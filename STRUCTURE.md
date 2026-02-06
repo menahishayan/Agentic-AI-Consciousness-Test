@@ -14,6 +14,15 @@ src/
       state.py
       signals.py
       memory_records.py
+    llm/
+      __init__.py
+      client.py
+      types.py
+      providers/
+        __init__.py
+        openai.py
+        anthropic.py
+        gemini.py
     memory/
       __init__.py
       manager.py
@@ -51,6 +60,13 @@ src/
     runtime/
       __init__.py
       loop.py
+    observability/
+      __init__.py
+      config.py
+      paths.py
+      serializer.py
+      logger.py
+      exceptions.py
 ```
 
 **Core Layers**
@@ -128,6 +144,13 @@ Implementation: `src/core/adapters/minedojo/observation_mapper.py`
 Action Mapper: Maps internal action proposals to env actions.
 Implementation: `src/core/adapters/minedojo/action_mapper.py`
 
+**LLM Interface (Provider-Agnostic)**
+LLM types and protocol: Standard chat-style messages and request/response schema.
+Implementation: `src/core/llm/types.py`, `src/core/llm/client.py`
+
+Provider stubs: No SDK dependencies; placeholders for OpenAI/Anthropic/Gemini.
+Implementation: `src/core/llm/providers/*.py`
+
 **Runtime Loop**
 AgentLoop: Orchestrates perception -> metacognition -> homeostasis -> action -> env step.
 Implementation: `src/core/runtime/loop.py`
@@ -140,6 +163,27 @@ Entrypoint: `src/core/main.py` defines a stub `main()` for future wiring.
 3. Homeostatic Agent raises arousal and generates survival goals.
 4. Motor Agent selects action proposals (fight, flee, build barrier).
 5. Memory Manager records prediction errors and policy traces.
+
+**Observability and Logs**
+Run logger: Creates a per-execution folder and writes JSONL logs for events, LLM requests/responses, memory activity, and state snapshots, plus tracebacks.
+Implementation: `src/core/observability/logger.py`
+
+Exception hooks: Captures uncaught exceptions and fatal errors.
+Implementation: `src/core/observability/exceptions.py`
+
+Run folder layout (default `logs/runs/`):
+- `run.json`: Run metadata
+- `events.jsonl`: Lifecycle and generic events
+- `llm.jsonl`: Provider-agnostic LLM request/response logs
+- `memory.jsonl`: Memory write/query events
+- `state.jsonl`: AgentState snapshots
+- `tracebacks.log`: Human-readable tracebacks
+- `tracebacks.jsonl`: Structured exception events
+
+LLM log schema (example fields):
+- `provider`, `model`, `messages`, `request_params` on request
+- `provider`, `model`, `text`, `usage`, `latency_ms`, `raw` on response
+Note: Hidden chain-of-thought is never captured; only explicit fields are logged.
 
 **How to Run (Future)**
 Use a `src/`-aware invocation once you implement the runtime logic.

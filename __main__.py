@@ -10,6 +10,8 @@ from openai import OpenAI
 
 from agent_state import AgentState
 
+# test basic AI integration
+
 ROOT = Path(__file__).resolve().parent
 SECRETS_ENV = ROOT / ".env"
 TELEMETRY_PATH = Path(
