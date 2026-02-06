@@ -1,0 +1,21 @@
+diff --git a/minedojo/sim/Malmo/Minecraft/build.gradle b/minedojo/sim/Malmo/Minecraft/build.gradle
+index 365fc66..1d818a4 100755
+--- a/minedojo/sim/Malmo/Minecraft/build.gradle
++++ b/minedojo/sim/Malmo/Minecraft/build.gradle
+@@ -3,6 +3,7 @@ buildscript {
+     repositories {
+ 
+         maven { url 'https://jitpack.io' }
++        maven { url 'https://repo.spongepowered.org/maven/' }
+         jcenter()
+         mavenCentral()
+         maven {
+@@ -16,7 +17,7 @@ buildscript {
+     }
+     dependencies {
+         classpath 'org.ow2.asm:asm:6.0'
+-        classpath('com.github.SpongePowered:MixinGradle:dcfaf61'){ // 0.6
++        classpath('org.spongepowered:mixingradle:0.6-SNAPSHOT'){ // 0.6
+             // Because forgegradle requires 6.0 (not -debug-all) while mixingradle depends on 5.0
+             // and putting mixin right here will place it before forge in the class loader
+             exclude group: 'org.ow2.asm', module: 'asm-debug-all'
