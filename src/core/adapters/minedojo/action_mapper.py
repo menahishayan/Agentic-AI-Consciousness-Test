@@ -6,4 +6,8 @@ from core.models.signals import ActionProposal
 
 
 def map_action(action_proposal: ActionProposal) -> Any:
-    raise NotImplementedError("Action mapping not implemented.")
+    if action_proposal is None:
+        return None
+    if hasattr(action_proposal, "action") and action_proposal.action is not None:
+        return action_proposal.action
+    return action_proposal
