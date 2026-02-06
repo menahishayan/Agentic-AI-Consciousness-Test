@@ -55,3 +55,44 @@ git -C ./MineDojo apply ./gradle-fix.patch
 ./.venv/bin/python -m pip install "pip<23" "setuptools<65" "wheel<0.40" "packaging<23"
 ```
 - Malmo build fix (local patch): update `minedojo/sim/Malmo/Minecraft/build.gradle` to use the SpongePowered repo and `org.spongepowered:mixingradle:0.6-SNAPSHOT` instead of the missing JitPack SHA.
+
+## Telemetry Fields
+
+The JSONL telemetry currently logs `info_keys` (available fields), not their values. To log values, update `__main__.py` to include selected `info` and `obs` fields in each record.
+
+## AgentState
+
+`agent_state.py` defines a structured `AgentState` object that can be passed between modules for decision-making. It is built from the MineDojo `info` dict and groups fields by category (homeostasis, position, biome, lighting/weather, world time, nearby, inventory, misc).
+
+Usage:
+```python
+from agent_state import AgentState
+
+state = AgentState.from_info(info)
+state_dict = state.to_dict(include_inventory=False, include_voxels=False)
+```
+
+In `__main__.py`, the current `AgentState` is included in the OpenAI prompt and logged to JSONL under the `state` key. Set `INCLUDE_INVENTORY=1` or `INCLUDE_VOXELS=1` in `.env` if you want those heavy fields logged.
+
+### Homeostasis Variables (Life Stats)
+
+- `life`
+- `armor`
+- `food`
+- `saturation`
+- `xp`
+- `air` (oxygen)
+- `is_sleeping`
+- `is_alive`
+- `is_dead`
+
+### Environment State Variables (from latest telemetry keys)
+
+- Position/orientation: `xpos`, `ypos`, `zpos`, `pitch`, `yaw`
+- Biome & world: `biome_name`, `biome_id`, `biome_temperature`, `biome_rainfall`, `sea_level`
+- Lighting & weather: `light_level`, `sky_light_level`, `sun_brightness`, `is_raining`, `can_see_sky`
+- Time: `world_time`, `total_time`
+- Local structures: `nearby_furnace`, `nearby_crafting_table`
+- Voxels: `voxels`
+- Inventory: `inventory`, `inventories_available`, `current_item_index`
+- Misc: `distance_travelled_cm`, `stat`, `achievement`, `damage_source`, `score`, `name`

@@ -8,6 +8,8 @@ import minedojo
 import numpy as np
 from openai import OpenAI
 
+from agent_state import AgentState
+
 ROOT = Path(__file__).resolve().parent
 SECRETS_ENV = ROOT / ".env"
 TELEMETRY_PATH = Path(
@@ -16,6 +18,8 @@ TELEMETRY_PATH = Path(
 MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1")
 TASK_ID = os.getenv("MINEDOJO_TASK_ID", "harvest_milk")
 MAX_STEPS = int(os.getenv("MAX_STEPS", "50"))
+INCLUDE_INVENTORY = os.getenv("INCLUDE_INVENTORY", "0") == "1"
+INCLUDE_VOXELS = os.getenv("INCLUDE_VOXELS", "0") == "1"
 
 
 def load_env_file(path: Path) -> None:
@@ -109,15 +113,21 @@ def main():
     space_info = action_space_info(space)
 
     obs = env.reset()
+    info = {}
     TELEMETRY_PATH.parent.mkdir(parents=True, exist_ok=True)
     with TELEMETRY_PATH.open("a", encoding="utf-8") as f:
         for step in range(MAX_STEPS):
             obs_summary = summarize_obs(obs)
+            state_for_prompt = AgentState.from_info(info).to_dict(
+                include_inventory=INCLUDE_INVENTORY,
+                include_voxels=INCLUDE_VOXELS,
+            )
             prompt = (
                 "You control a MineDojo agent.\n"
                 f"Task: {task_prompt}\n"
                 f"Guidance: {task_guidance}\n"
                 f"Action space: {space_info}\n"
+                f"State: {json.dumps(state_for_prompt)[:4000]}\n"
                 f"Observation summary: {json.dumps(obs_summary)[:4000]}\n"
                 'Return JSON only, like: {"action": [0,1,0,...]}.\n'
             )
@@ -130,6 +140,10 @@ def main():
             action, parse_meta = parse_action(text, space)
 
             obs, reward, done, info = env.step(action)
+            state_dict = AgentState.from_info(info).to_dict(
+                include_inventory=INCLUDE_INVENTORY,
+                include_voxels=INCLUDE_VOXELS,
+            )
             record = {
                 "ts": datetime.utcnow().isoformat() + "Z",
                 "step": step,
@@ -140,6 +154,7 @@ def main():
                 "reward": reward,
                 "done": done,
                 "info_keys": list(info.keys()) if isinstance(info, dict) else None,
+                "state": state_dict,
             }
 
             print(
