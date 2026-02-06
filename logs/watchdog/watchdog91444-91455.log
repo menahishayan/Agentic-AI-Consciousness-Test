@@ -1,0 +1,2 @@
+2026-02-06 13:52:08 Shayans-MacBook-Pro.local watchdog[91472] INFO Watchdog started between parent 91444 and child 91455
+2026-02-06 13:53:51 Shayans-MacBook-Pro.local watchdog[91472] INFO Parent is not running, hence we need terminate the child.
