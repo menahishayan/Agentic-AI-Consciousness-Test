@@ -34,15 +34,21 @@ class MemoryManager:
         self.logger = logger
 
     def snapshot_self_state(self, snapshot: Any) -> None:
+        step: Optional[int] = None
+        if isinstance(snapshot, Mapping):
+            raw_step = snapshot.get("step")
+            if isinstance(raw_step, int):
+                step = raw_step
         if self.logger is not None:
             self.logger.memory_event(
                 {
                     "type": "self_state",
                     "operation": "write",
                     "record": snapshot,
-                }
+                },
+                step=step,
             )
-        raise NotImplementedError("Self-state snapshotting not implemented.")
+        self.self_state.record(snapshot)
 
     def record_prediction_error(self, error: Any) -> None:
         if self.logger is not None:
@@ -150,9 +156,12 @@ class MemoryManager:
                 return self.policy_traces.query(query)
             if target == "prediction_errors":
                 return self.prediction_errors.query(query)
+            if target == "self_state":
+                return self.self_state.query(query)
             if target == "policies":
                 return self.get_policies(adapter_folder=query.get("adapter_folder"))
         return {
+            "self_state": self.self_state.query({}),
             "policy_traces": self.policy_traces.query({}),
             "prediction_errors": self.prediction_errors.query({}),
             "policies": self.get_policies(),

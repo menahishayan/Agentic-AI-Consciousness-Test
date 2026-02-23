@@ -100,6 +100,7 @@ class AgentLoop:
             info=self._last_info,
             vital_state_monitor=self.vital_state_monitor,
         )
+        self._record_vital_state(step=step, phase="pre_action")
         workspace_messages = self.workspace.broadcast()
         goals = self._extract_goals(workspace_messages)
 
@@ -130,6 +131,7 @@ class AgentLoop:
             info=info,
             vital_state_monitor=self.vital_state_monitor,
         )
+        self._record_vital_state(step=step, phase="post_step")
         if self.logger is not None:
             state_dict = state.to_dict(
                 include_inventory=self.include_inventory,
@@ -202,3 +204,12 @@ class AgentLoop:
                 if isinstance(payload_goals, list):
                     goals.extend(payload_goals)
         return goals
+
+    def _record_vital_state(self, step: int, phase: str) -> None:
+        self.memory_manager.snapshot_self_state(
+            {
+                "step": step,
+                "phase": phase,
+                "vital_state": self.vital_state_monitor.to_dict(),
+            }
+        )
