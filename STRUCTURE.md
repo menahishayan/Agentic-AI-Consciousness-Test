@@ -30,22 +30,12 @@ src/
       self_state.py
       prediction_error.py
       policy_traces.py
-      episodic.py
-      semantic.py
-      procedural.py
     layers/
       __init__.py
       interoceptive.py
       predictive.py
       action_selection.py
       metacognitive.py
-    agents/
-      __init__.py
-      homeostatic_agent.py
-      perceptual_agent.py
-      motor_agent.py
-      metacognitive_agent.py
-      coordinator.py
     coordination/
       __init__.py
       messages.py
@@ -86,21 +76,13 @@ Layer 4: Metacognitive Monitor
 Responsibilities: Information integration, uncertainty estimation, goal coherence.
 Implementation: `src/core/layers/metacognitive.py`
 
-**Agent Roles**
-Homeostatic Agent: Survival-driven goal generation.
-Implementation: `src/core/agents/homeostatic_agent.py`
-
-Perceptual Agent: Prediction and prediction error generation.
-Implementation: `src/core/agents/perceptual_agent.py`
-
-Motor Agent: Action proposal and selection interface.
-Implementation: `src/core/agents/motor_agent.py`
-
-Metacognitive Agent: Global broadcast and coherence checks.
-Implementation: `src/core/agents/metacognitive_agent.py`
-
-Coordinator: Orchestrates multi-agent step ordering and messaging.
-Implementation: `src/core/agents/coordinator.py`
+**Layer Modules**
+The layer modules map directly to architecture responsibilities without a duplicate
+agent wrapper layer:
+- `src/core/layers/interoceptive.py`
+- `src/core/layers/predictive.py`
+- `src/core/layers/action_selection.py`
+- `src/core/layers/metacognitive.py`
 
 **Memory Subsystems**
 Working Memory Buffer: Short-term active goals and predictions.
@@ -114,15 +96,6 @@ Implementation: `src/core/memory/prediction_error.py`
 
 Policy Traces: Records action-outcome patterns.
 Implementation: `src/core/memory/policy_traces.py`
-
-Episodic Memory: Stores event sequences and episodes.
-Implementation: `src/core/memory/episodic.py`
-
-Semantic Memory: Stores factual knowledge and abstractions.
-Implementation: `src/core/memory/semantic.py`
-
-Procedural Memory: Stores skills and action routines.
-Implementation: `src/core/memory/procedural.py`
 
 Memory Manager: Unified access to all memory subsystems.
 Implementation: `src/core/memory/manager.py`
@@ -152,16 +125,16 @@ Provider stubs: No SDK dependencies; placeholders for OpenAI/Anthropic/Gemini.
 Implementation: `src/core/llm/providers/*.py`
 
 **Runtime Loop**
-AgentLoop: Orchestrates perception -> metacognition -> homeostasis -> action -> env step.
+AgentLoop: Handles environment reset/step, state extraction, and observability.
 Implementation: `src/core/runtime/loop.py`
 
 Entrypoint: `src/core/main.py` defines a stub `main()` for future wiring.
 
 **Data Flow Example: Unexpected Mob**
-1. Perceptual Agent detects prediction error: unexpected mob spawn.
-2. Metacognitive Agent broadcasts a threat signal to the workspace.
-3. Homeostatic Agent raises arousal and generates survival goals.
-4. Motor Agent selects action proposals (fight, flee, build barrier).
+1. Predictive layer detects prediction error: unexpected mob spawn.
+2. Metacognitive layer broadcasts a threat signal to the workspace.
+3. Interoceptive layer raises arousal and generates survival goals.
+4. Action-selection layer proposes actions (fight, flee, build barrier).
 5. Memory Manager records prediction errors and policy traces.
 
 **Observability and Logs**

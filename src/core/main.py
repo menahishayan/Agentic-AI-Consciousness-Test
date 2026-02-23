@@ -6,11 +6,6 @@ from pathlib import Path
 import minedojo
 
 from core.adapters.minedojo.env_adapter import MineDojoAdapter
-from core.agents.coordinator import MultiAgentCoordinator
-from core.agents.homeostatic_agent import HomeostaticAgent
-from core.agents.metacognitive_agent import MetacognitiveAgent
-from core.agents.motor_agent import MotorAgent
-from core.agents.perceptual_agent import PerceptualAgent
 from core.memory.manager import MemoryManager
 from core.observability import LoggingConfig, RunLogger, install_exception_hooks
 from core.runtime.loop import AgentLoop
@@ -52,12 +47,6 @@ def main() -> None:
         env = minedojo.make(task_id=task_id, image_size=(160, 256))
         adapter = MineDojoAdapter(env)
 
-        coordinator = MultiAgentCoordinator(
-            HomeostaticAgent(),
-            PerceptualAgent(),
-            MotorAgent(),
-            MetacognitiveAgent(),
-        )
         memory_manager = MemoryManager(logger=logger)
 
         logger.event(
@@ -72,7 +61,6 @@ def main() -> None:
 
         loop = AgentLoop(
             adapter=adapter,
-            coordinator=coordinator,
             memory_manager=memory_manager,
             logger=logger,
             include_inventory=include_inventory,

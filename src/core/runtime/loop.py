@@ -3,7 +3,6 @@ from __future__ import annotations
 from typing import Any, Optional
 
 from core.adapters.minedojo.env_adapter import MineDojoAdapter
-from core.agents.coordinator import MultiAgentCoordinator
 from core.coordination.workspace import GlobalWorkspace
 from core.llm.client import LLMClient
 from core.memory.manager import MemoryManager
@@ -15,7 +14,6 @@ class AgentLoop:
     def __init__(
         self,
         adapter: MineDojoAdapter,
-        coordinator: MultiAgentCoordinator,
         memory_manager: MemoryManager,
         workspace: Optional[GlobalWorkspace] = None,
         llm_client: Optional[LLMClient] = None,
@@ -24,7 +22,6 @@ class AgentLoop:
         include_voxels: bool = True,
     ) -> None:
         self.adapter = adapter
-        self.coordinator = coordinator
         self.memory_manager = memory_manager
         self.workspace = workspace or GlobalWorkspace()
         self.llm_client = llm_client

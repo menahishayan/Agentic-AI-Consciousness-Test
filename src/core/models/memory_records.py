@@ -21,23 +21,3 @@ class PolicyTraceRecord:
     timestamp: Optional[str] = None
     action: Optional[Any] = None
     outcome: Optional[Any] = None
-
-
-@dataclass
-class EpisodicMemoryRecord:
-    timestamp: Optional[str] = None
-    summary: Optional[str] = None
-    details: Optional[Any] = None
-
-
-@dataclass
-class SemanticMemoryEntry:
-    key: Optional[str] = None
-    value: Optional[Any] = None
-
-
-@dataclass
-class ProceduralSkill:
-    name: Optional[str] = None
-    description: Optional[str] = None
-    parameters: Optional[Any] = None
