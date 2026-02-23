@@ -69,6 +69,7 @@ def load_config(path: Path) -> Dict[str, Any]:
                     "sample_action",
                     "get_available_vitals",
                     "get_available_policies",
+                    "get_action_space_actions",
                     "get_raw_observation",
                 ]
             },

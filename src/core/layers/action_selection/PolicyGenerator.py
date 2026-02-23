@@ -198,7 +198,11 @@ class PolicyGenerator:
             description = str(description)
         tags = self._normalize_tags(policy.get("tags"))
         signature = str(inspect.signature(member))
-        policy_id = f"{self.adapter_folder}:{callable_name}"
+        provided_policy_id = policy.get("policy_id")
+        if isinstance(provided_policy_id, str) and provided_policy_id.strip():
+            policy_id = provided_policy_id.strip()
+        else:
+            policy_id = f"{self.adapter_folder}:{callable_name}"
 
         return {
             "policy_id": policy_id,
@@ -311,6 +315,7 @@ class PolicyGenerator:
             "sample_action",
             "get_available_vitals",
             "get_available_policies",
+            "get_action_space_actions",
             "get_raw_observation",
         )
         if not isinstance(values, Iterable) or isinstance(values, (str, bytes)):
