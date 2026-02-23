@@ -1,0 +1,10 @@
+{
+  "adapter_folder": "minedojo",
+  "adapter_config": {
+    "task_id": "harvest_milk",
+    "image_size": [
+      160,
+      256
+    ]
+  }
+}

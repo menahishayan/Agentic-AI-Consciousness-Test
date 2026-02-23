@@ -2,10 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
-
-class VitalStateMonitor:
-    def update(self, state: Any) -> None:
-        raise NotImplementedError("Vital state monitoring not implemented.")
+from core.layers.interoceptive.VitalStateMonitor import VitalStateMonitor
 
 
 class AllostaticController:
@@ -16,3 +13,6 @@ class AllostaticController:
 class ArousalValenceSystem:
     def compute(self, state: Any) -> Any:
         raise NotImplementedError("Arousal/valence computation not implemented.")
+
+
+__all__ = ["VitalStateMonitor", "AllostaticController", "ArousalValenceSystem"]

@@ -32,7 +32,9 @@ src/
       policy_traces.py
     layers/
       __init__.py
-      interoceptive.py
+      interoceptive/
+        __init__.py
+        VitalStateMonitor.py
       predictive.py
       action_selection.py
       metacognitive.py
@@ -42,6 +44,7 @@ src/
       workspace.py
     adapters/
       __init__.py
+      loader.py
       minedojo/
         __init__.py
         env_adapter.py
@@ -62,7 +65,7 @@ src/
 **Core Layers**
 Layer 1: Interoceptive Foundation
 Responsibilities: Vital state tracking, allostatic prediction, arousal/valence computation.
-Implementation: `src/core/layers/interoceptive.py`
+Implementation: `src/core/layers/interoceptive/`
 
 Layer 2: Predictive Processing Engine
 Responsibilities: World model prediction, prediction error calculation, precision weighting.
@@ -79,7 +82,7 @@ Implementation: `src/core/layers/metacognitive.py`
 **Layer Modules**
 The layer modules map directly to architecture responsibilities without a duplicate
 agent wrapper layer:
-- `src/core/layers/interoceptive.py`
+- `src/core/layers/interoceptive/VitalStateMonitor.py`
 - `src/core/layers/predictive.py`
 - `src/core/layers/action_selection.py`
 - `src/core/layers/metacognitive.py`
@@ -107,7 +110,22 @@ Implementation: `src/core/coordination/messages.py`
 Global Workspace: Central broadcast buffer for agent signals.
 Implementation: `src/core/coordination/workspace.py`
 
-**MineDojo Integration**
+**Adapter Integration**
+Runtime adapter selection is configured via root `config.json` using `adapter_folder`.
+
+Adapter loader: Dynamically imports selected adapter package and validates the adapter contract.
+Implementation: `src/core/adapters/loader.py`
+
+Required adapter methods:
+- `reset()`
+- `step(action)`
+- `close()`
+- `get_available_vitals()` -> `list[str]`
+
+Optional adapter method:
+- `sample_action()`
+
+**MineDojo Adapter**
 Environment Adapter: Thin abstraction over MineDojo env lifecycle.
 Implementation: `src/core/adapters/minedojo/env_adapter.py`
 
