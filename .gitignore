@@ -5,4 +5,6 @@
 *.pyc
 .env
 logs/*
+data/long_term_memory/*
 MineDojo/*
+Voyager/*

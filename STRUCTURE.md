@@ -26,6 +26,7 @@ src/
     memory/
       __init__.py
       manager.py
+      long_term_memory.py
       working_memory.py
       self_state.py
       prediction_error.py
@@ -36,7 +37,11 @@ src/
         __init__.py
         VitalStateMonitor.py
       predictive.py
-      action_selection.py
+      action_selection/
+        __init__.py
+        PolicyGenerator.py
+        FreeEnergyMinimizer.py
+        MotorControlInterface.py
       metacognitive.py
     coordination/
       __init__.py
@@ -73,7 +78,7 @@ Implementation: `src/core/layers/predictive.py`
 
 Layer 3: Action Selection and Agency
 Responsibilities: Policy proposals, free-energy minimization, motor translation.
-Implementation: `src/core/layers/action_selection.py`
+Implementation: `src/core/layers/action_selection/`
 
 Layer 4: Metacognitive Monitor
 Responsibilities: Information integration, uncertainty estimation, goal coherence.
@@ -84,7 +89,9 @@ The layer modules map directly to architecture responsibilities without a duplic
 agent wrapper layer:
 - `src/core/layers/interoceptive/VitalStateMonitor.py`
 - `src/core/layers/predictive.py`
-- `src/core/layers/action_selection.py`
+- `src/core/layers/action_selection/PolicyGenerator.py`
+- `src/core/layers/action_selection/FreeEnergyMinimizer.py`
+- `src/core/layers/action_selection/MotorControlInterface.py`
 - `src/core/layers/metacognitive.py`
 
 **Memory Subsystems**
@@ -99,6 +106,9 @@ Implementation: `src/core/memory/prediction_error.py`
 
 Policy Traces: Records action-outcome patterns.
 Implementation: `src/core/memory/policy_traces.py`
+
+Long-Term Memory: Persists discovered policy metadata and policy outcome history.
+Implementation: `src/core/memory/long_term_memory.py`
 
 Memory Manager: Unified access to all memory subsystems.
 Implementation: `src/core/memory/manager.py`
@@ -124,6 +134,7 @@ Required adapter methods:
 
 Optional adapter method:
 - `sample_action()`
+- `get_available_policies()` -> `list[dict]`
 
 **MineDojo Adapter**
 Environment Adapter: Thin abstraction over MineDojo env lifecycle.
@@ -143,7 +154,7 @@ Provider stubs: No SDK dependencies; placeholders for OpenAI/Anthropic/Gemini.
 Implementation: `src/core/llm/providers/*.py`
 
 **Runtime Loop**
-AgentLoop: Handles environment reset/step, state extraction, and observability.
+AgentLoop: Handles environment reset/step, policy discovery/selection, state extraction, and observability.
 Implementation: `src/core/runtime/loop.py`
 
 Entrypoint: `src/core/main.py` defines a stub `main()` for future wiring.

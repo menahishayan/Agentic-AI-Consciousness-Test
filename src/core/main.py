@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, Mapping
 
 from core.adapters.loader import build_adapter
 from core.memory.manager import MemoryManager
@@ -31,12 +31,54 @@ def load_env_file(path: Path) -> None:
         os.environ.setdefault(key, value)
 
 
+def _deep_merge(base: Mapping[str, Any], override: Mapping[str, Any]) -> Dict[str, Any]:
+    merged: Dict[str, Any] = dict(base)
+    for key, value in override.items():
+        if (
+            key in merged
+            and isinstance(merged[key], Mapping)
+            and isinstance(value, Mapping)
+        ):
+            merged[key] = _deep_merge(merged[key], value)
+        else:
+            merged[key] = value
+    return merged
+
+
 def load_config(path: Path) -> Dict[str, Any]:
     default: Dict[str, Any] = {
         "adapter_folder": "minedojo",
         "adapter_config": {
             "task_id": "harvest_milk",
             "image_size": [160, 256],
+        },
+        "policy_generator": {
+            "weights": {
+                "goal_coherence": 0.6,
+                "prediction_error": 0.4,
+            },
+            "fallback_scores": {
+                "goal_coherence": 0.5,
+                "prediction_error": 0.5,
+            },
+            "discovery": {
+                "reserved_methods": [
+                    "reset",
+                    "step",
+                    "close",
+                    "sample_action",
+                    "get_available_vitals",
+                    "get_available_policies",
+                    "get_raw_observation",
+                ]
+            },
+            "long_term_memory": {
+                "path": "data/long_term_memory/policies.json",
+                "max_score_history": 200,
+                "max_outcome_history": 200,
+            },
+            "max_expected_error": 1.0,
+            "prediction_error_window": 20,
         },
     }
     if not path.exists():
@@ -46,16 +88,7 @@ def load_config(path: Path) -> Dict[str, Any]:
     parsed = json.loads(raw)
     if not isinstance(parsed, dict):
         raise ValueError("config.json must contain a top-level JSON object.")
-
-    merged = dict(default)
-    merged.update(parsed)
-
-    adapter_config = parsed.get("adapter_config")
-    if isinstance(adapter_config, dict):
-        merged["adapter_config"] = {**default["adapter_config"], **adapter_config}
-    elif "adapter_config" not in merged:
-        merged["adapter_config"] = dict(default["adapter_config"])
-    return merged
+    return _deep_merge(default, parsed)
 
 
 def main() -> None:
@@ -68,8 +101,14 @@ def main() -> None:
     include_voxels = _env_flag("INCLUDE_VOXELS", True)
     adapter_folder = str(app_config.get("adapter_folder", "minedojo"))
     adapter_cfg = app_config.get("adapter_config", {})
+    policy_cfg = app_config.get("policy_generator", {})
     if not isinstance(adapter_cfg, dict):
         raise ValueError("'adapter_config' in config.json must be an object.")
+    if not isinstance(policy_cfg, dict):
+        raise ValueError("'policy_generator' in config.json must be an object.")
+    ltm_cfg = policy_cfg.get("long_term_memory", {})
+    if not isinstance(ltm_cfg, dict):
+        raise ValueError("'policy_generator.long_term_memory' must be an object.")
 
     config = LoggingConfig.from_env()
     with RunLogger(config) as logger:
@@ -77,7 +116,10 @@ def main() -> None:
 
         adapter, observation_mapper = build_adapter(adapter_folder, adapter_cfg)
 
-        memory_manager = MemoryManager(logger=logger)
+        memory_manager = MemoryManager(
+            logger=logger,
+            long_term_memory_config=ltm_cfg,
+        )
 
         logger.event(
             "run.config",
@@ -87,6 +129,7 @@ def main() -> None:
                 "max_steps": max_steps,
                 "include_inventory": include_inventory,
                 "include_voxels": include_voxels,
+                "policy_generator": policy_cfg,
             },
         )
 
@@ -94,6 +137,8 @@ def main() -> None:
             adapter=adapter,
             observation_mapper=observation_mapper,
             memory_manager=memory_manager,
+            adapter_folder=adapter_folder,
+            policy_config=policy_cfg,
             logger=logger,
             include_inventory=include_inventory,
             include_voxels=include_voxels,

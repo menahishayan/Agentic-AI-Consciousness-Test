@@ -46,6 +46,66 @@ git -C ./MineDojo apply ./gradle-fix.patch
 ./.venv/bin/python ./MineDojo/scripts/validate_install.py
 ```
 
+## Runtime Config (`config.json`)
+
+`core.main` reads a root `config.json` to select the active adapter and policy behavior.
+
+Minimal shape:
+
+```json
+{
+  "adapter_folder": "minedojo",
+  "adapter_config": {
+    "task_id": "harvest_milk",
+    "image_size": [160, 256]
+  },
+  "policy_generator": {
+    "weights": {
+      "goal_coherence": 0.6,
+      "prediction_error": 0.4
+    },
+    "fallback_scores": {
+      "goal_coherence": 0.5,
+      "prediction_error": 0.5
+    },
+    "discovery": {
+      "reserved_methods": [
+        "reset",
+        "step",
+        "close",
+        "sample_action",
+        "get_available_vitals",
+        "get_available_policies",
+        "get_raw_observation"
+      ]
+    },
+    "long_term_memory": {
+      "path": "data/long_term_memory/policies.json",
+      "max_score_history": 200,
+      "max_outcome_history": 200
+    }
+  }
+}
+```
+
+## Adapter Policy Contract
+
+Adapters are selected by folder name (`src/core/adapters/<adapter_folder>/`).
+
+Required adapter methods:
+- `reset()`
+- `step(action)`
+- `close()`
+- `get_available_vitals() -> list[str]`
+
+Optional adapter methods:
+- `sample_action()`
+- `get_available_policies() -> list[dict]`
+
+Policy discovery behavior:
+- `PolicyGenerator` first uses `get_available_policies()` when available.
+- If missing or empty, it discovers policies from adapter public callables, excluding names in `policy_generator.discovery.reserved_methods`.
+
 ## Notes
 
 - `numpy<2` is required because MineDojo currently references `np.unicode_`, which was removed in NumPy 2.0.

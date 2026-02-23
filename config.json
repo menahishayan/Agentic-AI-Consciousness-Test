@@ -6,5 +6,33 @@
       160,
       256
     ]
+  },
+  "policy_generator": {
+    "weights": {
+      "goal_coherence": 0.6,
+      "prediction_error": 0.4
+    },
+    "fallback_scores": {
+      "goal_coherence": 0.5,
+      "prediction_error": 0.5
+    },
+    "discovery": {
+      "reserved_methods": [
+        "reset",
+        "step",
+        "close",
+        "sample_action",
+        "get_available_vitals",
+        "get_available_policies",
+        "get_raw_observation"
+      ]
+    },
+    "long_term_memory": {
+      "path": "data/long_term_memory/policies.json",
+      "max_score_history": 200,
+      "max_outcome_history": 200
+    },
+    "max_expected_error": 1.0,
+    "prediction_error_window": 20
   }
 }
