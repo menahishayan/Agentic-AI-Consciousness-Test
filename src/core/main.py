@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any, Dict, Mapping
 
 from core.adapters.loader import build_adapter
+from core.llm.factory import build_llm_client
 from core.memory.manager import MemoryManager
 from core.observability import LoggingConfig, RunLogger, install_exception_hooks
 from core.runtime.loop import AgentLoop
@@ -48,6 +49,14 @@ def _deep_merge(base: Mapping[str, Any], override: Mapping[str, Any]) -> Dict[st
 def load_config(path: Path) -> Dict[str, Any]:
     default: Dict[str, Any] = {
         "adapter_folder": "minedojo",
+        "llm": {
+            "enabled": False,
+            "provider": "openai",
+            "model": "gpt-4.1-mini",
+            "temperature": 0.1,
+            "max_tokens": 500,
+            "timeout_s": 1.0,
+        },
         "adapter_config": {
             "task_id": "harvest_milk",
             "image_size": [160, 256],
@@ -56,10 +65,14 @@ def load_config(path: Path) -> Dict[str, Any]:
             "weights": {
                 "goal_coherence": 0.6,
                 "prediction_error": 0.4,
+                "allostatic_survival_fit": 0.2,
+                "allostatic_urgency_alignment": 0.2,
             },
             "fallback_scores": {
                 "goal_coherence": 0.5,
                 "prediction_error": 0.5,
+                "allostatic_survival_fit": 0.5,
+                "allostatic_urgency_alignment": 0.5,
             },
             "discovery": {
                 "reserved_methods": [
@@ -80,6 +93,20 @@ def load_config(path: Path) -> Dict[str, Any]:
             },
             "max_expected_error": 1.0,
             "prediction_error_window": 20,
+            "allostatic_controller": {
+                "enabled": True,
+                "llm_interval_steps": 5,
+                "llm_timeout_s": 1.0,
+                "max_voxel_chars": 2000,
+                "life_drop_threshold": 2.0,
+                "food_drop_threshold": 2.0,
+                "air_drop_threshold": 20.0,
+                "high_risk_trigger": 0.7,
+                "default_goal_horizon_steps": 160,
+                "heuristic_confidence": 0.65,
+                "temperature": 0.1,
+                "max_tokens": 500,
+            },
         },
     }
     if not path.exists():
@@ -101,8 +128,11 @@ def main() -> None:
     include_inventory = _env_flag("INCLUDE_INVENTORY", True)
     include_voxels = _env_flag("INCLUDE_VOXELS", True)
     adapter_folder = str(app_config.get("adapter_folder", "minedojo"))
+    llm_cfg = app_config.get("llm", {})
     adapter_cfg = app_config.get("adapter_config", {})
     policy_cfg = app_config.get("policy_generator", {})
+    if not isinstance(llm_cfg, dict):
+        raise ValueError("'llm' in config.json must be an object.")
     if not isinstance(adapter_cfg, dict):
         raise ValueError("'adapter_config' in config.json must be an object.")
     if not isinstance(policy_cfg, dict):
@@ -116,6 +146,7 @@ def main() -> None:
         install_exception_hooks(logger)
 
         adapter, observation_mapper = build_adapter(adapter_folder, adapter_cfg)
+        llm_client = build_llm_client(llm_cfg, logger=logger)
 
         memory_manager = MemoryManager(
             logger=logger,
@@ -130,6 +161,12 @@ def main() -> None:
                 "max_steps": max_steps,
                 "include_inventory": include_inventory,
                 "include_voxels": include_voxels,
+                "llm": {
+                    "enabled": bool(llm_cfg.get("enabled", False)),
+                    "provider": llm_cfg.get("provider", "openai"),
+                    "model": llm_cfg.get("model"),
+                    "timeout_s": llm_cfg.get("timeout_s"),
+                },
                 "policy_generator": policy_cfg,
             },
         )
@@ -140,6 +177,7 @@ def main() -> None:
             memory_manager=memory_manager,
             adapter_folder=adapter_folder,
             policy_config=policy_cfg,
+            llm_client=llm_client,
             logger=logger,
             include_inventory=include_inventory,
             include_voxels=include_voxels,

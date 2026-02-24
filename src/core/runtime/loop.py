@@ -5,7 +5,7 @@ from typing import Any, Callable, List, Mapping, Optional
 from core.coordination.messages import AgentMessage
 from core.coordination.workspace import GlobalWorkspace
 from core.layers.action_selection import PolicyGenerator
-from core.layers.interoceptive import VitalStateMonitor
+from core.layers.interoceptive import AllostaticController, VitalStateMonitor
 from core.layers.metacognitive import GoalCoherenceChecker
 from core.layers.predictive import PredictionErrorCalculator
 from core.llm.client import LLMClient
@@ -39,8 +39,16 @@ class AgentLoop:
         self.logger = logger
         self.include_inventory = include_inventory
         self.include_voxels = include_voxels
+        allostatic_cfg = self.policy_config.get("allostatic_controller", {})
+        if not isinstance(allostatic_cfg, Mapping):
+            raise TypeError("'policy_generator.allostatic_controller' must be an object.")
         self.vital_state_monitor = VitalStateMonitor(
             expected_vitals=self._load_available_vitals(adapter),
+        )
+        self.allostatic_controller = AllostaticController(
+            llm_client=self.llm_client,
+            config=allostatic_cfg,
+            logger=self.logger,
         )
         self._initialized = False
         self._last_obs: Any = None
@@ -103,6 +111,33 @@ class AgentLoop:
         self._record_vital_state(step=step, phase="pre_action")
         workspace_messages = self.workspace.broadcast()
         goals = self._extract_goals(workspace_messages)
+        allostatic_assessment = self.allostatic_controller.assess(
+            step=step,
+            state=current_state,
+            goals=goals,
+            vital_state=self.vital_state_monitor.to_dict(),
+            obs=self._last_obs,
+            info=self._last_info,
+        )
+        self.memory_manager.snapshot_self_state(
+            {
+                "step": step,
+                "phase": "allostatic_pre_action",
+                "allostatic_assessment": allostatic_assessment,
+            }
+        )
+        if self.logger is not None:
+            self.logger.event(
+                "allostatic.assessment",
+                {
+                    "source": allostatic_assessment.get("source"),
+                    "risk_level": allostatic_assessment.get("risk_level"),
+                    "confidence": allostatic_assessment.get("confidence"),
+                    "survival_horizon_steps": allostatic_assessment.get("survival_horizon_steps"),
+                    "needs_count": len(allostatic_assessment.get("needs", [])),
+                },
+                step=step,
+            )
 
         policy_context = {
             "state": current_state,
@@ -111,6 +146,7 @@ class AgentLoop:
             "workspace_messages": workspace_messages,
             "step": step,
             "memory_manager": self.memory_manager,
+            "allostatic_assessment": allostatic_assessment,
         }
         action_proposal = self.policy_generator.propose_action(
             goals=goals,

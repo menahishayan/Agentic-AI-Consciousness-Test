@@ -33,13 +33,27 @@ class PolicyGenerator:
         self.logger = logger
 
         weights = self.config.get("weights", {})
-        self.weight_goal = self._as_float(weights.get("goal_coherence"), 0.6)
-        self.weight_prediction_error = self._as_float(weights.get("prediction_error"), 0.4)
+        self.weight_goal = max(0.0, self._as_float(weights.get("goal_coherence"), 0.6))
+        self.weight_prediction_error = max(
+            0.0, self._as_float(weights.get("prediction_error"), 0.4)
+        )
+        self.weight_allostatic_survival_fit = max(
+            0.0, self._as_float(weights.get("allostatic_survival_fit"), 0.0)
+        )
+        self.weight_allostatic_urgency_alignment = max(
+            0.0, self._as_float(weights.get("allostatic_urgency_alignment"), 0.0)
+        )
 
         fallback_scores = self.config.get("fallback_scores", {})
         self.fallback_goal_score = self._as_float(fallback_scores.get("goal_coherence"), 0.5)
         self.fallback_prediction_error_score = self._as_float(
             fallback_scores.get("prediction_error"), 0.5
+        )
+        self.fallback_allostatic_survival_fit = self._as_float(
+            fallback_scores.get("allostatic_survival_fit"), 0.5
+        )
+        self.fallback_allostatic_urgency_alignment = self._as_float(
+            fallback_scores.get("allostatic_urgency_alignment"), 0.5
         )
 
         discovery = self.config.get("discovery", {})
@@ -53,6 +67,7 @@ class PolicyGenerator:
 
         policy_records = self._policy_record_map()
         scored: List[Dict[str, Any]] = []
+        allostatic_assessment = context.get("allostatic_assessment")
         for policy in policies:
             coherence_result = self.goal_checker.check(goals, policy, context)
             prediction_result = self.prediction_error_calculator.compute(
@@ -70,9 +85,25 @@ class PolicyGenerator:
                 "prediction_error_score",
                 self.fallback_prediction_error_score,
             )
-            combined_score = (
-                self.weight_goal * coherence_score
-                + self.weight_prediction_error * (1.0 - prediction_error_score)
+            survival_fit_score = self._allostatic_survival_fit_score(
+                policy=policy,
+                allostatic_assessment=allostatic_assessment,
+            )
+            if survival_fit_score is None:
+                survival_fit_score = self.fallback_allostatic_survival_fit
+
+            urgency_alignment_score = self._allostatic_urgency_alignment_score(
+                policy=policy,
+                allostatic_assessment=allostatic_assessment,
+            )
+            if urgency_alignment_score is None:
+                urgency_alignment_score = self.fallback_allostatic_urgency_alignment
+
+            combined_score = self._combine_weighted_scores(
+                coherence_score=coherence_score,
+                prediction_error_score=prediction_error_score,
+                survival_fit_score=survival_fit_score,
+                urgency_alignment_score=urgency_alignment_score,
             )
             record = policy_records.get(policy["policy_id"], {})
             last_selected_at = str(record.get("last_selected_at") or "")
@@ -85,6 +116,8 @@ class PolicyGenerator:
                     "prediction_result": prediction_result,
                     "coherence_score": coherence_score,
                     "prediction_error_score": prediction_error_score,
+                    "survival_fit_score": survival_fit_score,
+                    "urgency_alignment_score": urgency_alignment_score,
                 }
             )
 
@@ -107,8 +140,11 @@ class PolicyGenerator:
             components = {
                 "coherence_score": candidate["coherence_score"],
                 "prediction_error_score": candidate["prediction_error_score"],
+                "survival_fit_score": candidate["survival_fit_score"],
+                "urgency_alignment_score": candidate["urgency_alignment_score"],
                 "coherence_result": candidate["coherence_result"],
                 "prediction_result": candidate["prediction_result"],
+                "allostatic_source": self._allostatic_source(allostatic_assessment),
                 "selected_at": _utc_ts(),
             }
             self.memory_manager.record_policy_selection(
@@ -306,6 +342,145 @@ class PolicyGenerator:
                 return max(0.0, min(1.0, float(raw)))
         return fallback
 
+    def _combine_weighted_scores(
+        self,
+        coherence_score: float,
+        prediction_error_score: float,
+        survival_fit_score: float,
+        urgency_alignment_score: float,
+    ) -> float:
+        weighted_sum = 0.0
+        weight_total = 0.0
+        components = (
+            (self.weight_goal, coherence_score),
+            (self.weight_prediction_error, 1.0 - prediction_error_score),
+            (self.weight_allostatic_survival_fit, survival_fit_score),
+            (self.weight_allostatic_urgency_alignment, urgency_alignment_score),
+        )
+        for weight, score in components:
+            if weight <= 0.0:
+                continue
+            weighted_sum += weight * self._clamp01(score)
+            weight_total += weight
+        if weight_total <= 0.0:
+            return 0.0
+        return self._clamp01(weighted_sum / weight_total)
+
+    def _allostatic_survival_fit_score(
+        self,
+        policy: Mapping[str, Any],
+        allostatic_assessment: Any,
+    ) -> Optional[float]:
+        if not isinstance(allostatic_assessment, Mapping):
+            return None
+        policy_tokens = self._policy_tokens(policy)
+        allostatic_tokens = self._allostatic_tokens(allostatic_assessment)
+        if not policy_tokens or not allostatic_tokens:
+            return None
+        overlap = policy_tokens.intersection(allostatic_tokens)
+        union = policy_tokens.union(allostatic_tokens)
+        if not union:
+            return None
+        return self._clamp01(float(len(overlap)) / float(len(union)))
+
+    def _allostatic_urgency_alignment_score(
+        self,
+        policy: Mapping[str, Any],
+        allostatic_assessment: Any,
+    ) -> Optional[float]:
+        if not isinstance(allostatic_assessment, Mapping):
+            return None
+        needs = allostatic_assessment.get("needs")
+        if not isinstance(needs, list):
+            return None
+        policy_tokens = self._policy_tokens(policy)
+        if not policy_tokens:
+            return None
+
+        weighted = 0.0
+        total = 0.0
+        for raw_need in needs:
+            if not isinstance(raw_need, Mapping):
+                continue
+            urgency_raw = raw_need.get("urgency")
+            if not isinstance(urgency_raw, (int, float)):
+                continue
+            urgency = self._clamp01(float(urgency_raw))
+            if urgency <= 0.0:
+                continue
+            need_tokens = self._need_tokens(raw_need)
+            if not need_tokens:
+                continue
+            overlap = policy_tokens.intersection(need_tokens)
+            union = policy_tokens.union(need_tokens)
+            if not union:
+                continue
+            score = float(len(overlap)) / float(len(union))
+            weighted += score * urgency
+            total += urgency
+
+        if total <= 0.0:
+            return None
+        return self._clamp01(weighted / total)
+
+    def _policy_tokens(self, policy: Mapping[str, Any]) -> set[str]:
+        sources: List[str] = []
+        for key in ("policy_id", "callable_name", "description"):
+            value = policy.get(key)
+            if value is not None:
+                sources.append(str(value))
+
+        for key in ("tags", "survival_domains"):
+            values = policy.get(key)
+            if isinstance(values, Iterable) and not isinstance(values, (str, bytes)):
+                for value in values:
+                    sources.append(str(value))
+
+        tokens: set[str] = set()
+        for source in sources:
+            tokens.update(self._name_tokens(source))
+        return tokens
+
+    def _allostatic_tokens(self, allostatic_assessment: Mapping[str, Any]) -> set[str]:
+        tokens: set[str] = set()
+
+        policy_tags = allostatic_assessment.get("policy_bias_tags")
+        if isinstance(policy_tags, Iterable) and not isinstance(policy_tags, (str, bytes)):
+            for tag in policy_tags:
+                tokens.update(self._name_tokens(str(tag)))
+
+        needs = allostatic_assessment.get("needs")
+        if isinstance(needs, list):
+            for need in needs:
+                if not isinstance(need, Mapping):
+                    continue
+                tokens.update(self._need_tokens(need))
+
+        return tokens
+
+    def _need_tokens(self, need: Mapping[str, Any]) -> set[str]:
+        sources: List[str] = [str(need.get("need_id") or "")]
+        for key in ("actions", "resources"):
+            values = need.get(key)
+            if isinstance(values, Iterable) and not isinstance(values, (str, bytes)):
+                for value in values:
+                    sources.append(str(value))
+
+        tokens: set[str] = set()
+        for source in sources:
+            tokens.update(self._name_tokens(source))
+        return tokens
+
+    @staticmethod
+    def _allostatic_source(allostatic_assessment: Any) -> Optional[str]:
+        if not isinstance(allostatic_assessment, Mapping):
+            return None
+        source = allostatic_assessment.get("source")
+        if source is None:
+            return None
+        text = str(source).strip()
+        return text or None
+
     @staticmethod
     def _normalize_reserved_methods(values: Any) -> Sequence[str]:
         default = (
@@ -356,3 +531,7 @@ class PolicyGenerator:
             return float(value)
         except (TypeError, ValueError):
             return default
+
+    @staticmethod
+    def _clamp01(value: float) -> float:
+        return max(0.0, min(1.0, float(value)))

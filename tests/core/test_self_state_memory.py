@@ -85,11 +85,17 @@ def test_agent_loop_persists_vital_state_snapshots(tmp_path: Path) -> None:
 
     snapshots = memory_manager.query({"target": "self_state"})
     assert isinstance(snapshots, list)
-    assert len(snapshots) >= 2
+    assert len(snapshots) >= 3
 
-    pre_action = snapshots[-2]
-    post_step = snapshots[-1]
-    assert pre_action["phase"] == "pre_action"
-    assert post_step["phase"] == "post_step"
-    assert pre_action["vital_state"]["state"]["life"] == 20
-    assert post_step["vital_state"]["state"]["life"] == 19
+    pre_action = [item for item in snapshots if item.get("phase") == "pre_action"]
+    allostatic = [item for item in snapshots if item.get("phase") == "allostatic_pre_action"]
+    post_step = [item for item in snapshots if item.get("phase") == "post_step"]
+
+    assert pre_action
+    assert allostatic
+    assert post_step
+
+    assert pre_action[-1]["vital_state"]["state"]["life"] == 20
+    assert post_step[-1]["vital_state"]["state"]["life"] == 19
+    assert "allostatic_assessment" in allostatic[-1]
+    assert allostatic[-1]["allostatic_assessment"]["source"] in {"heuristic", "llm", "cache"}
