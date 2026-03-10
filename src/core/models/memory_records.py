@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any, List, Optional
 
 
 @dataclass
@@ -24,20 +24,18 @@ class PolicyTraceRecord:
 
 
 @dataclass
-class EpisodicMemoryRecord:
-    timestamp: Optional[str] = None
-    summary: Optional[str] = None
-    details: Optional[Any] = None
-
-
-@dataclass
-class SemanticMemoryEntry:
-    key: Optional[str] = None
-    value: Optional[Any] = None
-
-
-@dataclass
-class ProceduralSkill:
-    name: Optional[str] = None
-    description: Optional[str] = None
-    parameters: Optional[Any] = None
+class PolicyMemoryRecord:
+    policy_id: Optional[str] = None
+    adapter_folder: Optional[str] = None
+    callable_name: Optional[str] = None
+    source: Optional[str] = None
+    signature: Optional[str] = None
+    tags: Optional[List[str]] = None
+    discovered_at: Optional[str] = None
+    last_seen_at: Optional[str] = None
+    selected_count: Optional[int] = None
+    success_count: Optional[int] = None
+    last_selected_at: Optional[str] = None
+    last_score: Optional[float] = None
+    score_history: Optional[List[Any]] = None
+    outcome_history: Optional[List[Any]] = None

@@ -26,32 +26,30 @@ src/
     memory/
       __init__.py
       manager.py
+      long_term_memory.py
       working_memory.py
       self_state.py
       prediction_error.py
       policy_traces.py
-      episodic.py
-      semantic.py
-      procedural.py
     layers/
       __init__.py
-      interoceptive.py
+      interoceptive/
+        __init__.py
+        VitalStateMonitor.py
       predictive.py
-      action_selection.py
+      action_selection/
+        __init__.py
+        PolicyGenerator.py
+        FreeEnergyMinimizer.py
+        MotorControlInterface.py
       metacognitive.py
-    agents/
-      __init__.py
-      homeostatic_agent.py
-      perceptual_agent.py
-      motor_agent.py
-      metacognitive_agent.py
-      coordinator.py
     coordination/
       __init__.py
       messages.py
       workspace.py
     adapters/
       __init__.py
+      loader.py
       minedojo/
         __init__.py
         env_adapter.py
@@ -72,7 +70,7 @@ src/
 **Core Layers**
 Layer 1: Interoceptive Foundation
 Responsibilities: Vital state tracking, allostatic prediction, arousal/valence computation.
-Implementation: `src/core/layers/interoceptive.py`
+Implementation: `src/core/layers/interoceptive/`
 
 Layer 2: Predictive Processing Engine
 Responsibilities: World model prediction, prediction error calculation, precision weighting.
@@ -80,27 +78,21 @@ Implementation: `src/core/layers/predictive.py`
 
 Layer 3: Action Selection and Agency
 Responsibilities: Policy proposals, free-energy minimization, motor translation.
-Implementation: `src/core/layers/action_selection.py`
+Implementation: `src/core/layers/action_selection/`
 
 Layer 4: Metacognitive Monitor
 Responsibilities: Information integration, uncertainty estimation, goal coherence.
 Implementation: `src/core/layers/metacognitive.py`
 
-**Agent Roles**
-Homeostatic Agent: Survival-driven goal generation.
-Implementation: `src/core/agents/homeostatic_agent.py`
-
-Perceptual Agent: Prediction and prediction error generation.
-Implementation: `src/core/agents/perceptual_agent.py`
-
-Motor Agent: Action proposal and selection interface.
-Implementation: `src/core/agents/motor_agent.py`
-
-Metacognitive Agent: Global broadcast and coherence checks.
-Implementation: `src/core/agents/metacognitive_agent.py`
-
-Coordinator: Orchestrates multi-agent step ordering and messaging.
-Implementation: `src/core/agents/coordinator.py`
+**Layer Modules**
+The layer modules map directly to architecture responsibilities without a duplicate
+agent wrapper layer:
+- `src/core/layers/interoceptive/VitalStateMonitor.py`
+- `src/core/layers/predictive.py`
+- `src/core/layers/action_selection/PolicyGenerator.py`
+- `src/core/layers/action_selection/FreeEnergyMinimizer.py`
+- `src/core/layers/action_selection/MotorControlInterface.py`
+- `src/core/layers/metacognitive.py`
 
 **Memory Subsystems**
 Working Memory Buffer: Short-term active goals and predictions.
@@ -115,14 +107,8 @@ Implementation: `src/core/memory/prediction_error.py`
 Policy Traces: Records action-outcome patterns.
 Implementation: `src/core/memory/policy_traces.py`
 
-Episodic Memory: Stores event sequences and episodes.
-Implementation: `src/core/memory/episodic.py`
-
-Semantic Memory: Stores factual knowledge and abstractions.
-Implementation: `src/core/memory/semantic.py`
-
-Procedural Memory: Stores skills and action routines.
-Implementation: `src/core/memory/procedural.py`
+Long-Term Memory: Persists discovered policy metadata and policy outcome history.
+Implementation: `src/core/memory/long_term_memory.py`
 
 Memory Manager: Unified access to all memory subsystems.
 Implementation: `src/core/memory/manager.py`
@@ -134,7 +120,23 @@ Implementation: `src/core/coordination/messages.py`
 Global Workspace: Central broadcast buffer for agent signals.
 Implementation: `src/core/coordination/workspace.py`
 
-**MineDojo Integration**
+**Adapter Integration**
+Runtime adapter selection is configured via root `config.json` using `adapter_folder`.
+
+Adapter loader: Dynamically imports selected adapter package and validates the adapter contract.
+Implementation: `src/core/adapters/loader.py`
+
+Required adapter methods:
+- `reset()`
+- `step(action)`
+- `close()`
+- `get_available_vitals()` -> `list[str]`
+
+Optional adapter method:
+- `sample_action()`
+- `get_available_policies()` -> `list[dict]`
+
+**MineDojo Adapter**
 Environment Adapter: Thin abstraction over MineDojo env lifecycle.
 Implementation: `src/core/adapters/minedojo/env_adapter.py`
 
@@ -152,16 +154,16 @@ Provider stubs: No SDK dependencies; placeholders for OpenAI/Anthropic/Gemini.
 Implementation: `src/core/llm/providers/*.py`
 
 **Runtime Loop**
-AgentLoop: Orchestrates perception -> metacognition -> homeostasis -> action -> env step.
+AgentLoop: Handles environment reset/step, policy discovery/selection, state extraction, and observability.
 Implementation: `src/core/runtime/loop.py`
 
 Entrypoint: `src/core/main.py` defines a stub `main()` for future wiring.
 
 **Data Flow Example: Unexpected Mob**
-1. Perceptual Agent detects prediction error: unexpected mob spawn.
-2. Metacognitive Agent broadcasts a threat signal to the workspace.
-3. Homeostatic Agent raises arousal and generates survival goals.
-4. Motor Agent selects action proposals (fight, flee, build barrier).
+1. Predictive layer detects prediction error: unexpected mob spawn.
+2. Metacognitive layer broadcasts a threat signal to the workspace.
+3. Interoceptive layer raises arousal and generates survival goals.
+4. Action-selection layer proposes actions (fight, flee, build barrier).
 5. Memory Manager records prediction errors and policy traces.
 
 **Observability and Logs**

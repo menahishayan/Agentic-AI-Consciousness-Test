@@ -1,14 +1,33 @@
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, List, Mapping, Optional
 
 
 class PredictionErrorHistory:
     def __init__(self) -> None:
-        pass
+        self.records: List[Any] = []
 
     def record(self, error: Any) -> None:
-        raise NotImplementedError("Prediction error recording not implemented.")
+        self.records.append(error)
 
     def query(self, query: Any) -> Any:
-        raise NotImplementedError("Prediction error query not implemented.")
+        if not isinstance(query, Mapping):
+            return list(self.records)
+
+        policy_id = query.get("policy_id")
+        limit = query.get("limit")
+        out: List[Any] = []
+        for record in self.records:
+            if policy_id is not None:
+                rec_policy_id: Optional[str] = None
+                if isinstance(record, dict):
+                    rec_policy_id = record.get("policy_id")
+                elif hasattr(record, "policy_id"):
+                    rec_policy_id = getattr(record, "policy_id")
+                if rec_policy_id != policy_id:
+                    continue
+            out.append(record)
+
+        if isinstance(limit, int) and limit >= 0:
+            return out[-limit:]
+        return out
