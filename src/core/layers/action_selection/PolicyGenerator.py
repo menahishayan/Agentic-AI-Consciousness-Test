@@ -373,15 +373,24 @@ class PolicyGenerator:
     ) -> Optional[float]:
         if not isinstance(allostatic_assessment, Mapping):
             return None
+        policy_bias_alignment = self._policy_bias_alignment_score(
+            policy=policy,
+            policy_bias=allostatic_assessment.get("policy_bias"),
+        )
         policy_tokens = self._policy_tokens(policy)
         allostatic_tokens = self._allostatic_tokens(allostatic_assessment)
-        if not policy_tokens or not allostatic_tokens:
-            return None
-        overlap = policy_tokens.intersection(allostatic_tokens)
-        union = policy_tokens.union(allostatic_tokens)
-        if not union:
-            return None
-        return self._clamp01(float(len(overlap)) / float(len(union)))
+        overlap_score: Optional[float] = None
+        if policy_tokens and allostatic_tokens:
+            overlap = policy_tokens.intersection(allostatic_tokens)
+            union = policy_tokens.union(allostatic_tokens)
+            if union:
+                overlap_score = self._clamp01(float(len(overlap)) / float(len(union)))
+
+        if overlap_score is None:
+            return policy_bias_alignment
+        if policy_bias_alignment is None:
+            return overlap_score
+        return self._clamp01((overlap_score + policy_bias_alignment) / 2.0)
 
     def _allostatic_urgency_alignment_score(
         self,
@@ -470,6 +479,76 @@ class PolicyGenerator:
         for source in sources:
             tokens.update(self._name_tokens(source))
         return tokens
+
+    def _policy_bias_alignment_score(
+        self,
+        policy: Mapping[str, Any],
+        policy_bias: Any,
+    ) -> Optional[float]:
+        if not isinstance(policy_bias, Mapping):
+            return None
+
+        survival_weight_raw = policy_bias.get("survival_weight")
+        exploration_weight_raw = policy_bias.get("exploration_weight")
+        if not isinstance(survival_weight_raw, (int, float)):
+            return None
+        survival_weight = self._clamp01(float(survival_weight_raw))
+        if isinstance(exploration_weight_raw, (int, float)):
+            exploration_weight = self._clamp01(float(exploration_weight_raw))
+        else:
+            exploration_weight = self._clamp01(1.0 - survival_weight)
+
+        weight_total = survival_weight + exploration_weight
+        if weight_total <= 0.0:
+            survival_weight = 0.5
+            exploration_weight = 0.5
+        else:
+            survival_weight /= weight_total
+            exploration_weight /= weight_total
+
+        affinity = self._policy_survival_affinity(policy)
+        return self._clamp01(
+            survival_weight * affinity + exploration_weight * (1.0 - affinity)
+        )
+
+    def _policy_survival_affinity(self, policy: Mapping[str, Any]) -> float:
+        tokens = self._policy_tokens(policy)
+        if not tokens:
+            return 0.5
+        survival_markers = {
+            "survival",
+            "health",
+            "heal",
+            "food",
+            "hunger",
+            "oxygen",
+            "air",
+            "escape",
+            "retreat",
+            "shelter",
+            "avoid",
+            "defend",
+            "shield",
+            "protect",
+        }
+        exploration_markers = {
+            "explore",
+            "exploration",
+            "scout",
+            "search",
+            "mine",
+            "gather",
+            "discover",
+            "travel",
+            "wander",
+            "survey",
+        }
+        survival_hits = len(tokens.intersection(survival_markers))
+        exploration_hits = len(tokens.intersection(exploration_markers))
+        total = survival_hits + exploration_hits
+        if total <= 0:
+            return 0.5
+        return self._clamp01(float(survival_hits) / float(total))
 
     @staticmethod
     def _allostatic_source(allostatic_assessment: Any) -> Optional[str]:
