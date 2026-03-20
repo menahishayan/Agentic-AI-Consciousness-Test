@@ -1,22 +1,12 @@
 from __future__ import annotations
 
+from copy import deepcopy
 import hashlib
 import json
-import re
-from copy import deepcopy
 from pathlib import Path
+import re
 from types import MethodType
-from typing import (
-    Any,
-    Callable,
-    Dict,
-    Iterable,
-    List,
-    Mapping,
-    Optional,
-    Sequence,
-    Tuple,
-)
+from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 _ADAPTER_DIR = Path(__file__).resolve().parent
 _PROJECT_ROOT = Path(__file__).resolve().parents[4]
@@ -97,11 +87,7 @@ class MineDojoAdapter:
         return obs, self._last_info
 
     def step(self, action: Any) -> Tuple[Any, Any, Any, Any]:
-        try:
-            result = self.env.step(action)
-        except ValueError:
-            # Illegal action (e.g. place-air) — silently fall back to noop
-            result = self.env.step(self._noop_action)
+        result = self.env.step(action)
         if isinstance(result, tuple) and len(result) == 5:
             obs, reward, terminated, truncated, info = result
             done = bool(terminated or truncated)
@@ -857,13 +843,20 @@ class MineDojoAdapter:
         return max(0.0, min(1.0, float(value)))
 
 
-def create_adapter(config: Optional[Mapping[str, Any]] = None) -> MineDojoAdapter:
+def create_adapter(config: Optional[Mapping[str, Any]] = None) -> Any:
+    cfg = dict(config or {})
+
+    # If use_remote=true, connect to a running persistent_server instead of
+    # spawning a new Minecraft process.
+    if cfg.get("use_remote", False):
+        from core.adapters.minedojo.remote_adapter import RemoteMineDojoAdapter
+        return RemoteMineDojoAdapter(cfg)
+
     try:
         import minedojo
     except Exception as exc:  # pragma: no cover - optional dependency
         raise ImportError("minedojo package is required for the minedojo adapter") from exc
 
-    cfg = dict(config or {})
     task_id = cfg.get("task_id", "harvest_milk")
     image_size_value = cfg.get("image_size", (160, 256))
     if isinstance(image_size_value, (list, tuple)) and len(image_size_value) == 2:

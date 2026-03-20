@@ -15,7 +15,8 @@
       256
     ],
     "initial_health": 6,
-    "initial_food": 4
+    "initial_food": 4,
+    "use_remote": true
   },
   "policy_generator": {
     "weights": {
