@@ -31,3 +31,8 @@ class PolicyTraces:
         if isinstance(limit, int) and limit >= 0:
             return out[-limit:]
         return out
+
+    def get_conflict_resolution_score(self, channel_id_a: str, channel_id_b: str) -> float:
+        _ = channel_id_a
+        _ = channel_id_b
+        return 0.0

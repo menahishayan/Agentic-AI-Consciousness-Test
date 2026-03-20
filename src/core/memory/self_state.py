@@ -40,6 +40,11 @@ class SelfStateMemory:
             out = out[-limit:]
         return deepcopy(out)
 
+    def get_depletion_rate(self, channel_id: str, context_hash: str) -> Optional[float]:
+        _ = channel_id
+        _ = context_hash
+        return None
+
     @staticmethod
     def _field(item: Any, key: str) -> Optional[Any]:
         if isinstance(item, Mapping):

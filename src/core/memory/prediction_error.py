@@ -40,6 +40,19 @@ class PredictionErrorHistory:
         familiarity = 1.0 - avg_magnitude
         return max(0.0, min(1.0, familiarity))
 
+    def get_area_threat_prior(self, area_id: str) -> float:
+        key = self._normalize_area_id(area_id)
+        if key is None:
+            return 0.0
+        stats = self._area_stats.get(key)
+        if not isinstance(stats, dict):
+            return 0.0
+        count = float(stats.get("count", 0.0))
+        if count <= 0.0:
+            return 0.0
+        avg_magnitude = float(stats.get("sum", 0.0)) / count
+        return max(0.0, min(1.0, avg_magnitude))
+
     def query(self, query: Any) -> Any:
         if not isinstance(query, Mapping):
             return list(self.records)
