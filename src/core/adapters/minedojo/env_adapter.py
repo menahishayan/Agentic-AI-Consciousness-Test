@@ -1,12 +1,22 @@
 from __future__ import annotations
 
-from copy import deepcopy
 import hashlib
 import json
-from pathlib import Path
 import re
+from copy import deepcopy
+from pathlib import Path
 from types import MethodType
-from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    Iterable,
+    List,
+    Mapping,
+    Optional,
+    Sequence,
+    Tuple,
+)
 
 _ADAPTER_DIR = Path(__file__).resolve().parent
 _PROJECT_ROOT = Path(__file__).resolve().parents[4]
@@ -87,7 +97,11 @@ class MineDojoAdapter:
         return obs, self._last_info
 
     def step(self, action: Any) -> Tuple[Any, Any, Any, Any]:
-        result = self.env.step(action)
+        try:
+            result = self.env.step(action)
+        except ValueError:
+            # Illegal action (e.g. place-air) — silently fall back to noop
+            result = self.env.step(self._noop_action)
         if isinstance(result, tuple) and len(result) == 5:
             obs, reward, terminated, truncated, info = result
             done = bool(terminated or truncated)
