@@ -4,6 +4,8 @@ from collections import deque
 from dataclasses import asdict
 from typing import Any, Callable, Deque, Dict, List, Mapping, Optional
 
+import numpy as np
+
 from core.coordination.messages import AgentMessage
 from core.coordination.workspace import GlobalWorkspace
 from core.layers.action_selection import PolicyGenerator
@@ -73,7 +75,7 @@ class AgentLoop:
         self.vital_state_monitor = VitalStateMonitor(
             expected_vitals=self._load_available_vitals(adapter),
         )
-        self._drive_channels = self._build_drive_channels()
+        self._drive_channels = self._build_drive_channels(allostatic_cfg)
         self._allostatic_config = self._build_allostatic_config(allostatic_cfg)
         self._homeostatic_history: Deque[DriveState] = deque(
             maxlen=max(1, int(self._allostatic_config.history_window))
@@ -102,6 +104,7 @@ class AgentLoop:
         self._last_selected_policy_id = "bootstrap"
         self._last_drive_signals: Optional[PrioritisedDriveSignals] = None
         self._last_perceptual_batch: Optional[PredictionErrorBatch] = None
+        self._last_homeostatic_state_for_memory: Optional[HomeostaticState] = None
 
         self.goal_checker = GoalCoherenceChecker()
         self.policy_prediction_error_calculator = PolicyPredictionErrorCalculator(
@@ -212,6 +215,17 @@ class AgentLoop:
             prediction_error=latest_prediction_error,
         )
         arousal_payload = asdict(arousal_valence_state)
+        channel_deltas = self._homeostatic_deltas(homeostatic_state)
+        self._last_homeostatic_state_for_memory = homeostatic_state
+        self.memory_manager.record_state(
+            state=homeostatic_state,
+            channel_deltas=channel_deltas,
+            context_tags=[
+                f"area:{area_id}",
+                f"tick_bucket:{step // 100}",
+            ],
+            arousal=float(arousal_valence_state.arousal),
+        )
 
         allostatic_assessment["policy_bias"] = dict(arousal_payload["policy_bias"])
         allostatic_assessment["urgency_signal"] = arousal_payload["urgency_signal"]
@@ -308,6 +322,14 @@ class AgentLoop:
                 policy_id=selected_policy_id,
                 reward=reward,
                 done=done,
+                step=step,
+            )
+            self._record_policy_trace(
+                selected_policy_id=selected_policy_id,
+                homeostatic_state=homeostatic_state,
+                arousal=float(arousal_valence_state.arousal),
+                drive_signals=drive_signals,
+                reward=reward,
                 step=step,
             )
             self._last_selected_policy_id = selected_policy_id
@@ -627,9 +649,72 @@ class AgentLoop:
                 pass
         return 0.0
 
+    def _homeostatic_deltas(self, current: HomeostaticState) -> Dict[str, float]:
+        previous = self._last_homeostatic_state_for_memory
+        if previous is None:
+            return {}
+
+        dt = max(1, int(current.tick) - int(previous.tick))
+        channels = ("health", "hunger", "resource_level", "threat_proximity", "oxygen")
+        out: Dict[str, float] = {}
+        for channel in channels:
+            prev_value = getattr(previous, channel, None)
+            curr_value = getattr(current, channel, None)
+            if not isinstance(prev_value, (int, float)):
+                continue
+            if not isinstance(curr_value, (int, float)):
+                continue
+            out[channel] = float(curr_value - prev_value) / float(dt)
+        return out
+
+    def _record_policy_trace(
+        self,
+        selected_policy_id: str,
+        homeostatic_state: HomeostaticState,
+        arousal: float,
+        drive_signals: PrioritisedDriveSignals,
+        reward: Any,
+        step: int,
+    ) -> None:
+        signals = list(drive_signals.signals)
+        if not signals:
+            return
+
+        winner = signals[0]
+        runner_up = signals[1] if len(signals) > 1 else winner
+        context_vector = np.asarray(
+            [
+                self._clamp01(homeostatic_state.health),
+                self._clamp01(homeostatic_state.hunger),
+                self._clamp01(homeostatic_state.resource_level),
+                self._clamp01(homeostatic_state.threat_proximity),
+                self._clamp01(homeostatic_state.oxygen),
+                self._clamp01(arousal),
+            ],
+            dtype=np.float32,
+        )
+        self.memory_manager.record_trace(
+            channel_a_id=winner.channel_id,
+            channel_b_id=runner_up.channel_id,
+            winner_channel_id=winner.channel_id,
+            action_tag=str(selected_policy_id),
+            context_vector=context_vector,
+            outcome_score=self._reward_to_outcome_score(reward),
+            tick=int(step),
+        )
+
     @staticmethod
-    def _build_drive_channels() -> List[DriveChannel]:
-        return [
+    def _reward_to_outcome_score(reward: Any) -> float:
+        try:
+            numeric = float(reward)
+        except (TypeError, ValueError):
+            return 0.5
+        # Squash arbitrary reward scale into [0, 1].
+        return max(0.0, min(1.0, (numeric + 1.0) / 2.0))
+
+    @staticmethod
+    def _build_drive_channels(config: Mapping[str, Any]) -> List[DriveChannel]:
+        default_channels: List[DriveChannel] = [
             DriveChannel(
                 id="health",
                 setpoint=0.9,
@@ -671,6 +756,30 @@ class AgentLoop:
                 suggested_action_tag="retreat",
             ),
         ]
+        raw_channels = config.get("channels")
+        if not isinstance(raw_channels, list):
+            return default_channels
+
+        out: List[DriveChannel] = []
+        for item in raw_channels:
+            if not isinstance(item, Mapping):
+                continue
+            channel_id = item.get("id")
+            if not isinstance(channel_id, str) or not channel_id.strip():
+                continue
+            out.append(
+                DriveChannel(
+                    id=channel_id.strip(),
+                    setpoint=AgentLoop._clamp(item.get("setpoint", 0.8), 0.0, 1.0),
+                    critical_threshold=AgentLoop._clamp(
+                        item.get("critical_threshold", 0.3), 0.0, 1.0
+                    ),
+                    irreversible=bool(item.get("irreversible", False)),
+                    recovery_cost_ticks=max(0, int(item.get("recovery_cost_ticks", 20))),
+                    suggested_action_tag=str(item.get("suggested_action_tag", "")).strip(),
+                )
+            )
+        return out or default_channels
 
     @staticmethod
     def _build_allostatic_config(config: Mapping[str, Any]) -> AllostaticConfig:

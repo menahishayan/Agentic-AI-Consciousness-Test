@@ -134,11 +134,27 @@ def main():
                 'Return JSON only, like: {"action": [0,1,0,...]}.\n'
             )
 
-            resp = client.responses.create(
-                model=MODEL,
-                input=prompt,
-            )
-            text = getattr(resp, "output_text", "") or ""
+            text = ""
+            responses_api = getattr(client, "responses", None)
+            if responses_api is not None and callable(getattr(responses_api, "create", None)):
+                resp = responses_api.create(
+                    model=MODEL,
+                    input=prompt,
+                )
+                text = getattr(resp, "output_text", "") or ""
+            else:
+                chat_api = getattr(client, "chat", None)
+                completions_api = None if chat_api is None else getattr(chat_api, "completions", None)
+                if completions_api is None or not callable(getattr(completions_api, "create", None)):
+                    raise RuntimeError("OpenAI client does not expose a supported completion API.")
+                chat_resp = completions_api.create(
+                    model=MODEL,
+                    messages=[{"role": "user", "content": prompt}],
+                )
+                choices = getattr(chat_resp, "choices", None) or []
+                if choices:
+                    message = getattr(choices[0], "message", None)
+                    text = "" if message is None else (getattr(message, "content", "") or "")
             action, parse_meta = parse_action(text, space)
 
             obs, reward, done, info = env.step(action)

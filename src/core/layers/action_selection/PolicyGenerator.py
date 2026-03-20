@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 import inspect
 import re
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence
+from typing import Any, Dict, Iterable, List, Mapping, Optional
 
 from core.models.signals import ActionProposal
 from core.observability.logger import RunLogger
@@ -63,10 +63,6 @@ class PolicyGenerator:
         self.fallback_allostatic_urgency_alignment = self._as_float(
             fallback_scores.get("allostatic_urgency_alignment"), 0.5
         )
-
-        discovery = self.config.get("discovery", {})
-        reserved = discovery.get("reserved_methods", ())
-        self.reserved_methods = set(self._normalize_reserved_methods(reserved))
 
     def propose_action(self, goals: Any, context: Mapping[str, Any]) -> Optional[ActionProposal]:
         policies = self.discover_policies()
@@ -205,27 +201,6 @@ class PolicyGenerator:
             if descriptor is not None:
                 normalized.append(descriptor)
         return normalized
-
-    def _discover_from_public_callables(self) -> List[Dict[str, Any]]:
-        found: List[Dict[str, Any]] = []
-        for name in dir(self.adapter):
-            if name.startswith("_"):
-                continue
-            if name in self.reserved_methods:
-                continue
-            try:
-                member = getattr(self.adapter, name)
-            except Exception:
-                continue
-            if not callable(member):
-                continue
-            descriptor = self._normalize_policy_descriptor(
-                {"callable_name": name, "tags": self._name_tokens(name)},
-                source="introspection",
-            )
-            if descriptor is not None:
-                found.append(descriptor)
-        return found
 
     def _normalize_policy_descriptor(
         self,
@@ -666,31 +641,6 @@ class PolicyGenerator:
             if drive_tag in tokens or preferred.intersection(tokens):
                 out.append(drive_tag)
         return out
-
-    @staticmethod
-    def _normalize_reserved_methods(values: Any) -> Sequence[str]:
-        default = (
-            "reset",
-            "step",
-            "close",
-            "sample_action",
-            "get_available_vitals",
-            "get_available_policies",
-            "get_action_space_actions",
-            "get_raw_observation",
-        )
-        if not isinstance(values, Iterable) or isinstance(values, (str, bytes)):
-            return default
-
-        out: List[str] = []
-        seen = set()
-        for value in values:
-            name = str(value).strip()
-            if not name or name in seen:
-                continue
-            out.append(name)
-            seen.add(name)
-        return out or list(default)
 
     @staticmethod
     def _normalize_tags(raw: Any) -> List[str]:

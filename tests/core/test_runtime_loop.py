@@ -3,9 +3,9 @@ from __future__ import annotations
 from typing import Any, Dict, List, Mapping, Optional
 
 from core.layers.interoceptive import VitalStateMonitor
-from core.memory.manager import MemoryManager
 from core.models.state import AgentState
 from core.runtime.loop import AgentLoop
+from memory.memory_manager import MemoryManager
 
 
 class _DriveAwareDummyAdapter:
@@ -202,10 +202,11 @@ def test_prediction_error_is_attributed_to_previous_selected_policy() -> None:
 def test_drive_allostasis_uses_rolling_history_and_emits_signals() -> None:
     adapter = _DriveAwareDummyAdapter()
     mapper = _CountingMapper()
+    memory_manager = MemoryManager()
     loop = AgentLoop(
         adapter=adapter,
         observation_mapper=mapper,
-        memory_manager=MemoryManager(),
+        memory_manager=memory_manager,
         adapter_folder="dummy",
         policy_config={},
     )
@@ -216,3 +217,5 @@ def test_drive_allostasis_uses_rolling_history_and_emits_signals() -> None:
     assert loop._last_drive_signals is not None  # noqa: SLF001
     assert len(loop._homeostatic_history) >= 2  # noqa: SLF001
     assert isinstance(loop._last_drive_signals.signals, list)  # noqa: SLF001
+    assert memory_manager.self_state._metadata  # noqa: SLF001
+    assert memory_manager.policy_traces._metadata  # noqa: SLF001
