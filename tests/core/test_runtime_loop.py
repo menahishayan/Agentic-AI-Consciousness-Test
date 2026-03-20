@@ -2,11 +2,14 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Mapping, Optional
 
-from core.layers.interoceptive import VitalStateMonitor
+from core.layers.interoceptive import (
+    DriveSignal,
+    PrioritisedDriveSignals,
+    VitalStateMonitor,
+)
+from core.memory import MemoryManager
 from core.models.state import AgentState
 from core.runtime.loop import AgentLoop
-from homeostatic import DriveSignal, PrioritisedDriveSignals
-from memory.memory_manager import MemoryManager
 
 
 class _DriveAwareDummyAdapter:

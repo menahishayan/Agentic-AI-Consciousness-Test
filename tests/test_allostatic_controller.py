@@ -4,7 +4,7 @@ from typing import Dict, List
 
 import pytest
 
-from homeostatic.allostatic_controller import (
+from core.layers.interoceptive import (
     AllostaticConfig,
     AllostaticController,
     DriveChannel,

@@ -1,4 +1,6 @@
-from perceptual.prediction_error_calculator import (
+from __future__ import annotations
+
+from core.perceptual.prediction_error_calculator import (
     ObservationSnapshot,
     PEConfig,
     PredictionError,

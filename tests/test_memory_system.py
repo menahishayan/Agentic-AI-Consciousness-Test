@@ -6,11 +6,15 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
-from memory.memory_manager import MemoryConfig, MemoryManager
-from memory.policy_traces import PolicyTraces
-from memory.prediction_error_history import PredictionErrorHistory
-from memory.self_state_tracking import SelfStateTracking
-from memory.working_memory_buffer import WorkingMemoryBuffer, WorkingMemoryEntry
+from core.memory import (
+    MemoryConfig,
+    MemoryManager,
+    PolicyTraces,
+    PredictionErrorHistory,
+    SelfStateTracking,
+    WorkingMemoryBuffer,
+    WorkingMemoryEntry,
+)
 
 
 @dataclass

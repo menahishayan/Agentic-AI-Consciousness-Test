@@ -6,7 +6,7 @@ from typing import Dict, List
 import numpy as np
 import pytest
 
-from perceptual.prediction_error_calculator import (
+from core.perceptual import (
     ObservationSnapshot,
     PEConfig,
     PredictionErrorCalculator,

@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any, Dict, Mapping
 
 from core.adapters.loader import build_adapter
-from memory.memory_manager import MemoryConfig, MemoryManager
+from core.memory import MemoryConfig, MemoryManager
 from core.observability import LoggingConfig, RunLogger, install_exception_hooks
 from core.runtime.loop import AgentLoop
 

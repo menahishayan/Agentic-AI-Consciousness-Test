@@ -1,23 +1,37 @@
 from __future__ import annotations
 
-from core.layers.interoceptive.AllostaticController import AllostaticController
+from core.layers.interoceptive.allostatic_controller import (
+    AllostaticConfig,
+    AllostaticController,
+    DriveChannel,
+    DriveSignal,
+    HomeostaticHistory,
+    HomeostaticState,
+    PrioritisedDriveSignals,
+)
 from core.layers.interoceptive.ArousalValenceSystem import (
     ArousalValenceConfig,
     ArousalValenceState,
     ArousalValenceSystem,
-    HomeostaticState,
+    HomeostaticState as ArousalHomeostaticState,
     PolicyBias,
     PredictionError,
 )
 from core.layers.interoceptive.VitalStateMonitor import VitalStateMonitor
 
 __all__ = [
-    "VitalStateMonitor",
+    "AllostaticConfig",
     "AllostaticController",
-    "ArousalValenceSystem",
     "ArousalValenceConfig",
+    "ArousalHomeostaticState",
     "ArousalValenceState",
+    "ArousalValenceSystem",
+    "DriveChannel",
+    "DriveSignal",
+    "HomeostaticHistory",
     "HomeostaticState",
-    "PredictionError",
     "PolicyBias",
+    "PredictionError",
+    "PrioritisedDriveSignals",
+    "VitalStateMonitor",
 ]

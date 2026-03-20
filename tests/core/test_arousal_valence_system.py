@@ -4,9 +4,9 @@ import numpy as np
 import pytest
 
 from core.layers.interoceptive import (
+    ArousalHomeostaticState as HomeostaticState,
     ArousalValenceConfig,
     ArousalValenceSystem,
-    HomeostaticState,
     PredictionError,
 )
 

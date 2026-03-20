@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-from core.layers.interoceptive import AllostaticController
-from homeostatic.allostatic_controller import (
+from core.layers.interoceptive import (
     AllostaticConfig,
+    AllostaticController,
     DriveChannel,
     HomeostaticHistory,
     HomeostaticState,

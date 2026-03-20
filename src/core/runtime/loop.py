@@ -11,9 +11,15 @@ from core.coordination.messages import AgentMessage
 from core.coordination.workspace import GlobalWorkspace
 from core.layers.action_selection import PolicyGenerator
 from core.layers.interoceptive import (
+    AllostaticConfig,
+    AllostaticController,
+    ArousalHomeostaticState as HomeostaticState,
     ArousalValenceSystem,
-    HomeostaticState,
+    DriveChannel,
+    HomeostaticHistory as DriveHistory,
+    HomeostaticState as DriveState,
     PredictionError,
+    PrioritisedDriveSignals,
     VitalStateMonitor,
 )
 from core.layers.metacognitive import GoalCoherenceChecker
@@ -21,16 +27,8 @@ from core.layers.predictive import PredictionErrorCalculator as PolicyPrediction
 from core.models.signals import ActionProposal
 from core.models.state import AgentState
 from core.observability.logger import RunLogger
-from homeostatic import (
-    AllostaticConfig,
-    AllostaticController,
-    DriveChannel,
-    HomeostaticHistory as DriveHistory,
-    HomeostaticState as DriveState,
-    PrioritisedDriveSignals,
-)
-from memory.memory_manager import MemoryManager
-from perceptual import (
+from core.memory import MemoryManager
+from core.perceptual import (
     ObservationSnapshot,
     PEConfig,
     PredictionErrorBatch,
