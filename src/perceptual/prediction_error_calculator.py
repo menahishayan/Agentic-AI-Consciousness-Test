@@ -69,11 +69,12 @@ class PredictionErrorCalculator:
     def __init__(
         self,
         config: PEConfig,
+        memory_manager: Optional[Any] = None,
         pe_history: Optional[Any] = None,
         message_bus: Any = None,
     ) -> None:
         self.config = self._normalize_config(config)
-        self.pe_history = pe_history
+        self.memory_manager = memory_manager if memory_manager is not None else pe_history
         self.message_bus = message_bus
 
         self._baseline: Dict[str, float] = {}
@@ -165,7 +166,7 @@ class PredictionErrorCalculator:
             self._variance[channel] = max(updated_var, self.config.epsilon**2)
 
     def _estimate_precision(self, area_id: str) -> float:
-        getter = getattr(self.pe_history, "get_area_familiarity", None)
+        getter = getattr(self.memory_manager, "get_area_familiarity", None)
         if not callable(getter):
             return self.config.default_precision
         try:
@@ -178,13 +179,21 @@ class PredictionErrorCalculator:
         return self._clip01(precision)
 
     def _record_errors(self, area_id: str, errors: List[PredictionError]) -> None:
-        if self.pe_history is None:
-            return
-        record = getattr(self.pe_history, "record", None)
-        if not callable(record):
+        if self.memory_manager is None:
             return
 
         for error in errors:
+            record_pe = getattr(self.memory_manager, "record_pe", None)
+            if callable(record_pe):
+                try:
+                    record_pe(str(area_id), error)
+                    continue
+                except Exception:
+                    pass
+
+            record = getattr(self.memory_manager, "record", None)
+            if not callable(record):
+                continue
             try:
                 record(str(area_id), error)
                 continue

@@ -72,16 +72,21 @@ class AllostaticController:
         self_state_memory: Optional[Any] = None,
         pe_history: Optional[Any] = None,
         policy_traces: Optional[Any] = None,
+        memory_manager: Optional[Any] = None,
         message_bus: Any = None,
     ) -> None:
         self.config = self._normalize_config(config)
         self.channels = list(channels)
         self._channel_map = {channel.id: channel for channel in self.channels}
-        self.self_state_memory = self_state_memory
-        self.pe_history = pe_history
-        self.policy_traces = policy_traces
+        self.memory_manager = memory_manager
+        self.self_state_memory = (
+            self_state_memory if self_state_memory is not None else memory_manager
+        )
+        self.pe_history = pe_history if pe_history is not None else memory_manager
+        self.policy_traces = policy_traces if policy_traces is not None else memory_manager
         self.message_bus = message_bus
         self._last_output: Optional[PrioritisedDriveSignals] = None
+        self._last_tick: int = 0
 
     def update(
         self,
@@ -96,6 +101,7 @@ class AllostaticController:
             return out
 
         newest = snapshots[0]
+        self._last_tick = int(history.tick)
         context_hash = self._resolve_context_hash(newest, area_id)
         active_channels = history.channels if history.channels else self.channels
         max_recovery_cost = max((max(0, int(c.recovery_cost_ticks)) for c in active_channels), default=1)
@@ -110,6 +116,7 @@ class AllostaticController:
             raw_rate = self._rate_of_change(values_oldest_first)
             corrected_rate, confidence = self._memory_corrected_rate(
                 channel_id=channel.id,
+                state_snapshot=newest,
                 context_hash=context_hash,
                 raw_rate=raw_rate,
                 snapshot_count=len(snapshots),
@@ -165,7 +172,7 @@ class AllostaticController:
         if abs(delta) > self.config.urgency_tie_epsilon:
             return -1 if delta > 0.0 else 1
 
-        conflict_score = self._conflict_resolution_score(left.channel_id, right.channel_id)
+        conflict_score = self._conflict_resolution_score(left, right)
         if conflict_score > 0.0:
             return -1
         if conflict_score < 0.0:
@@ -185,10 +192,24 @@ class AllostaticController:
     def _memory_corrected_rate(
         self,
         channel_id: str,
+        state_snapshot: HomeostaticState,
         context_hash: str,
         raw_rate: float,
         snapshot_count: int,
     ) -> tuple[float, float]:
+        getter = getattr(self.memory_manager, "get_depletion_rate", None)
+        if callable(getter):
+            try:
+                historical_rate = getter(state_snapshot, channel_id)
+            except TypeError:
+                historical_rate = None
+            except Exception:
+                historical_rate = None
+            if isinstance(historical_rate, (int, float)):
+                corrected = 0.6 * raw_rate + 0.4 * float(historical_rate)
+                confidence = max(self.config.min_confidence, 0.75)
+                return corrected, self._clip(confidence, self.config.min_confidence, 1.0)
+
         getter = getattr(self.self_state_memory, "get_depletion_rate", None)
         if callable(getter):
             try:
@@ -213,7 +234,9 @@ class AllostaticController:
         if isinf(ticks_to_critical) or not channel.irreversible:
             return ticks_to_critical
 
-        getter = getattr(self.pe_history, "get_area_threat_prior", None)
+        getter = getattr(self.memory_manager, "get_area_threat_prior", None)
+        if not callable(getter):
+            getter = getattr(self.pe_history, "get_area_threat_prior", None)
         if not callable(getter):
             return ticks_to_critical
 
@@ -301,17 +324,56 @@ class AllostaticController:
             return area_id.strip()
         return "default"
 
-    def _conflict_resolution_score(self, channel_id_a: str, channel_id_b: str) -> float:
-        getter = getattr(self.policy_traces, "get_conflict_resolution_score", None)
-        if not callable(getter):
-            return 0.0
-        try:
-            score = getter(channel_id_a, channel_id_b)
-        except Exception:
-            return 0.0
+    def _conflict_resolution_score(self, left: DriveSignal, right: DriveSignal) -> float:
+        channel_id_a = left.channel_id
+        channel_id_b = right.channel_id
+        context_vector = self._build_conflict_context_vector(left, right)
+
+        getter = getattr(self.memory_manager, "get_conflict_resolution_score", None)
+        score: Any = None
+        if callable(getter):
+            try:
+                score = getter(channel_id_a, channel_id_b, context_vector)
+            except TypeError:
+                score = getter(channel_id_a, channel_id_b)
+            except Exception:
+                score = None
+
+        if score is None:
+            getter = getattr(self.policy_traces, "get_conflict_resolution_score", None)
+            if not callable(getter):
+                return 0.0
+            try:
+                score = getter(channel_id_a, channel_id_b)
+            except Exception:
+                return 0.0
+
         if not isinstance(score, (int, float)):
             return 0.0
         return float(score)
+
+    def _build_conflict_context_vector(self, left: DriveSignal, right: DriveSignal) -> np.ndarray:
+        left_channel = self._channel_map.get(left.channel_id)
+        right_channel = self._channel_map.get(right.channel_id)
+        survival_weight = 1.0 if (
+            bool(getattr(left_channel, "irreversible", False))
+            or bool(getattr(right_channel, "irreversible", False))
+        ) else 0.5
+        tick_norm = self._clip01(
+            float(self._last_tick % max(1, self.config.planning_horizon))
+            / float(max(1, self.config.planning_horizon))
+        )
+        return np.asarray(
+            [
+                self._clip01(left.urgency),
+                self._clip01(right.urgency),
+                self._clip01(max(left.urgency, right.urgency)),
+                self._clip(left.projected_value - right.projected_value, -1.0, 1.0),
+                self._clip01(survival_weight),
+                tick_norm,
+            ],
+            dtype=np.float32,
+        )
 
     def _publish(self, output: PrioritisedDriveSignals) -> None:
         publish = getattr(self.message_bus, "publish", None)

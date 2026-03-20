@@ -64,6 +64,7 @@ class AgentLoop:
             config=arousal_cfg,
             message_bus=self.workspace,
             self_state_tracker=self.memory_manager.self_state,
+            memory_manager=self.memory_manager,
         )
         self._initialized = False
         self._last_obs: Any = None

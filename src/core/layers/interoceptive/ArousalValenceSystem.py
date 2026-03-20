@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
-from typing import Any, Mapping, Optional
+from typing import Any, Dict, Mapping, Optional
 
 import numpy as np
 
@@ -63,11 +63,14 @@ class ArousalValenceSystem:
         config: Optional[Mapping[str, Any] | ArousalValenceConfig] = None,
         message_bus: Any = None,
         self_state_tracker: Any = None,
+        memory_manager: Any = None,
     ) -> None:
         self.config = self._normalize_config(config)
         self.message_bus = message_bus
         self.self_state_tracker = self_state_tracker
+        self.memory_manager = memory_manager if memory_manager is not None else self_state_tracker
         self._last_tick: Optional[int] = None
+        self._last_homeostatic_state: Optional[HomeostaticState] = None
         self._current_state = self._build_state(
             arousal=self.config.resting_arousal,
             valence=0.0,
@@ -121,10 +124,16 @@ class ArousalValenceSystem:
             )
             arousal = self._clip01(max(raw_arousal, decayed_prior))
 
+        channel_deltas = self._compute_channel_deltas(homeostatic_state)
         self._current_state = self._build_state(arousal=arousal, valence=valence, tick=tick)
         self._last_tick = tick
         self._publish(self._current_state)
-        self._record_high_arousal_if_needed(self._current_state)
+        self._record_high_arousal_if_needed(
+            state=self._current_state,
+            homeostatic_state=homeostatic_state,
+            channel_deltas=channel_deltas,
+        )
+        self._last_homeostatic_state = homeostatic_state
         return self.get_current_state()
 
     def apply_decay(self, dt: int) -> None:
@@ -161,6 +170,7 @@ class ArousalValenceSystem:
             tick=0,
         )
         self._last_tick = None
+        self._last_homeostatic_state = None
 
     def _build_state(self, arousal: float, valence: float, tick: int) -> ArousalValenceState:
         arousal = self._clip01(arousal)
@@ -215,20 +225,67 @@ class ArousalValenceSystem:
         except TypeError:
             publish(topic="homeostatic.arousal_valence", payload=payload)
 
-    def _record_high_arousal_if_needed(self, state: ArousalValenceState) -> None:
-        if state.arousal <= 0.7 or self.self_state_tracker is None:
+    def _record_high_arousal_if_needed(
+        self,
+        state: ArousalValenceState,
+        homeostatic_state: HomeostaticState,
+        channel_deltas: Mapping[str, float],
+    ) -> None:
+        if state.arousal <= 0.7:
             return
+
+        record_state = getattr(self.memory_manager, "record_state", None)
+        if callable(record_state):
+            context_tags = [f"tick_bucket:{state.tick // 100}"]
+            time_of_day = getattr(homeostatic_state, "time_of_day", None)
+            if isinstance(time_of_day, (int, float)):
+                context_tags.append(f"time_of_day:{float(time_of_day):.2f}")
+            try:
+                record_state(
+                    homeostatic_state,
+                    dict(channel_deltas),
+                    context_tags,
+                    float(state.arousal),
+                )
+                return
+            except Exception:
+                pass
+
+        # Backward-compatible fallback for legacy trackers.
         record = getattr(self.self_state_tracker, "record", None)
-        if not callable(record):
-            return
-        record(
-            {
-                "tick": state.tick,
-                "phase": "arousal_valence_alert",
-                "topic": "homeostatic.arousal_valence",
-                "arousal_valence": asdict(state),
-            }
+        if callable(record):
+            record(
+                {
+                    "tick": state.tick,
+                    "phase": "arousal_valence_alert",
+                    "topic": "homeostatic.arousal_valence",
+                    "arousal_valence": asdict(state),
+                }
+            )
+
+    def _compute_channel_deltas(self, current: HomeostaticState) -> Dict[str, float]:
+        previous = self._last_homeostatic_state
+        if previous is None:
+            return {}
+
+        dt = max(1, int(current.tick) - int(previous.tick))
+        deltas: Dict[str, float] = {}
+        channels = (
+            "health",
+            "hunger",
+            "resource_level",
+            "threat_proximity",
+            "oxygen",
         )
+        for channel in channels:
+            prev_value = getattr(previous, channel, None)
+            curr_value = getattr(current, channel, None)
+            if not isinstance(prev_value, (int, float)):
+                continue
+            if not isinstance(curr_value, (int, float)):
+                continue
+            deltas[channel] = float(curr_value - prev_value) / float(dt)
+        return deltas
 
     @staticmethod
     def _normalize_config(
