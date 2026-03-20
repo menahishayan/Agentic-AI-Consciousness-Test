@@ -14,6 +14,14 @@ def _utc_ts() -> str:
 
 
 class PolicyGenerator:
+    _DRIVE_PREFERRED_TAGS: Dict[str, set[str]] = {
+        "health": {"heal", "retreat", "defend"},
+        "hunger": {"eat", "collect", "cook"},
+        "oxygen": {"surface", "ascend", "air"},
+        "resource_level": {"gather", "mine", "craft"},
+        "safety": {"retreat", "avoid", "shelter"},
+    }
+
     def __init__(
         self,
         adapter: Any,
@@ -68,6 +76,7 @@ class PolicyGenerator:
         policy_records = self._policy_record_map()
         scored: List[Dict[str, Any]] = []
         allostatic_assessment = context.get("allostatic_assessment")
+        drive_signals = context.get("drive_signals")
         for policy in policies:
             coherence_result = self.goal_checker.check(goals, policy, context)
             prediction_result = self.prediction_error_calculator.compute(
@@ -75,6 +84,12 @@ class PolicyGenerator:
                 context=context,
                 memory_manager=self.memory_manager,
             )
+            drive_urgency_alignment_score = self._drive_urgency_alignment_score(
+                policy=policy,
+                drive_signals=drive_signals,
+            )
+            if drive_urgency_alignment_score is None:
+                drive_urgency_alignment_score = 0.0
             coherence_score = self._score_from_result(
                 coherence_result,
                 "coherence_score",
@@ -97,7 +112,10 @@ class PolicyGenerator:
                 allostatic_assessment=allostatic_assessment,
             )
             if urgency_alignment_score is None:
-                urgency_alignment_score = self.fallback_allostatic_urgency_alignment
+                urgency_alignment_score = drive_urgency_alignment_score
+            urgency_alignment_score = self._clamp01(
+                max(urgency_alignment_score, drive_urgency_alignment_score)
+            )
 
             combined_score = self._combine_weighted_scores(
                 coherence_score=coherence_score,
@@ -118,11 +136,13 @@ class PolicyGenerator:
                     "prediction_error_score": prediction_error_score,
                     "survival_fit_score": survival_fit_score,
                     "urgency_alignment_score": urgency_alignment_score,
+                    "drive_urgency_alignment_score": drive_urgency_alignment_score,
                 }
             )
 
         scored.sort(
             key=lambda item: (
+                -float(item["drive_urgency_alignment_score"]),
                 -float(item["combined_score"]),
                 item["last_selected_at"],
                 item["policy"]["policy_id"],
@@ -142,6 +162,7 @@ class PolicyGenerator:
                 "prediction_error_score": candidate["prediction_error_score"],
                 "survival_fit_score": candidate["survival_fit_score"],
                 "urgency_alignment_score": candidate["urgency_alignment_score"],
+                "drive_urgency_alignment_score": candidate["drive_urgency_alignment_score"],
                 "coherence_result": candidate["coherence_result"],
                 "prediction_result": candidate["prediction_result"],
                 "allostatic_source": self._allostatic_source(allostatic_assessment),
@@ -165,8 +186,6 @@ class PolicyGenerator:
 
     def discover_policies(self) -> List[Dict[str, Any]]:
         policies = self._discover_from_adapter_api()
-        if not policies:
-            policies = self._discover_from_public_callables()
         self.memory_manager.register_policies(policies)
         return policies
 
@@ -233,6 +252,14 @@ class PolicyGenerator:
         if description is not None:
             description = str(description)
         tags = self._normalize_tags(policy.get("tags"))
+        if not tags:
+            return None
+        drive_tags = self._normalize_tags(policy.get("drive_tags"))
+        if not drive_tags:
+            descriptor_texts = [callable_name]
+            if isinstance(description, str):
+                descriptor_texts.append(description)
+            drive_tags = self._infer_drive_tags(tags=tags, descriptor_texts=descriptor_texts)
         signature = str(inspect.signature(member))
         provided_policy_id = policy.get("policy_id")
         if isinstance(provided_policy_id, str) and provided_policy_id.strip():
@@ -247,6 +274,7 @@ class PolicyGenerator:
             "source": source,
             "signature": signature,
             "tags": tags,
+            "drive_tags": drive_tags,
             "description": description,
         }
 
@@ -432,6 +460,43 @@ class PolicyGenerator:
             return None
         return self._clamp01(weighted / total)
 
+    def _drive_urgency_alignment_score(
+        self,
+        policy: Mapping[str, Any],
+        drive_signals: Any,
+    ) -> Optional[float]:
+        signals = self._resolve_drive_signals(drive_signals)
+        if not signals:
+            return None
+        policy_tokens = self._policy_tokens(policy)
+        if not policy_tokens:
+            return None
+
+        weighted = 0.0
+        total = 0.0
+        for signal in signals:
+            channel_id = signal.get("channel_id")
+            urgency_raw = signal.get("urgency")
+            if not isinstance(channel_id, str):
+                continue
+            if not isinstance(urgency_raw, (int, float)):
+                continue
+            urgency = self._clamp01(float(urgency_raw))
+            if urgency <= 0.0:
+                continue
+
+            preferred_tags = self._preferred_tags_for_drive(channel_id)
+            if not preferred_tags:
+                continue
+            overlap = preferred_tags.intersection(policy_tokens)
+            score = float(len(overlap)) / float(len(preferred_tags))
+            weighted += urgency * score
+            total += urgency
+
+        if total <= 0.0:
+            return None
+        return self._clamp01(weighted / total)
+
     def _policy_tokens(self, policy: Mapping[str, Any]) -> set[str]:
         sources: List[str] = []
         for key in ("policy_id", "callable_name", "description"):
@@ -439,7 +504,7 @@ class PolicyGenerator:
             if value is not None:
                 sources.append(str(value))
 
-        for key in ("tags", "survival_domains"):
+        for key in ("tags", "drive_tags", "survival_domains"):
             values = policy.get(key)
             if isinstance(values, Iterable) and not isinstance(values, (str, bytes)):
                 for value in values:
@@ -559,6 +624,48 @@ class PolicyGenerator:
             return None
         text = str(source).strip()
         return text or None
+
+    def _resolve_drive_signals(self, drive_signals: Any) -> List[Dict[str, Any]]:
+        if drive_signals is None:
+            return []
+
+        if isinstance(drive_signals, Mapping):
+            raw_signals = drive_signals.get("signals")
+        elif hasattr(drive_signals, "signals"):
+            raw_signals = getattr(drive_signals, "signals")
+        else:
+            raw_signals = None
+
+        if not isinstance(raw_signals, list):
+            return []
+
+        out: List[Dict[str, Any]] = []
+        for item in raw_signals:
+            if isinstance(item, Mapping):
+                out.append(dict(item))
+                continue
+            if hasattr(item, "__dict__"):
+                out.append(dict(vars(item)))
+        return out
+
+    def _preferred_tags_for_drive(self, channel_id: str) -> set[str]:
+        normalized = str(channel_id).strip().lower()
+        if not normalized:
+            return set()
+        preferred = set(self._DRIVE_PREFERRED_TAGS.get(normalized, set()))
+        preferred.add(normalized)
+        return preferred
+
+    def _infer_drive_tags(self, tags: List[str], descriptor_texts: List[str]) -> List[str]:
+        tokens = set(tags)
+        for text in descriptor_texts:
+            tokens.update(self._name_tokens(text))
+
+        out: List[str] = []
+        for drive_tag, preferred in self._DRIVE_PREFERRED_TAGS.items():
+            if drive_tag in tokens or preferred.intersection(tokens):
+                out.append(drive_tag)
+        return out
 
     @staticmethod
     def _normalize_reserved_methods(values: Any) -> Sequence[str]:

@@ -19,7 +19,7 @@ class PredictionErrorCalculator:
         context: Any = None,
         memory_manager: Any = None,
     ) -> Dict[str, Any]:
-        if memory_manager is None or not hasattr(memory_manager, "prediction_errors"):
+        if memory_manager is None:
             return {
                 "prediction_error_score": None,
                 "reason": "prediction_history_unavailable",
@@ -27,7 +27,7 @@ class PredictionErrorCalculator:
             }
 
         query = {"policy_id": policy_id, "limit": self.window_size}
-        history = memory_manager.prediction_errors.query(query)
+        history = self._query_prediction_history(memory_manager=memory_manager, query=query)
         if not isinstance(history, list) or not history:
             return {
                 "prediction_error_score": None,
@@ -72,6 +72,29 @@ class PredictionErrorCalculator:
             if isinstance(value, (int, float)):
                 return abs(float(value))
         return None
+
+    @staticmethod
+    def _query_prediction_history(memory_manager: Any, query: Mapping[str, Any]) -> List[Any]:
+        query_prediction_errors = getattr(memory_manager, "query_prediction_errors", None)
+        if callable(query_prediction_errors):
+            try:
+                return query_prediction_errors(
+                    policy_id=query.get("policy_id"),
+                    area_id=query.get("area_id"),
+                    limit=query.get("limit"),
+                )
+            except Exception:
+                pass
+
+        prediction_errors = getattr(memory_manager, "prediction_errors", None)
+        if prediction_errors is not None:
+            query_method = getattr(prediction_errors, "query", None)
+            if callable(query_method):
+                try:
+                    return query_method(query)
+                except Exception:
+                    pass
+        return []
 
 
 class PrecisionWeighter:

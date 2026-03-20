@@ -6,8 +6,7 @@ from pathlib import Path
 from typing import Any, Dict, Mapping
 
 from core.adapters.loader import build_adapter
-from core.llm.factory import build_llm_client
-from core.memory.manager import MemoryManager
+from memory.memory_manager import MemoryConfig, MemoryManager
 from core.observability import LoggingConfig, RunLogger, install_exception_hooks
 from core.runtime.loop import AgentLoop
 
@@ -94,18 +93,28 @@ def load_config(path: Path) -> Dict[str, Any]:
             "max_expected_error": 1.0,
             "prediction_error_window": 20,
             "allostatic_controller": {
-                "enabled": True,
-                "llm_interval_steps": 5,
-                "llm_timeout_s": 1.0,
-                "max_voxel_chars": 2000,
-                "life_drop_threshold": 2.0,
-                "food_drop_threshold": 2.0,
-                "air_drop_threshold": 20.0,
-                "high_risk_trigger": 0.7,
-                "default_goal_horizon_steps": 160,
-                "heuristic_confidence": 0.65,
-                "temperature": 0.1,
-                "max_tokens": 500,
+                "planning_horizon": 50,
+                "history_window": 20,
+                "irreversibility_bonus": 0.3,
+                "recovery_weight_factor": 0.2,
+                "urgency_tie_epsilon": 0.05,
+                "threat_prior_weight": 0.3,
+                "min_confidence": 0.5,
+            },
+            "perceptual_prediction_error": {
+                "alpha": 0.1,
+                "epsilon": 0.01,
+                "sigma_clip": 3.0,
+                "default_precision": 0.5,
+                "min_precision": 0.3,
+            },
+            "memory": {
+                "working_memory_capacity": 100,
+                "pe_min_observations": 5,
+                "pe_ema_alpha": 0.1,
+                "faiss_k_default": 5,
+                "faiss_epsilon": 1e-6,
+                "episode_length": 1000,
             },
             "arousal_valence": {
                 "w_health": 0.35,
@@ -141,27 +150,34 @@ def main() -> None:
     include_inventory = _env_flag("INCLUDE_INVENTORY", True)
     include_voxels = _env_flag("INCLUDE_VOXELS", True)
     adapter_folder = str(app_config.get("adapter_folder", "minedojo"))
-    llm_cfg = app_config.get("llm", {})
     adapter_cfg = app_config.get("adapter_config", {})
     policy_cfg = app_config.get("policy_generator", {})
-    if not isinstance(llm_cfg, dict):
-        raise ValueError("'llm' in config.json must be an object.")
     if not isinstance(adapter_cfg, dict):
         raise ValueError("'adapter_config' in config.json must be an object.")
     if not isinstance(policy_cfg, dict):
         raise ValueError("'policy_generator' in config.json must be an object.")
     ltm_cfg = policy_cfg.get("long_term_memory", {})
+    memory_cfg = policy_cfg.get("memory", {})
     if not isinstance(ltm_cfg, dict):
         raise ValueError("'policy_generator.long_term_memory' must be an object.")
+    if not isinstance(memory_cfg, dict):
+        raise ValueError("'policy_generator.memory' must be an object.")
 
     config = LoggingConfig.from_env()
     with RunLogger(config) as logger:
         install_exception_hooks(logger)
 
         adapter, observation_mapper = build_adapter(adapter_folder, adapter_cfg)
-        llm_client = build_llm_client(llm_cfg, logger=logger)
 
         memory_manager = MemoryManager(
+            config=MemoryConfig(
+                working_memory_capacity=int(memory_cfg.get("working_memory_capacity", 100)),
+                pe_min_observations=int(memory_cfg.get("pe_min_observations", 5)),
+                pe_ema_alpha=float(memory_cfg.get("pe_ema_alpha", 0.1)),
+                faiss_k_default=int(memory_cfg.get("faiss_k_default", 5)),
+                faiss_epsilon=float(memory_cfg.get("faiss_epsilon", 1e-6)),
+                episode_length=int(memory_cfg.get("episode_length", 1000)),
+            ),
             logger=logger,
             long_term_memory_config=ltm_cfg,
         )
@@ -174,12 +190,6 @@ def main() -> None:
                 "max_steps": max_steps,
                 "include_inventory": include_inventory,
                 "include_voxels": include_voxels,
-                "llm": {
-                    "enabled": bool(llm_cfg.get("enabled", False)),
-                    "provider": llm_cfg.get("provider", "openai"),
-                    "model": llm_cfg.get("model"),
-                    "timeout_s": llm_cfg.get("timeout_s"),
-                },
                 "policy_generator": policy_cfg,
             },
         )
@@ -190,7 +200,6 @@ def main() -> None:
             memory_manager=memory_manager,
             adapter_folder=adapter_folder,
             policy_config=policy_cfg,
-            llm_client=llm_client,
             logger=logger,
             include_inventory=include_inventory,
             include_voxels=include_voxels,

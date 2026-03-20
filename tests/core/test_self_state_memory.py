@@ -98,4 +98,4 @@ def test_agent_loop_persists_vital_state_snapshots(tmp_path: Path) -> None:
     assert pre_action[-1]["vital_state"]["state"]["life"] == 20
     assert post_step[-1]["vital_state"]["state"]["life"] == 19
     assert "allostatic_assessment" in allostatic[-1]
-    assert allostatic[-1]["allostatic_assessment"]["source"] in {"heuristic", "llm", "cache"}
+    assert allostatic[-1]["allostatic_assessment"]["source"] == "drive_model"

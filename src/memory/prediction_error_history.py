@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, Mapping, Optional
+from typing import Any, Dict, List, Mapping, Optional
 
 
 @dataclass
@@ -19,6 +19,7 @@ class PredictionErrorHistory:
         self.min_observations = max(1, int(min_observations))
         self.ema_alpha = max(1e-6, min(1.0, float(ema_alpha)))
         self._stats: Dict[str, AreaStats] = {}
+        self._records: List[Dict[str, Any]] = []
         self._welford_mean: Dict[str, float] = {}
         self._welford_m2: Dict[str, float] = {}
         self._threat_seen: set[str] = set()
@@ -35,6 +36,20 @@ class PredictionErrorHistory:
         magnitude = self._clip01(abs(float(magnitude)))
         source = self._extract_source(error)
         tick = self._extract_tick(error)
+        policy_id = self._extract_policy_id(error)
+        channel = self._extract_channel(error)
+
+        self._records.append(
+            {
+                "area_id": normalized_area,
+                "policy_id": policy_id,
+                "channel": channel,
+                "magnitude": magnitude,
+                "source": source,
+                "tick": tick,
+            }
+        )
+
         stats = self._stats.get(normalized_area)
         if stats is None:
             stats = AreaStats(
@@ -98,8 +113,35 @@ class PredictionErrorHistory:
             return 0.0
         return self._clip01(stats.threat_mean)
 
+    def query(self, query: Any) -> List[Dict[str, Any]]:
+        if not isinstance(query, Mapping):
+            return list(self._records)
+
+        policy_id = self._normalize_optional_text(query.get("policy_id"))
+        area_id = self._normalize_optional_text(query.get("area_id"))
+        channel = self._normalize_optional_text(query.get("channel"))
+        source = self._normalize_optional_text(query.get("source"))
+        limit = query.get("limit")
+
+        out: List[Dict[str, Any]] = []
+        for record in self._records:
+            if policy_id is not None and self._normalize_optional_text(record.get("policy_id")) != policy_id:
+                continue
+            if area_id is not None and self._normalize_optional_text(record.get("area_id")) != area_id:
+                continue
+            if channel is not None and self._normalize_optional_text(record.get("channel")) != channel:
+                continue
+            if source is not None and self._normalize_optional_text(record.get("source")) != source:
+                continue
+            out.append(dict(record))
+
+        if isinstance(limit, int) and limit >= 0:
+            return out[-limit:]
+        return out
+
     def clear(self) -> None:
         self._stats.clear()
+        self._records.clear()
         self._welford_mean.clear()
         self._welford_m2.clear()
         self._threat_seen.clear()
@@ -148,6 +190,46 @@ class PredictionErrorHistory:
         return None
 
     @staticmethod
+    def _extract_policy_id(error: Any) -> Optional[str]:
+        if isinstance(error, Mapping):
+            policy_id = error.get("policy_id")
+            if isinstance(policy_id, str):
+                normalized = policy_id.strip()
+                return normalized or None
+            nested = error.get("error")
+            if isinstance(nested, Mapping):
+                nested_policy_id = nested.get("policy_id")
+                if isinstance(nested_policy_id, str):
+                    normalized_nested = nested_policy_id.strip()
+                    return normalized_nested or None
+        if hasattr(error, "policy_id"):
+            policy_id = getattr(error, "policy_id")
+            if isinstance(policy_id, str):
+                normalized_attr = policy_id.strip()
+                return normalized_attr or None
+        return None
+
+    @staticmethod
+    def _extract_channel(error: Any) -> Optional[str]:
+        if isinstance(error, Mapping):
+            channel = error.get("channel")
+            if isinstance(channel, str):
+                normalized = channel.strip().lower()
+                return normalized or None
+            nested = error.get("error")
+            if isinstance(nested, Mapping):
+                nested_channel = nested.get("channel")
+                if isinstance(nested_channel, str):
+                    normalized_nested = nested_channel.strip().lower()
+                    return normalized_nested or None
+        if hasattr(error, "channel"):
+            channel = getattr(error, "channel")
+            if isinstance(channel, str):
+                normalized_attr = channel.strip().lower()
+                return normalized_attr or None
+        return None
+
+    @staticmethod
     def _extract_tick(error: Any) -> Optional[int]:
         if isinstance(error, Mapping):
             tick = error.get("tick")
@@ -167,3 +249,12 @@ class PredictionErrorHistory:
     @staticmethod
     def _clip01(value: float) -> float:
         return max(0.0, min(1.0, float(value)))
+
+    @staticmethod
+    def _normalize_optional_text(value: Any) -> Optional[str]:
+        if value is None:
+            return None
+        text = str(value).strip()
+        if not text:
+            return None
+        return text

@@ -1,25 +1,38 @@
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import asdict
-from typing import Any, Callable, List, Mapping, Optional
+from typing import Any, Callable, Deque, Dict, List, Mapping, Optional
 
 from core.coordination.messages import AgentMessage
 from core.coordination.workspace import GlobalWorkspace
 from core.layers.action_selection import PolicyGenerator
 from core.layers.interoceptive import (
-    AllostaticController,
     ArousalValenceSystem,
     HomeostaticState,
     PredictionError,
     VitalStateMonitor,
 )
 from core.layers.metacognitive import GoalCoherenceChecker
-from core.layers.predictive import PredictionErrorCalculator
-from core.llm.client import LLMClient
-from core.memory.manager import MemoryManager
+from core.layers.predictive import PredictionErrorCalculator as PolicyPredictionErrorCalculator
 from core.models.signals import ActionProposal
 from core.models.state import AgentState
 from core.observability.logger import RunLogger
+from homeostatic import (
+    AllostaticConfig,
+    AllostaticController,
+    DriveChannel,
+    HomeostaticHistory as DriveHistory,
+    HomeostaticState as DriveState,
+    PrioritisedDriveSignals,
+)
+from memory.memory_manager import MemoryManager
+from perceptual import (
+    ObservationSnapshot,
+    PEConfig,
+    PredictionErrorBatch,
+    PredictionErrorCalculator as PerceptualPredictionErrorCalculator,
+)
 
 
 class AgentLoop:
@@ -31,7 +44,7 @@ class AgentLoop:
         adapter_folder: str,
         policy_config: Optional[Mapping[str, Any]] = None,
         workspace: Optional[GlobalWorkspace] = None,
-        llm_client: Optional[LLMClient] = None,
+        llm_client: Optional[Any] = None,
         logger: Optional[RunLogger] = None,
         include_inventory: bool = True,
         include_voxels: bool = True,
@@ -46,19 +59,30 @@ class AgentLoop:
         self.logger = logger
         self.include_inventory = include_inventory
         self.include_voxels = include_voxels
+
         allostatic_cfg = self.policy_config.get("allostatic_controller", {})
         if not isinstance(allostatic_cfg, Mapping):
             raise TypeError("'policy_generator.allostatic_controller' must be an object.")
         arousal_cfg = self.policy_config.get("arousal_valence", {})
         if not isinstance(arousal_cfg, Mapping):
             raise TypeError("'policy_generator.arousal_valence' must be an object.")
+        perceptual_cfg = self.policy_config.get("perceptual_prediction_error", {})
+        if not isinstance(perceptual_cfg, Mapping):
+            raise TypeError("'policy_generator.perceptual_prediction_error' must be an object.")
+
         self.vital_state_monitor = VitalStateMonitor(
             expected_vitals=self._load_available_vitals(adapter),
         )
+        self._drive_channels = self._build_drive_channels()
+        self._allostatic_config = self._build_allostatic_config(allostatic_cfg)
+        self._homeostatic_history: Deque[DriveState] = deque(
+            maxlen=max(1, int(self._allostatic_config.history_window))
+        )
         self.allostatic_controller = AllostaticController(
-            llm_client=self.llm_client,
-            config=allostatic_cfg,
-            logger=self.logger,
+            config=self._allostatic_config,
+            channels=self._drive_channels,
+            memory_manager=self.memory_manager,
+            message_bus=self.workspace,
         )
         self.arousal_valence_system = ArousalValenceSystem(
             config=arousal_cfg,
@@ -66,11 +90,21 @@ class AgentLoop:
             self_state_tracker=self.memory_manager.self_state,
             memory_manager=self.memory_manager,
         )
+        self.perceptual_prediction_error_calculator = PerceptualPredictionErrorCalculator(
+            config=self._build_pe_config(perceptual_cfg),
+            memory_manager=self.memory_manager,
+            message_bus=self.workspace,
+        )
+
         self._initialized = False
         self._last_obs: Any = None
         self._last_info: Any = {}
+        self._last_selected_policy_id = "bootstrap"
+        self._last_drive_signals: Optional[PrioritisedDriveSignals] = None
+        self._last_perceptual_batch: Optional[PredictionErrorBatch] = None
+
         self.goal_checker = GoalCoherenceChecker()
-        self.prediction_error_calculator = PredictionErrorCalculator(
+        self.policy_prediction_error_calculator = PolicyPredictionErrorCalculator(
             max_expected_error=float(self.policy_config.get("max_expected_error", 1.0)),
             window_size=int(self.policy_config.get("prediction_error_window", 20)),
         )
@@ -79,7 +113,7 @@ class AgentLoop:
             adapter_folder=self.adapter_folder,
             memory_manager=self.memory_manager,
             goal_checker=self.goal_checker,
-            prediction_error_calculator=self.prediction_error_calculator,
+            prediction_error_calculator=self.policy_prediction_error_calculator,
             config=self.policy_config,
             logger=self.logger,
         )
@@ -105,59 +139,91 @@ class AgentLoop:
             self._last_obs = obs
             self._last_info = info
             self._initialized = True
-            state = self.observation_mapper(
+            current_state = self.observation_mapper(
                 raw_obs=obs,
                 info=info,
                 vital_state_monitor=self.vital_state_monitor,
             )
             if self.logger is not None:
-                state_dict = state.to_dict(
+                state_dict = current_state.to_dict(
                     include_inventory=self.include_inventory,
                     include_voxels=self.include_voxels,
                 )
                 self.logger.state_snapshot(state_dict, step=step)
                 info_keys = list(info.keys()) if isinstance(info, dict) else None
                 self.logger.event("env.reset", {"info_keys": info_keys}, step=step)
+        else:
+            current_state = self.observation_mapper(
+                raw_obs=self._last_obs,
+                info=self._last_info,
+                vital_state_monitor=self.vital_state_monitor,
+            )
 
-        current_state = self.observation_mapper(
-            raw_obs=self._last_obs,
-            info=self._last_info,
-            vital_state_monitor=self.vital_state_monitor,
-        )
         self._record_vital_state(step=step, phase="pre_action")
         workspace_messages = self.workspace.broadcast()
         goals = self._extract_goals(workspace_messages)
-        allostatic_assessment = self.allostatic_controller.assess(
-            step=step,
-            state=current_state,
-            goals=goals,
-            vital_state=self.vital_state_monitor.to_dict(),
-            obs=self._last_obs,
-            info=self._last_info,
-        )
+
         homeostatic_state = self._build_homeostatic_state(
             step=step,
             state=current_state,
             workspace_messages=workspace_messages,
         )
-        latest_prediction_error = self._latest_prediction_error(step=step)
+        area_id = self._build_area_id(
+            step=step,
+            state=current_state,
+            info=self._last_info,
+            obs=self._last_obs,
+        )
+        drive_state = self._build_drive_state(
+            homeostatic_state=homeostatic_state,
+            step=step,
+            area_id=area_id,
+        )
+        self._homeostatic_history.appendleft(drive_state)
+
+        drive_history = DriveHistory(
+            snapshots=list(self._homeostatic_history),
+            channels=self._drive_channels,
+            tick=step,
+        )
+        drive_signals = self.allostatic_controller.update(
+            history=drive_history,
+            area_id=area_id,
+        )
+        self._last_drive_signals = drive_signals
+        allostatic_assessment = self._build_allostatic_assessment(drive_signals)
+
+        self.memory_manager.set_active_policy_for_pe(self._last_selected_policy_id)
+        perceptual_snapshot = self._build_perceptual_snapshot(
+            step=step,
+            state=current_state,
+            homeostatic_state=homeostatic_state,
+            area_id=area_id,
+        )
+        prediction_error_batch = self.perceptual_prediction_error_calculator.update(
+            perceptual_snapshot
+        )
+        self._last_perceptual_batch = prediction_error_batch
+        latest_prediction_error = self._prediction_error_from_batch(
+            prediction_error_batch
+        )
         arousal_valence_state = self.arousal_valence_system.update(
             homeostatic_state=homeostatic_state,
             prediction_error=latest_prediction_error,
         )
         arousal_payload = asdict(arousal_valence_state)
-        if isinstance(allostatic_assessment, Mapping):
-            allostatic_assessment = dict(allostatic_assessment)
-            allostatic_assessment["policy_bias"] = dict(arousal_payload["policy_bias"])
-            allostatic_assessment["urgency_signal"] = arousal_payload["urgency_signal"]
-            allostatic_assessment["arousal"] = arousal_payload["arousal"]
-            allostatic_assessment["valence"] = arousal_payload["valence"]
+
+        allostatic_assessment["policy_bias"] = dict(arousal_payload["policy_bias"])
+        allostatic_assessment["urgency_signal"] = arousal_payload["urgency_signal"]
+        allostatic_assessment["arousal"] = arousal_payload["arousal"]
+        allostatic_assessment["valence"] = arousal_payload["valence"]
 
         self.memory_manager.snapshot_self_state(
             {
                 "step": step,
                 "phase": "allostatic_pre_action",
                 "allostatic_assessment": allostatic_assessment,
+                "drive_signals": asdict(drive_signals),
             }
         )
         self.memory_manager.snapshot_self_state(
@@ -173,8 +239,7 @@ class AgentLoop:
                 {
                     "source": allostatic_assessment.get("source"),
                     "risk_level": allostatic_assessment.get("risk_level"),
-                    "confidence": allostatic_assessment.get("confidence"),
-                    "survival_horizon_steps": allostatic_assessment.get("survival_horizon_steps"),
+                    "highest_urgency": allostatic_assessment.get("highest_urgency"),
                     "needs_count": len(allostatic_assessment.get("needs", [])),
                 },
                 step=step,
@@ -198,6 +263,7 @@ class AgentLoop:
             "step": step,
             "memory_manager": self.memory_manager,
             "allostatic_assessment": allostatic_assessment,
+            "drive_signals": asdict(drive_signals),
             "arousal_valence_state": arousal_payload,
         }
         action_proposal = self.policy_generator.propose_action(
@@ -244,6 +310,9 @@ class AgentLoop:
                 done=done,
                 step=step,
             )
+            self._last_selected_policy_id = selected_policy_id
+        else:
+            self._last_selected_policy_id = "bootstrap"
 
         return {"obs": obs, "reward": reward, "done": done, "info": info, "state": state}
 
@@ -328,16 +397,22 @@ class AgentLoop:
         hunger = self._clamp01(0.0 if food is None else food / 20.0)
         oxygen = self._clamp01(0.0 if air is None else air / 300.0)
         resource_level = self._estimate_resource_level(
+            state=state,
             hunger=hunger,
             lighting=lighting,
             nearby=nearby,
             inventory_state=inventory_state,
+            info=self._last_info,
+            obs=self._last_obs,
         )
         threat_proximity = self._estimate_threat_proximity(
+            state=state,
             messages=workspace_messages,
             health=health,
             lighting=lighting,
             homeostasis=homeostasis,
+            info=self._last_info,
+            obs=self._last_obs,
         )
         return HomeostaticState(
             health=health,
@@ -348,93 +423,285 @@ class AgentLoop:
             tick=step,
         )
 
+    def _build_drive_state(
+        self,
+        homeostatic_state: HomeostaticState,
+        step: int,
+        area_id: str,
+    ) -> DriveState:
+        values = {
+            "health": self._clamp01(homeostatic_state.health),
+            "hunger": self._clamp01(homeostatic_state.hunger),
+            "oxygen": self._clamp01(homeostatic_state.oxygen),
+            "resource_level": self._clamp01(homeostatic_state.resource_level),
+            "safety": self._clamp01(1.0 - homeostatic_state.threat_proximity),
+        }
+        return DriveState(values=values, tick=step, context_hash=area_id)
+
+    def _build_allostatic_assessment(
+        self,
+        drive_signals: PrioritisedDriveSignals,
+    ) -> Dict[str, Any]:
+        needs: List[Dict[str, Any]] = []
+        tags: List[str] = []
+        min_ttc: Optional[float] = None
+        for signal in drive_signals.signals:
+            need = {
+                "need_id": f"stabilize_{signal.channel_id}",
+                "urgency": self._clamp01(signal.urgency),
+                "time_to_critical_steps": max(0, int(round(signal.ticks_to_critical))),
+                "actions": [signal.suggested_action_tag] if signal.suggested_action_tag else [],
+                "resources": [signal.channel_id],
+                "evidence": [
+                    f"current={signal.current_value:.3f}",
+                    f"projected={signal.projected_value:.3f}",
+                ],
+            }
+            needs.append(need)
+            if signal.suggested_action_tag:
+                tags.append(str(signal.suggested_action_tag).strip().lower())
+            tags.append(str(signal.channel_id).strip().lower())
+            if min_ttc is None:
+                min_ttc = signal.ticks_to_critical
+            else:
+                min_ttc = min(min_ttc, signal.ticks_to_critical)
+
+        horizon = (
+            int(round(min_ttc))
+            if isinstance(min_ttc, (int, float))
+            else int(self._allostatic_config.planning_horizon)
+        )
+        return {
+            "source": "drive_model",
+            "risk_level": self._clamp01(drive_signals.highest_urgency),
+            "confidence": 1.0,
+            "highest_urgency": self._clamp01(drive_signals.highest_urgency),
+            "survival_horizon_steps": max(1, horizon),
+            "needs": needs,
+            "policy_bias_tags": list(dict.fromkeys(tag for tag in tags if tag)),
+        }
+
+    def _build_perceptual_snapshot(
+        self,
+        step: int,
+        state: AgentState,
+        homeostatic_state: HomeostaticState,
+        area_id: str,
+    ) -> ObservationSnapshot:
+        entity_density = self._estimate_entity_density(
+            state=state,
+            info=self._last_info,
+            obs=self._last_obs,
+        )
+        terrain_novelty = self._estimate_terrain_novelty(
+            state=state,
+            info=self._last_info,
+            obs=self._last_obs,
+        )
+        return ObservationSnapshot(
+            health=self._clamp01(homeostatic_state.health),
+            hunger=self._clamp01(homeostatic_state.hunger),
+            resource_level=self._clamp01(homeostatic_state.resource_level),
+            oxygen=self._clamp01(homeostatic_state.oxygen),
+            threat_proximity=self._clamp01(homeostatic_state.threat_proximity),
+            entity_density=self._clamp01(entity_density),
+            terrain_novelty=self._clamp01(terrain_novelty),
+            area_id=area_id,
+            last_action=self._last_selected_policy_id,
+            tick=int(step),
+        )
+
+    def _prediction_error_from_batch(
+        self,
+        batch: PredictionErrorBatch,
+    ) -> Optional[PredictionError]:
+        if not batch.errors:
+            return None
+        source = str(batch.dominant_source or "visual")
+        if source not in {"visual", "proprioceptive", "threat"}:
+            source = "visual"
+        return PredictionError(
+            magnitude=self._clamp01(batch.aggregate_magnitude),
+            source=source,
+            tick=int(batch.tick),
+        )
+
+    def _build_area_id(
+        self,
+        step: int,
+        state: AgentState,
+        info: Any,
+        obs: Any,
+    ) -> str:
+        builder = getattr(self.adapter, "build_area_id", None)
+        if callable(builder):
+            try:
+                area_id = builder(state=state, info=info, obs=obs, step=step)
+                if isinstance(area_id, str) and area_id.strip():
+                    return area_id.strip()
+            except Exception:
+                pass
+
+        biome = self._as_mapping(getattr(state, "biome", None))
+        position = self._as_mapping(getattr(state, "position", None))
+        biome_name = str(biome.get("biome_name") or "unknown").strip().lower() or "unknown"
+        xpos = self._as_optional_float(position.get("xpos")) or 0.0
+        zpos = self._as_optional_float(position.get("zpos")) or 0.0
+        return f"{biome_name}:{int(xpos // 32.0)}:{int(zpos // 32.0)}"
+
     def _estimate_resource_level(
         self,
+        state: AgentState,
         hunger: float,
         lighting: Mapping[str, Any],
         nearby: Mapping[str, Any],
         inventory_state: Mapping[str, Any],
+        info: Any,
+        obs: Any,
     ) -> float:
-        signals: List[float] = [self._clamp01(hunger)]
-        if nearby.get("nearby_crafting_table") is True or nearby.get("nearby_furnace") is True:
-            signals.append(0.75)
-        if lighting.get("can_see_sky") is False:
-            signals.append(0.70)
-        if inventory_state.get("current_item_index") is not None:
-            signals.append(0.65)
-        if len(signals) == 1:
-            signals.append(0.50)
-        return self._clamp01(sum(signals) / float(len(signals)))
+        estimator = getattr(self.adapter, "estimate_resource_level", None)
+        if callable(estimator):
+            try:
+                value = estimator(
+                    state=state,
+                    hunger=hunger,
+                    lighting=lighting,
+                    nearby=nearby,
+                    inventory_state=inventory_state,
+                    info=info,
+                    obs=obs,
+                )
+                if isinstance(value, (int, float)):
+                    return self._clamp01(float(value))
+            except Exception:
+                pass
+        return self._clamp01(hunger)
 
     def _estimate_threat_proximity(
         self,
+        state: AgentState,
         messages: List[AgentMessage],
         health: float,
         lighting: Mapping[str, Any],
         homeostasis: Mapping[str, Any],
+        info: Any,
+        obs: Any,
     ) -> float:
-        threat = 0.0
-        for message in messages:
-            kind = str(getattr(message, "kind", "")).strip().lower()
-            payload = getattr(message, "payload", None)
-            if kind in {"threat", "threat_signal", "danger"}:
-                if isinstance(payload, Mapping) and isinstance(payload.get("severity"), (int, float)):
-                    threat = max(threat, self._clamp01(payload.get("severity")))
-                else:
-                    threat = max(threat, 0.60)
-                continue
-            if isinstance(payload, Mapping) and isinstance(payload.get("threat_proximity"), (int, float)):
-                threat = max(threat, self._clamp01(payload.get("threat_proximity")))
+        estimator = getattr(self.adapter, "estimate_threat_proximity", None)
+        if callable(estimator):
+            try:
+                value = estimator(
+                    state=state,
+                    messages=messages,
+                    health=health,
+                    lighting=lighting,
+                    homeostasis=homeostasis,
+                    info=info,
+                    obs=obs,
+                )
+                if isinstance(value, (int, float)):
+                    return self._clamp01(float(value))
+            except Exception:
+                pass
+        return self._clamp01(1.0 - health)
 
-        light_level = self._as_optional_float(lighting.get("light_level"))
-        can_see_sky = lighting.get("can_see_sky")
-        if light_level is not None and can_see_sky is True and light_level < 7.0:
-            threat = max(threat, self._clamp01((7.0 - light_level) / 7.0 * 0.6))
-        threat = max(threat, self._clamp01(1.0 - health))
+    def _estimate_entity_density(self, state: AgentState, info: Any, obs: Any) -> float:
+        estimator = getattr(self.adapter, "estimate_entity_density", None)
+        if callable(estimator):
+            try:
+                value = estimator(state=state, info=info, obs=obs)
+                if isinstance(value, (int, float)):
+                    return self._clamp01(float(value))
+            except Exception:
+                pass
+        return 0.0
 
-        if homeostasis.get("is_dead") is True or homeostasis.get("is_alive") is False:
-            threat = 1.0
-        return self._clamp01(threat)
+    def _estimate_terrain_novelty(self, state: AgentState, info: Any, obs: Any) -> float:
+        estimator = getattr(self.adapter, "estimate_terrain_novelty", None)
+        if callable(estimator):
+            try:
+                value = estimator(state=state, info=info, obs=obs)
+                if isinstance(value, (int, float)):
+                    return self._clamp01(float(value))
+            except Exception:
+                pass
+        return 0.0
 
-    def _latest_prediction_error(self, step: int) -> Optional[PredictionError]:
-        history = self.memory_manager.prediction_errors.query({"limit": 1})
-        if not isinstance(history, list) or not history:
-            return None
-        record = history[-1]
+    @staticmethod
+    def _build_drive_channels() -> List[DriveChannel]:
+        return [
+            DriveChannel(
+                id="health",
+                setpoint=0.9,
+                critical_threshold=0.25,
+                irreversible=True,
+                recovery_cost_ticks=25,
+                suggested_action_tag="heal",
+            ),
+            DriveChannel(
+                id="hunger",
+                setpoint=0.8,
+                critical_threshold=0.2,
+                irreversible=False,
+                recovery_cost_ticks=20,
+                suggested_action_tag="eat",
+            ),
+            DriveChannel(
+                id="oxygen",
+                setpoint=0.9,
+                critical_threshold=0.2,
+                irreversible=True,
+                recovery_cost_ticks=30,
+                suggested_action_tag="surface",
+            ),
+            DriveChannel(
+                id="resource_level",
+                setpoint=0.7,
+                critical_threshold=0.3,
+                irreversible=False,
+                recovery_cost_ticks=15,
+                suggested_action_tag="gather",
+            ),
+            DriveChannel(
+                id="safety",
+                setpoint=0.8,
+                critical_threshold=0.35,
+                irreversible=True,
+                recovery_cost_ticks=20,
+                suggested_action_tag="retreat",
+            ),
+        ]
 
-        magnitude = None
-        source = "visual"
-        tick = step
+    @staticmethod
+    def _build_allostatic_config(config: Mapping[str, Any]) -> AllostaticConfig:
+        return AllostaticConfig(
+            planning_horizon=max(1, int(config.get("planning_horizon", 50))),
+            history_window=max(1, int(config.get("history_window", 20))),
+            irreversibility_bonus=AgentLoop._clamp(  # type: ignore[arg-type]
+                config.get("irreversibility_bonus", 0.3), 0.0, 1.0
+            ),
+            recovery_weight_factor=AgentLoop._clamp(  # type: ignore[arg-type]
+                config.get("recovery_weight_factor", 0.2), 0.0, 1.0
+            ),
+            urgency_tie_epsilon=AgentLoop._clamp(  # type: ignore[arg-type]
+                config.get("urgency_tie_epsilon", 0.05), 0.0, 1.0
+            ),
+            threat_prior_weight=AgentLoop._clamp(  # type: ignore[arg-type]
+                config.get("threat_prior_weight", 0.3), 0.0, 1.0
+            ),
+            min_confidence=AgentLoop._clamp(  # type: ignore[arg-type]
+                config.get("min_confidence", 0.5), 0.0, 1.0
+            ),
+        )
 
-        if isinstance(record, Mapping):
-            magnitude = self._as_optional_float(record.get("magnitude"))
-            if magnitude is None:
-                nested = record.get("error")
-                if isinstance(nested, Mapping):
-                    magnitude = self._as_optional_float(nested.get("magnitude"))
-            raw_source = record.get("source")
-            if raw_source is None and isinstance(record.get("error"), Mapping):
-                raw_source = record.get("error", {}).get("source")
-            if isinstance(raw_source, str) and raw_source in {"visual", "proprioceptive", "threat"}:
-                source = raw_source
-            raw_tick = record.get("tick")
-            if isinstance(raw_tick, int):
-                tick = raw_tick
-        elif hasattr(record, "magnitude"):
-            magnitude = self._as_optional_float(getattr(record, "magnitude"))
-            raw_source = getattr(record, "source", None)
-            if isinstance(raw_source, str) and raw_source in {"visual", "proprioceptive", "threat"}:
-                source = raw_source
-            raw_tick = getattr(record, "tick", None)
-            if isinstance(raw_tick, int):
-                tick = raw_tick
-
-        if magnitude is None:
-            return None
-        return PredictionError(
-            magnitude=self._clamp01(magnitude),
-            source=source,
-            tick=tick,
+    @staticmethod
+    def _build_pe_config(config: Mapping[str, Any]) -> PEConfig:
+        return PEConfig(
+            alpha=AgentLoop._clamp(config.get("alpha", 0.1), 1e-6, 1.0),  # type: ignore[arg-type]
+            epsilon=AgentLoop._clamp(config.get("epsilon", 0.01), 1e-6, 1.0),  # type: ignore[arg-type]
+            sigma_clip=AgentLoop._clamp(config.get("sigma_clip", 3.0), 1e-6, 10.0),  # type: ignore[arg-type]
+            default_precision=AgentLoop._clamp(config.get("default_precision", 0.5), 0.0, 1.0),  # type: ignore[arg-type]
+            min_precision=AgentLoop._clamp(config.get("min_precision", 0.3), 0.0, 1.0),  # type: ignore[arg-type]
         )
 
     @staticmethod
@@ -463,3 +730,11 @@ class AgentLoop:
         except (TypeError, ValueError):
             numeric = 0.0
         return max(0.0, min(1.0, numeric))
+
+    @staticmethod
+    def _clamp(value: Any, lo: float, hi: float) -> float:
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError):
+            numeric = lo
+        return max(lo, min(hi, numeric))

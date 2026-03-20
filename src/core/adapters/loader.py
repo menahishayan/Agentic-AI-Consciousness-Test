@@ -38,7 +38,18 @@ def build_adapter(
 
 
 def _validate_adapter(adapter: Any, folder: str) -> None:
-    required = ("reset", "step", "close", "get_available_vitals")
+    required = (
+        "reset",
+        "step",
+        "close",
+        "get_available_vitals",
+        "get_available_policies",
+        "estimate_resource_level",
+        "estimate_threat_proximity",
+        "build_area_id",
+        "estimate_entity_density",
+        "estimate_terrain_novelty",
+    )
     for name in required:
         if not callable(getattr(adapter, name, None)):
             raise AttributeError(
@@ -55,3 +66,37 @@ def _validate_adapter(adapter: Any, folder: str) -> None:
             raise TypeError(
                 f"Adapter '{folder}' get_available_vitals() must return list[str]."
             )
+
+    policies = adapter.get_available_policies()
+    if not isinstance(policies, list):
+        raise TypeError(
+            f"Adapter '{folder}' get_available_policies() must return list[dict]."
+        )
+    for descriptor in policies:
+        if not isinstance(descriptor, Mapping):
+            raise TypeError(
+                f"Adapter '{folder}' policy descriptors must be dict-like objects."
+            )
+        for required_key in ("policy_id", "callable_name"):
+            raw = descriptor.get(required_key)
+            if not isinstance(raw, str) or not raw.strip():
+                raise ValueError(
+                    f"Adapter '{folder}' policy descriptor is missing '{required_key}'."
+                )
+        tags = descriptor.get("tags")
+        if not isinstance(tags, list) or not tags:
+            raise ValueError(
+                f"Adapter '{folder}' policy descriptor '{descriptor.get('policy_id')}' must define non-empty tags."
+            )
+        if not all(isinstance(tag, str) and tag.strip() for tag in tags):
+            raise ValueError(
+                f"Adapter '{folder}' policy descriptor '{descriptor.get('policy_id')}' tags must be list[str]."
+            )
+        drive_tags = descriptor.get("drive_tags")
+        if drive_tags is not None:
+            if not isinstance(drive_tags, list) or not all(
+                isinstance(tag, str) and tag.strip() for tag in drive_tags
+            ):
+                raise ValueError(
+                    f"Adapter '{folder}' policy descriptor '{descriptor.get('policy_id')}' drive_tags must be list[str] when provided."
+                )
