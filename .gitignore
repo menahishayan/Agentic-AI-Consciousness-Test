@@ -4,7 +4,9 @@
 **/.DS_Store
 *.pyc
 .env
-logs/*
+**/logs/*
 data/long_term_memory/*
 MineDojo/*
 Voyager/*
+Archive.zip
+data/

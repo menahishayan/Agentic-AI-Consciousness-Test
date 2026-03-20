@@ -7,7 +7,7 @@ from typing import Any, Dict, Mapping
 
 from core.adapters.loader import build_adapter
 from core.llm.factory import build_llm_client
-from core.memory.manager import MemoryManager
+from core.memory import MemoryConfig, MemoryManager
 from core.observability import LoggingConfig, RunLogger, install_exception_hooks
 from core.runtime.loop import AgentLoop
 
@@ -74,38 +74,91 @@ def load_config(path: Path) -> Dict[str, Any]:
                 "allostatic_survival_fit": 0.5,
                 "allostatic_urgency_alignment": 0.5,
             },
-            "discovery": {
-                "reserved_methods": [
-                    "reset",
-                    "step",
-                    "close",
-                    "sample_action",
-                    "get_available_vitals",
-                    "get_available_policies",
-                    "get_action_space_actions",
-                    "get_raw_observation",
-                ]
-            },
             "long_term_memory": {
-                "path": "data/long_term_memory/policies.json",
+                "path": "data/long_term_memory",
                 "max_score_history": 200,
                 "max_outcome_history": 200,
             },
             "max_expected_error": 1.0,
             "prediction_error_window": 20,
             "allostatic_controller": {
-                "enabled": True,
-                "llm_interval_steps": 5,
-                "llm_timeout_s": 1.0,
-                "max_voxel_chars": 2000,
-                "life_drop_threshold": 2.0,
-                "food_drop_threshold": 2.0,
-                "air_drop_threshold": 20.0,
-                "high_risk_trigger": 0.7,
-                "default_goal_horizon_steps": 160,
-                "heuristic_confidence": 0.65,
-                "temperature": 0.1,
-                "max_tokens": 500,
+                "planning_horizon": 50,
+                "history_window": 20,
+                "irreversibility_bonus": 0.3,
+                "recovery_weight_factor": 0.2,
+                "urgency_tie_epsilon": 0.05,
+                "threat_prior_weight": 0.3,
+                "min_confidence": 0.5,
+                "channels": [
+                    {
+                        "id": "health",
+                        "setpoint": 0.9,
+                        "critical_threshold": 0.25,
+                        "irreversible": True,
+                        "recovery_cost_ticks": 25,
+                        "suggested_action_tag": "heal",
+                    },
+                    {
+                        "id": "hunger",
+                        "setpoint": 0.8,
+                        "critical_threshold": 0.2,
+                        "irreversible": False,
+                        "recovery_cost_ticks": 20,
+                        "suggested_action_tag": "eat",
+                    },
+                    {
+                        "id": "oxygen",
+                        "setpoint": 0.9,
+                        "critical_threshold": 0.2,
+                        "irreversible": True,
+                        "recovery_cost_ticks": 30,
+                        "suggested_action_tag": "surface",
+                    },
+                    {
+                        "id": "resource_level",
+                        "setpoint": 0.7,
+                        "critical_threshold": 0.3,
+                        "irreversible": False,
+                        "recovery_cost_ticks": 15,
+                        "suggested_action_tag": "gather",
+                    },
+                    {
+                        "id": "safety",
+                        "setpoint": 0.8,
+                        "critical_threshold": 0.35,
+                        "irreversible": True,
+                        "recovery_cost_ticks": 20,
+                        "suggested_action_tag": "retreat",
+                    },
+                ],
+            },
+            "perceptual_prediction_error": {
+                "alpha": 0.1,
+                "epsilon": 0.01,
+                "sigma_clip": 3.0,
+                "default_precision": 0.5,
+                "min_precision": 0.3,
+            },
+            "memory": {
+                "working_memory_capacity": 100,
+                "pe_min_observations": 5,
+                "pe_ema_alpha": 0.1,
+                "faiss_k_default": 5,
+                "faiss_epsilon": 1e-6,
+                "episode_length": 1000,
+            },
+            "arousal_valence": {
+                "w_health": 0.35,
+                "w_hunger": 0.25,
+                "w_threat": 0.30,
+                "w_pred_err": 0.10,
+                "v_health": 0.30,
+                "v_hunger": 0.30,
+                "v_resources": 0.20,
+                "v_oxygen": 0.20,
+                "decay_rate": 0.95,
+                "resting_arousal": 0.10,
+                "urgency_broadcast_threshold": 0.65,
             },
         },
     }
@@ -128,30 +181,48 @@ def main() -> None:
     include_inventory = _env_flag("INCLUDE_INVENTORY", True)
     include_voxels = _env_flag("INCLUDE_VOXELS", True)
     adapter_folder = str(app_config.get("adapter_folder", "minedojo"))
-    llm_cfg = app_config.get("llm", {})
     adapter_cfg = app_config.get("adapter_config", {})
     policy_cfg = app_config.get("policy_generator", {})
-    if not isinstance(llm_cfg, dict):
-        raise ValueError("'llm' in config.json must be an object.")
+    llm_cfg = app_config.get("llm", {})
     if not isinstance(adapter_cfg, dict):
         raise ValueError("'adapter_config' in config.json must be an object.")
     if not isinstance(policy_cfg, dict):
         raise ValueError("'policy_generator' in config.json must be an object.")
+    if not isinstance(llm_cfg, dict):
+        raise ValueError("'llm' in config.json must be an object.")
     ltm_cfg = policy_cfg.get("long_term_memory", {})
+    memory_cfg = policy_cfg.get("memory", {})
     if not isinstance(ltm_cfg, dict):
         raise ValueError("'policy_generator.long_term_memory' must be an object.")
+    if not isinstance(memory_cfg, dict):
+        raise ValueError("'policy_generator.memory' must be an object.")
+    resolved_ltm_cfg = dict(ltm_cfg)
+    ltm_path = Path(str(resolved_ltm_cfg.get("path", "data/long_term_memory")))
+    if not ltm_path.is_absolute():
+        ltm_path = (root / ltm_path).resolve()
+    resolved_ltm_cfg["path"] = str(ltm_path)
 
     config = LoggingConfig.from_env()
+    if not config.log_root.is_absolute():
+        config.log_root = (root / config.log_root).resolve()
     with RunLogger(config) as logger:
         install_exception_hooks(logger)
 
         adapter, observation_mapper = build_adapter(adapter_folder, adapter_cfg)
-        llm_client = build_llm_client(llm_cfg, logger=logger)
 
         memory_manager = MemoryManager(
+            config=MemoryConfig(
+                working_memory_capacity=int(memory_cfg.get("working_memory_capacity", 100)),
+                pe_min_observations=int(memory_cfg.get("pe_min_observations", 5)),
+                pe_ema_alpha=float(memory_cfg.get("pe_ema_alpha", 0.1)),
+                faiss_k_default=int(memory_cfg.get("faiss_k_default", 5)),
+                faiss_epsilon=float(memory_cfg.get("faiss_epsilon", 1e-6)),
+                episode_length=int(memory_cfg.get("episode_length", 1000)),
+            ),
             logger=logger,
-            long_term_memory_config=ltm_cfg,
+            long_term_memory_config=resolved_ltm_cfg,
         )
+        llm_client = build_llm_client(llm_cfg, logger=logger)
 
         logger.event(
             "run.config",
@@ -161,12 +232,6 @@ def main() -> None:
                 "max_steps": max_steps,
                 "include_inventory": include_inventory,
                 "include_voxels": include_voxels,
-                "llm": {
-                    "enabled": bool(llm_cfg.get("enabled", False)),
-                    "provider": llm_cfg.get("provider", "openai"),
-                    "model": llm_cfg.get("model"),
-                    "timeout_s": llm_cfg.get("timeout_s"),
-                },
                 "policy_generator": policy_cfg,
             },
         )
@@ -177,10 +242,11 @@ def main() -> None:
             memory_manager=memory_manager,
             adapter_folder=adapter_folder,
             policy_config=policy_cfg,
-            llm_client=llm_client,
+            llm_config=llm_cfg,
             logger=logger,
             include_inventory=include_inventory,
             include_voxels=include_voxels,
+            llm_client=llm_client,
         )
 
         try:

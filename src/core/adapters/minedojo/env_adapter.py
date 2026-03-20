@@ -52,11 +52,20 @@ class MineDojoAdapter:
         },
     }
 
+    _DRIVE_TAG_RULES: Dict[str, set[str]] = {
+        "health": {"heal", "retreat", "defend", "protect", "shield", "escape"},
+        "hunger": {"eat", "collect", "cook", "food", "harvest", "fish", "drink"},
+        "oxygen": {"surface", "ascend", "air", "breath"},
+        "resource_level": {"gather", "mine", "craft", "smelt", "chop", "dig"},
+        "safety": {"retreat", "avoid", "shelter", "defend", "escape"},
+    }
+
     def __init__(self, env: Any, config: Optional[Mapping[str, Any]] = None) -> None:
         self.env = env
         self._config = dict(config or {})
         self._last_obs: Any = None
         self._last_info: Dict[str, Any] = {}
+        self._last_area_signature: Optional[str] = None
         self._nvec = self._extract_action_nvec()
         self._noop_action = self._build_noop_action()
         self._action_space_actions = self._build_action_space_actions()
@@ -109,6 +118,132 @@ class MineDojoAdapter:
 
     def get_available_policies(self) -> List[Dict[str, Any]]:
         return deepcopy(self._policies)
+
+    def estimate_resource_level(
+        self,
+        *,
+        hunger: float,
+        lighting: Mapping[str, Any],
+        nearby: Mapping[str, Any],
+        inventory_state: Mapping[str, Any],
+        state: Any = None,
+        info: Any = None,
+        obs: Any = None,
+    ) -> float:
+        _ = state
+        _ = info
+        _ = obs
+        signals: List[float] = [self._clip01(hunger)]
+        if nearby.get("nearby_crafting_table") is True or nearby.get("nearby_furnace") is True:
+            signals.append(0.75)
+        if lighting.get("can_see_sky") is False:
+            signals.append(0.70)
+        if inventory_state.get("current_item_index") is not None:
+            signals.append(0.65)
+        if len(signals) == 1:
+            signals.append(0.50)
+        return self._clip01(sum(signals) / float(len(signals)))
+
+    def estimate_threat_proximity(
+        self,
+        *,
+        messages: List[Any],
+        health: float,
+        lighting: Mapping[str, Any],
+        homeostasis: Mapping[str, Any],
+        state: Any = None,
+        info: Any = None,
+        obs: Any = None,
+    ) -> float:
+        _ = state
+        _ = info
+        _ = obs
+        threat = 0.0
+        for message in messages:
+            kind = str(getattr(message, "kind", "")).strip().lower()
+            payload = getattr(message, "payload", None)
+            if kind in {"threat", "threat_signal", "danger"}:
+                if isinstance(payload, Mapping) and isinstance(payload.get("severity"), (int, float)):
+                    threat = max(threat, self._clip01(float(payload.get("severity"))))
+                else:
+                    threat = max(threat, 0.60)
+                continue
+            if isinstance(payload, Mapping) and isinstance(payload.get("threat_proximity"), (int, float)):
+                threat = max(threat, self._clip01(float(payload.get("threat_proximity"))))
+
+        light_level = self._as_optional_float(lighting.get("light_level"))
+        can_see_sky = lighting.get("can_see_sky")
+        if light_level is not None and can_see_sky is True and light_level < 7.0:
+            threat = max(threat, self._clip01((7.0 - light_level) / 7.0 * 0.6))
+        threat = max(threat, self._clip01(1.0 - health))
+
+        if homeostasis.get("is_dead") is True or homeostasis.get("is_alive") is False:
+            threat = 1.0
+        return self._clip01(threat)
+
+    def build_area_id(
+        self,
+        *,
+        state: Any = None,
+        info: Any = None,
+        obs: Any = None,
+        step: Optional[int] = None,
+    ) -> str:
+        _ = obs
+        _ = step
+        info_map = info if isinstance(info, Mapping) else {}
+        biome_name = str(info_map.get("biome_name") or "unknown").strip().lower() or "unknown"
+        xpos = self._as_optional_float(info_map.get("xpos"))
+        zpos = self._as_optional_float(info_map.get("zpos"))
+        ypos = self._as_optional_float(info_map.get("ypos"))
+        if xpos is None and state is not None and hasattr(state, "position"):
+            xpos = self._as_optional_float(getattr(state.position, "xpos", None))
+            zpos = self._as_optional_float(getattr(state.position, "zpos", None))
+            ypos = self._as_optional_float(getattr(state.position, "ypos", None))
+        chunk_x = int((xpos or 0.0) // 32.0)
+        chunk_z = int((zpos or 0.0) // 32.0)
+        height = int((ypos or 0.0) // 16.0)
+        return f"{biome_name}:{chunk_x}:{chunk_z}:{height}"
+
+    def estimate_entity_density(
+        self,
+        *,
+        state: Any = None,
+        info: Any = None,
+        obs: Any = None,
+    ) -> float:
+        _ = state
+        _ = obs
+        info_map = info if isinstance(info, Mapping) else {}
+        explicit = self._as_optional_float(info_map.get("entity_density"))
+        if explicit is not None:
+            return self._clip01(explicit)
+        if info_map.get("damage_source") not in (None, "", []):
+            return 0.8
+        if info_map.get("nearby_furnace") is True or info_map.get("nearby_crafting_table") is True:
+            return 0.2
+        return 0.05
+
+    def estimate_terrain_novelty(
+        self,
+        *,
+        state: Any = None,
+        info: Any = None,
+        obs: Any = None,
+    ) -> float:
+        _ = state
+        _ = obs
+        info_map = info if isinstance(info, Mapping) else {}
+        biome = str(info_map.get("biome_name") or "unknown").strip().lower() or "unknown"
+        light = int(self._as_optional_float(info_map.get("light_level")) or 0.0)
+        sky = "sky" if info_map.get("can_see_sky") is True else "nosky"
+        signature = f"{biome}:{light}:{sky}"
+        if self._last_area_signature is None:
+            self._last_area_signature = signature
+            return 0.25
+        novelty = 0.1 if signature == self._last_area_signature else 0.75
+        self._last_area_signature = signature
+        return self._clip01(novelty)
 
     def _register_action_space_policies(self) -> None:
         if not self._nvec:
@@ -528,6 +663,11 @@ class MineDojoAdapter:
             "description": description,
             "tags": self._normalize_tags(tags),
         }
+        descriptor["policy_id"] = str(metadata.get("policy_id")) if isinstance(metadata, Mapping) and metadata.get("policy_id") is not None else f"{source}:{method_name}"
+        descriptor["drive_tags"] = self._infer_drive_tags(
+            tags=descriptor["tags"],
+            descriptor_texts=[method_name, description],
+        )
         if metadata is not None:
             for key, value in metadata.items():
                 if value is not None:
@@ -651,6 +791,16 @@ class MineDojoAdapter:
             seen.add(tag)
         return tags
 
+    def _infer_drive_tags(self, tags: List[str], descriptor_texts: List[str]) -> List[str]:
+        tokens = set(tags)
+        for text in descriptor_texts:
+            tokens.update(self._name_tokens(text))
+        inferred: List[str] = []
+        for drive_tag, marker_tags in self._DRIVE_TAG_RULES.items():
+            if drive_tag in tokens or marker_tags.intersection(tokens):
+                inferred.append(drive_tag)
+        return inferred
+
     @staticmethod
     def _stable_index(seed: str, modulo: int) -> int:
         if modulo <= 0:
@@ -679,14 +829,34 @@ class MineDojoAdapter:
                 return False
         return bool(value)
 
+    @staticmethod
+    def _as_optional_float(value: Any) -> Optional[float]:
+        if isinstance(value, bool):
+            return None
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
 
-def create_adapter(config: Optional[Mapping[str, Any]] = None) -> MineDojoAdapter:
+    @staticmethod
+    def _clip01(value: float) -> float:
+        return max(0.0, min(1.0, float(value)))
+
+
+def create_adapter(config: Optional[Mapping[str, Any]] = None) -> Any:
+    cfg = dict(config or {})
+
+    # If use_remote=true, connect to a running persistent_server instead of
+    # spawning a new Minecraft process.
+    if cfg.get("use_remote", False):
+        from core.adapters.minedojo.remote_adapter import RemoteMineDojoAdapter
+        return RemoteMineDojoAdapter(cfg)
+
     try:
         import minedojo
     except Exception as exc:  # pragma: no cover - optional dependency
         raise ImportError("minedojo package is required for the minedojo adapter") from exc
 
-    cfg = dict(config or {})
     task_id = cfg.get("task_id", "harvest_milk")
     image_size_value = cfg.get("image_size", (160, 256))
     if isinstance(image_size_value, (list, tuple)) and len(image_size_value) == 2:

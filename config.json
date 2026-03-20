@@ -1,19 +1,22 @@
 {
   "adapter_folder": "minedojo",
   "llm": {
-    "enabled": false,
+    "enabled": true,
     "provider": "openai",
     "model": "gpt-4.1-mini",
     "temperature": 0.1,
     "max_tokens": 500,
-    "timeout_s": 1.0
+    "timeout_s": 10.0
   },
   "adapter_config": {
     "task_id": "harvest_milk",
     "image_size": [
       160,
       256
-    ]
+    ],
+    "initial_health": 6,
+    "initial_food": 4,
+    "use_remote": true
   },
   "policy_generator": {
     "weights": {
@@ -28,18 +31,6 @@
       "allostatic_survival_fit": 0.5,
       "allostatic_urgency_alignment": 0.5
     },
-    "discovery": {
-      "reserved_methods": [
-        "reset",
-        "step",
-        "close",
-        "sample_action",
-        "get_available_vitals",
-        "get_available_policies",
-        "get_action_space_actions",
-        "get_raw_observation"
-      ]
-    },
     "long_term_memory": {
       "path": "data/long_term_memory/policies.json",
       "max_score_history": 200,
@@ -48,18 +39,83 @@
     "max_expected_error": 1.0,
     "prediction_error_window": 20,
     "allostatic_controller": {
-      "enabled": true,
-      "llm_interval_steps": 5,
-      "llm_timeout_s": 1.0,
-      "max_voxel_chars": 2000,
-      "life_drop_threshold": 2.0,
-      "food_drop_threshold": 2.0,
-      "air_drop_threshold": 20.0,
-      "high_risk_trigger": 0.7,
-      "default_goal_horizon_steps": 160,
-      "heuristic_confidence": 0.65,
-      "temperature": 0.1,
-      "max_tokens": 500
+      "planning_horizon": 50,
+      "history_window": 20,
+      "irreversibility_bonus": 0.3,
+      "recovery_weight_factor": 0.2,
+      "urgency_tie_epsilon": 0.05,
+      "threat_prior_weight": 0.3,
+      "min_confidence": 0.5,
+      "channels": [
+        {
+          "id": "health",
+          "setpoint": 0.9,
+          "critical_threshold": 0.25,
+          "irreversible": true,
+          "recovery_cost_ticks": 25,
+          "suggested_action_tag": "heal"
+        },
+        {
+          "id": "hunger",
+          "setpoint": 0.8,
+          "critical_threshold": 0.2,
+          "irreversible": false,
+          "recovery_cost_ticks": 20,
+          "suggested_action_tag": "eat"
+        },
+        {
+          "id": "oxygen",
+          "setpoint": 0.9,
+          "critical_threshold": 0.2,
+          "irreversible": true,
+          "recovery_cost_ticks": 30,
+          "suggested_action_tag": "surface"
+        },
+        {
+          "id": "resource_level",
+          "setpoint": 0.7,
+          "critical_threshold": 0.3,
+          "irreversible": false,
+          "recovery_cost_ticks": 15,
+          "suggested_action_tag": "gather"
+        },
+        {
+          "id": "safety",
+          "setpoint": 0.8,
+          "critical_threshold": 0.35,
+          "irreversible": true,
+          "recovery_cost_ticks": 20,
+          "suggested_action_tag": "retreat"
+        }
+      ]
+    },
+    "perceptual_prediction_error": {
+      "alpha": 0.1,
+      "epsilon": 0.01,
+      "sigma_clip": 3.0,
+      "default_precision": 0.5,
+      "min_precision": 0.3
+    },
+    "memory": {
+      "working_memory_capacity": 100,
+      "pe_min_observations": 5,
+      "pe_ema_alpha": 0.1,
+      "faiss_k_default": 5,
+      "faiss_epsilon": 1e-6,
+      "episode_length": 1000
+    },
+    "arousal_valence": {
+      "w_health": 0.35,
+      "w_hunger": 0.25,
+      "w_threat": 0.30,
+      "w_pred_err": 0.10,
+      "v_health": 0.30,
+      "v_hunger": 0.30,
+      "v_resources": 0.20,
+      "v_oxygen": 0.20,
+      "decay_rate": 0.95,
+      "resting_arousal": 0.10,
+      "urgency_broadcast_threshold": 0.65
     }
   }
 }

@@ -1,14 +1,37 @@
 from __future__ import annotations
 
-from typing import Any
-
-from core.layers.interoceptive.AllostaticController import AllostaticController
+from core.layers.interoceptive.allostatic_controller import (
+    AllostaticConfig,
+    AllostaticController,
+    DriveChannel,
+    DriveSignal,
+    HomeostaticHistory,
+    HomeostaticState,
+    PrioritisedDriveSignals,
+)
+from core.layers.interoceptive.ArousalValenceSystem import (
+    ArousalValenceConfig,
+    ArousalValenceState,
+    ArousalValenceSystem,
+    HomeostaticState as ArousalHomeostaticState,
+    PolicyBias,
+    PredictionError,
+)
 from core.layers.interoceptive.VitalStateMonitor import VitalStateMonitor
 
-
-class ArousalValenceSystem:
-    def compute(self, state: Any) -> Any:
-        raise NotImplementedError("Arousal/valence computation not implemented.")
-
-
-__all__ = ["VitalStateMonitor", "AllostaticController", "ArousalValenceSystem"]
+__all__ = [
+    "AllostaticConfig",
+    "AllostaticController",
+    "ArousalValenceConfig",
+    "ArousalHomeostaticState",
+    "ArousalValenceState",
+    "ArousalValenceSystem",
+    "DriveChannel",
+    "DriveSignal",
+    "HomeostaticHistory",
+    "HomeostaticState",
+    "PolicyBias",
+    "PredictionError",
+    "PrioritisedDriveSignals",
+    "VitalStateMonitor",
+]
