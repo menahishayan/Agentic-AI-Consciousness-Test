@@ -52,6 +52,7 @@ class AgentLoop:
         memory_manager: MemoryManager,
         adapter_folder: str,
         policy_config: Optional[Mapping[str, Any]] = None,
+        llm_config: Optional[Mapping[str, Any]] = None,
         workspace: Optional[GlobalWorkspace] = None,
         llm_client: Optional[Any] = None,
         logger: Optional[RunLogger] = None,
@@ -63,6 +64,7 @@ class AgentLoop:
         self.memory_manager = memory_manager
         self.adapter_folder = adapter_folder
         self.policy_config = dict(policy_config or {})
+        self.llm_config = dict(llm_config or {})
         self.workspace = workspace or GlobalWorkspace()
         self.llm_client = llm_client
         self.logger = logger
@@ -119,13 +121,16 @@ class AgentLoop:
             max_expected_error=float(self.policy_config.get("max_expected_error", 1.0)),
             window_size=int(self.policy_config.get("prediction_error_window", 20)),
         )
+        policy_generator_config = dict(self.policy_config)
+        if "model" not in policy_generator_config and self.llm_config.get("model") is not None:
+            policy_generator_config["model"] = self.llm_config.get("model")
         self.policy_generator = PolicyGenerator(
             adapter=self.adapter,
             adapter_folder=self.adapter_folder,
             memory_manager=self.memory_manager,
             goal_checker=self.goal_checker,
             prediction_error_calculator=self.policy_prediction_error_calculator,
-            config=self.policy_config,
+            config=policy_generator_config,
             logger=self.logger,
             llm_client=self.llm_client,
         )

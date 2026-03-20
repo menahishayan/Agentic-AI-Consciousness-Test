@@ -263,6 +263,25 @@ class PolicyGenerator:
             context=context,
         )
 
+        step = context.get("step")
+        drive_signals = self._resolve_drive_signals(context.get("drive_signals"))
+        allostatic_assessment = context.get("allostatic_assessment")
+
+        if self.logger is not None:
+            self.logger.llm_request(
+                {
+                    "system_prompt": system_prompt,
+                    "user_prompt": user_prompt,
+                    "model": self.model,
+                    "temperature": self.temperature,
+                    "max_tokens": 512,
+                    "candidate_policy_ids": [p.get("policy_id") for p in policies],
+                    "drive_signals": drive_signals,
+                    "allostatic_assessment": allostatic_assessment,
+                },
+                step=step,
+            )
+
         response_text = ""
         try:
             response = self.llm_client.generate(
@@ -291,10 +310,17 @@ class PolicyGenerator:
                     {
                         "error_type": type(exc).__name__,
                         "error": str(exc),
+                        "fallback_policy_id": selected.get("policy_id") if selected else None,
                     },
-                    step=context.get("step"),
+                    step=step,
                 )
             return selected
+
+        if self.logger is not None:
+            self.logger.llm_response(
+                {"raw": response_text},
+                step=step,
+            )
 
         selected = self._parse_arbitration_response(response_text, policies)
         if selected is None:
@@ -305,13 +331,57 @@ class PolicyGenerator:
                 context=context,
                 status="fallback_parse_error",
             )
+            if self.logger is not None:
+                self.logger.event(
+                    "policy.arbitration_parse_error",
+                    {
+                        "raw_response": response_text,
+                        "fallback_policy_id": fallback.get("policy_id") if fallback else None,
+                    },
+                    step=step,
+                )
             return fallback
+
+        parsed_response = self._parse_full_response(response_text)
+        rationale = parsed_response.get("rationale", self._extract_rationale(response_text))
+        reasoning = parsed_response.get("reasoning", "")
+        drive_conflict = parsed_response.get("drive_conflict_detected", False)
+        confidence = parsed_response.get("confidence")
 
         self._write_arbitration_trace(
             selected_policy=selected,
-            rationale=self._extract_rationale(response_text),
+            rationale=rationale,
             context=context,
         )
+
+        if self.logger is not None:
+            self.logger.event(
+                "policy.decision",
+                {
+                    "selected_policy_id": selected.get("policy_id"),
+                    "reasoning": reasoning,
+                    "rationale": rationale,
+                    "drive_conflict_detected": drive_conflict,
+                    "confidence": confidence,
+                    "drive_signals": [
+                        {
+                            "channel_id": s.get("channel_id"),
+                            "urgency": s.get("urgency"),
+                            "projected_value": s.get("projected_value"),
+                            "ticks_to_critical": s.get("ticks_to_critical"),
+                        }
+                        for s in drive_signals
+                    ],
+                    "allostatic_needs": (
+                        allostatic_assessment.get("needs")
+                        if isinstance(allostatic_assessment, Mapping)
+                        else []
+                    ),
+                    "candidate_policy_ids": [p.get("policy_id") for p in policies],
+                },
+                step=step,
+            )
+
         return selected
 
     def _build_arbitration_prompt(
@@ -325,9 +395,14 @@ class PolicyGenerator:
             "Select the action that minimizes expected free energy by reducing homeostatic deficits while managing epistemic uncertainty.\n"
             "Reason only from the provided drive states and policy descriptors.\n"
             "Do not use prior knowledge about what any action physically does in the world.\n"
-            "Output only valid JSON with this schema: "
-            '{"selected_index": <int>, "rationale": "<string>", '
-            '"drive_conflict_detected": <bool>, "confidence": <float 0-1>}.'
+            "Output only valid JSON with this schema:\n"
+            '{"reasoning": "<step-by-step chain of thought: identify which drives are most urgent, '
+            "explain any conflicts between drives, evaluate each candidate policy against the drive state, "
+            'and justify your final selection>", '
+            '"selected_index": <int>, '
+            '"rationale": "<one-sentence summary of the decision>", '
+            '"drive_conflict_detected": <bool>, '
+            '"confidence": <float 0-1>}'
         )
 
         drive_signals = self._resolve_drive_signals(context.get("drive_signals"))
@@ -731,3 +806,13 @@ class PolicyGenerator:
         except Exception:
             pass
         return cleaned
+
+    def _parse_full_response(self, text: str) -> Dict[str, Any]:
+        """Parse all fields from the LLM JSON response without raising."""
+        try:
+            payload = json.loads(self._strip_markdown_fences(text))
+            if isinstance(payload, Mapping):
+                return dict(payload)
+        except Exception:
+            pass
+        return {}
