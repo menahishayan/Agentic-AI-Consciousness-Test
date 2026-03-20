@@ -2,9 +2,12 @@ from __future__ import annotations
 
 from datetime import datetime
 import inspect
+import json
 import re
 from typing import Any, Dict, Iterable, List, Mapping, Optional
 
+from core.llm.client import LLMClient
+from core.llm.types import LLMMessage, LLMRequest
 from core.models.signals import ActionProposal
 from core.observability.logger import RunLogger
 
@@ -14,14 +17,6 @@ def _utc_ts() -> str:
 
 
 class PolicyGenerator:
-    _DRIVE_PREFERRED_TAGS: Dict[str, set[str]] = {
-        "health": {"heal", "retreat", "defend"},
-        "hunger": {"eat", "collect", "cook"},
-        "oxygen": {"surface", "ascend", "air"},
-        "resource_level": {"gather", "mine", "craft"},
-        "safety": {"retreat", "avoid", "shelter"},
-    }
-
     def __init__(
         self,
         adapter: Any,
@@ -31,6 +26,7 @@ class PolicyGenerator:
         prediction_error_calculator: Any,
         config: Optional[Mapping[str, Any]] = None,
         logger: Optional[RunLogger] = None,
+        llm_client: Optional[LLMClient] = None,
     ) -> None:
         self.adapter = adapter
         self.adapter_folder = adapter_folder
@@ -39,146 +35,67 @@ class PolicyGenerator:
         self.prediction_error_calculator = prediction_error_calculator
         self.config = dict(config or {})
         self.logger = logger
+        self.llm_client = llm_client
 
-        weights = self.config.get("weights", {})
-        self.weight_goal = max(0.0, self._as_float(weights.get("goal_coherence"), 0.6))
-        self.weight_prediction_error = max(
-            0.0, self._as_float(weights.get("prediction_error"), 0.4)
-        )
-        self.weight_allostatic_survival_fit = max(
-            0.0, self._as_float(weights.get("allostatic_survival_fit"), 0.0)
-        )
-        self.weight_allostatic_urgency_alignment = max(
-            0.0, self._as_float(weights.get("allostatic_urgency_alignment"), 0.0)
-        )
-
-        fallback_scores = self.config.get("fallback_scores", {})
-        self.fallback_goal_score = self._as_float(fallback_scores.get("goal_coherence"), 0.5)
-        self.fallback_prediction_error_score = self._as_float(
-            fallback_scores.get("prediction_error"), 0.5
-        )
-        self.fallback_allostatic_survival_fit = self._as_float(
-            fallback_scores.get("allostatic_survival_fit"), 0.5
-        )
-        self.fallback_allostatic_urgency_alignment = self._as_float(
-            fallback_scores.get("allostatic_urgency_alignment"), 0.5
-        )
+        self.temperature = self._as_float(self.config.get("temperature"), 0.3)
+        self.horizon = max(1, int(self._as_float(self.config.get("horizon"), 5.0)))
+        model_value = self.config.get("model", "claude-sonnet-4-20250514")
+        self.model = str(model_value).strip() or "claude-sonnet-4-20250514"
 
     def propose_action(self, goals: Any, context: Mapping[str, Any]) -> Optional[ActionProposal]:
         policies = self.discover_policies()
         if not policies:
             return None
 
-        policy_records = self._policy_record_map()
-        scored: List[Dict[str, Any]] = []
-        allostatic_assessment = context.get("allostatic_assessment")
-        drive_signals = context.get("drive_signals")
-        for policy in policies:
-            coherence_result = self.goal_checker.check(goals, policy, context)
-            prediction_result = self.prediction_error_calculator.compute(
-                policy["policy_id"],
-                context=context,
-                memory_manager=self.memory_manager,
-            )
-            drive_urgency_alignment_score = self._drive_urgency_alignment_score(
-                policy=policy,
-                drive_signals=drive_signals,
-            )
-            if drive_urgency_alignment_score is None:
-                drive_urgency_alignment_score = 0.0
-            coherence_score = self._score_from_result(
-                coherence_result,
-                "coherence_score",
-                self.fallback_goal_score,
-            )
-            prediction_error_score = self._score_from_result(
-                prediction_result,
-                "prediction_error_score",
-                self.fallback_prediction_error_score,
-            )
-            survival_fit_score = self._allostatic_survival_fit_score(
-                policy=policy,
-                allostatic_assessment=allostatic_assessment,
-            )
-            if survival_fit_score is None:
-                survival_fit_score = self.fallback_allostatic_survival_fit
+        selected_policy = self._arbitrate(policies=policies, goals=goals, context=context)
+        if selected_policy is None:
+            return None
 
-            urgency_alignment_score = self._allostatic_urgency_alignment_score(
-                policy=policy,
-                allostatic_assessment=allostatic_assessment,
-            )
-            if urgency_alignment_score is None:
-                urgency_alignment_score = drive_urgency_alignment_score
-            urgency_alignment_score = self._clamp01(
-                max(urgency_alignment_score, drive_urgency_alignment_score)
-            )
+        try:
+            action_payload = self._invoke_policy(selected_policy, goals, context)
+        except Exception as exc:
+            self._record_policy_invoke_error(selected_policy, context, exc)
+            return None
 
-            combined_score = self._combine_weighted_scores(
-                coherence_score=coherence_score,
-                prediction_error_score=prediction_error_score,
-                survival_fit_score=survival_fit_score,
-                urgency_alignment_score=urgency_alignment_score,
-            )
-            record = policy_records.get(policy["policy_id"], {})
-            last_selected_at = str(record.get("last_selected_at") or "")
-            scored.append(
-                {
-                    "policy": policy,
-                    "combined_score": combined_score,
-                    "last_selected_at": last_selected_at,
-                    "coherence_result": coherence_result,
-                    "prediction_result": prediction_result,
-                    "coherence_score": coherence_score,
-                    "prediction_error_score": prediction_error_score,
-                    "survival_fit_score": survival_fit_score,
-                    "urgency_alignment_score": urgency_alignment_score,
-                    "drive_urgency_alignment_score": drive_urgency_alignment_score,
-                }
-            )
+        coherence_result = self.goal_checker.check(goals, selected_policy, context)
+        prediction_result = self.prediction_error_calculator.compute(
+            selected_policy["policy_id"],
+            context=context,
+            memory_manager=self.memory_manager,
+        )
+        coherence_score = self._score_from_result(
+            coherence_result,
+            "coherence_score",
+            0.5,
+        )
+        prediction_error_score = self._score_from_result(
+            prediction_result,
+            "prediction_error_score",
+            0.5,
+        )
+        combined_score = self._clamp01((coherence_score + (1.0 - prediction_error_score)) / 2.0)
 
-        scored.sort(
-            key=lambda item: (
-                -float(item["drive_urgency_alignment_score"]),
-                -float(item["combined_score"]),
-                item["last_selected_at"],
-                item["policy"]["policy_id"],
-            )
+        components = {
+            "coherence_score": coherence_score,
+            "prediction_error_score": prediction_error_score,
+            "coherence_result": coherence_result,
+            "prediction_result": prediction_result,
+            "selected_at": _utc_ts(),
+            "selection_mode": "llm_arbitration",
+        }
+        self.memory_manager.record_policy_selection(
+            policy_id=selected_policy["policy_id"],
+            score=combined_score,
+            components=components,
+            step=context.get("step"),
         )
 
-        for candidate in scored:
-            policy = candidate["policy"]
-            try:
-                action_payload = self._invoke_policy(policy, goals, context)
-            except Exception as exc:
-                self._record_policy_invoke_error(policy, context, exc)
-                continue
-
-            components = {
-                "coherence_score": candidate["coherence_score"],
-                "prediction_error_score": candidate["prediction_error_score"],
-                "survival_fit_score": candidate["survival_fit_score"],
-                "urgency_alignment_score": candidate["urgency_alignment_score"],
-                "drive_urgency_alignment_score": candidate["drive_urgency_alignment_score"],
-                "coherence_result": candidate["coherence_result"],
-                "prediction_result": candidate["prediction_result"],
-                "allostatic_source": self._allostatic_source(allostatic_assessment),
-                "selected_at": _utc_ts(),
-            }
-            self.memory_manager.record_policy_selection(
-                policy_id=policy["policy_id"],
-                score=candidate["combined_score"],
-                components=components,
-                step=context.get("step"),
-            )
-
-            return ActionProposal(
-                action_id=policy["policy_id"],
-                action=action_payload,
-                expected_outcome=policy.get("description"),
-                cost=max(0.0, 1.0 - float(candidate["combined_score"])),
-            )
-
-        return None
+        return ActionProposal(
+            action_id=selected_policy["policy_id"],
+            action=action_payload,
+            expected_outcome=selected_policy.get("description"),
+            cost=max(0.0, 1.0 - float(combined_score)),
+        )
 
     def discover_policies(self) -> List[Dict[str, Any]]:
         policies = self._discover_from_adapter_api()
@@ -321,17 +238,325 @@ class PolicyGenerator:
                 step=context.get("step"),
             )
 
-    def _policy_record_map(self) -> Dict[str, Dict[str, Any]]:
-        records = self.memory_manager.get_policies(adapter_folder=self.adapter_folder)
-        out: Dict[str, Dict[str, Any]] = {}
-        for record in records:
-            if not isinstance(record, Mapping):
+    def _arbitrate(
+        self,
+        policies: List[Dict[str, Any]],
+        goals: Any,
+        context: Mapping[str, Any],
+    ) -> Optional[Dict[str, Any]]:
+        if not policies:
+            return None
+
+        if self.llm_client is None or len(policies) == 1:
+            selected = self._urgency_fallback(policies, context)
+            self._write_arbitration_fallback_trace(
+                selected_policy=selected,
+                rationale="urgency_fallback",
+                context=context,
+                status="fallback",
+            )
+            return selected
+
+        system_prompt, user_prompt = self._build_arbitration_prompt(
+            policies=policies,
+            goals=goals,
+            context=context,
+        )
+
+        response_text = ""
+        try:
+            response = self.llm_client.generate(
+                LLMRequest(
+                    messages=[
+                        LLMMessage("system", system_prompt),
+                        LLMMessage("user", user_prompt),
+                    ],
+                    model=self.model,
+                    temperature=self.temperature,
+                    max_tokens=512,
+                )
+            )
+            response_text = str(getattr(response, "text", "") or "")
+        except Exception as exc:
+            selected = self._urgency_fallback(policies, context)
+            self._write_arbitration_fallback_trace(
+                selected_policy=selected,
+                rationale=f"llm_error:{type(exc).__name__}:{exc}",
+                context=context,
+                status="fallback_error",
+            )
+            if self.logger is not None:
+                self.logger.event(
+                    "policy.arbitration_error",
+                    {
+                        "error_type": type(exc).__name__,
+                        "error": str(exc),
+                    },
+                    step=context.get("step"),
+                )
+            return selected
+
+        selected = self._parse_arbitration_response(response_text, policies)
+        if selected is None:
+            fallback = self._urgency_fallback(policies, context)
+            self._write_arbitration_fallback_trace(
+                selected_policy=fallback,
+                rationale=response_text,
+                context=context,
+                status="fallback_parse_error",
+            )
+            return fallback
+
+        self._write_arbitration_trace(
+            selected_policy=selected,
+            rationale=self._extract_rationale(response_text),
+            context=context,
+        )
+        return selected
+
+    def _build_arbitration_prompt(
+        self,
+        policies: List[Dict[str, Any]],
+        goals: Any,
+        context: Mapping[str, Any],
+    ) -> tuple[str, str]:
+        system_prompt = (
+            "You are an active inference arbitration system under the free energy principle.\n"
+            "Select the action that minimizes expected free energy by reducing homeostatic deficits while managing epistemic uncertainty.\n"
+            "Reason only from the provided drive states and policy descriptors.\n"
+            "Do not use prior knowledge about what any action physically does in the world.\n"
+            "Output only valid JSON with this schema: "
+            '{"selected_index": <int>, "rationale": "<string>", '
+            '"drive_conflict_detected": <bool>, "confidence": <float 0-1>}.'
+        )
+
+        drive_signals = self._resolve_drive_signals(context.get("drive_signals"))
+        allostatic_assessment = context.get("allostatic_assessment")
+
+        drive_lines: List[str] = [
+            "DRIVE STATE",
+            f"goals: {self._serialize_for_prompt(goals)}",
+            f"signal_count: {len(drive_signals)}",
+        ]
+        for index, signal in enumerate(drive_signals):
+            channel_id = signal.get("channel_id")
+            urgency = signal.get("urgency")
+            projected_value = signal.get("projected_value")
+            ticks_to_critical = signal.get("ticks_to_critical")
+            drive_lines.append(f"signal[{index}].channel_id: {channel_id}")
+            drive_lines.append(f"signal[{index}].urgency: {urgency}")
+            drive_lines.append(f"signal[{index}].projected_value: {projected_value}")
+            drive_lines.append(f"signal[{index}].ticks_to_critical: {ticks_to_critical}")
+
+        if isinstance(allostatic_assessment, Mapping):
+            needs = allostatic_assessment.get("needs")
+            drive_lines.append("allostatic_assessment.present: true")
+            drive_lines.append("allostatic_assessment.needs:")
+            if isinstance(needs, list) and needs:
+                for index, need in enumerate(needs):
+                    if not isinstance(need, Mapping):
+                        continue
+                    drive_lines.append(f"need[{index}].need_id: {need.get('need_id')}")
+                    drive_lines.append(f"need[{index}].urgency: {need.get('urgency')}")
+            else:
+                drive_lines.append("none")
+
+            policy_bias = allostatic_assessment.get("policy_bias")
+            drive_lines.append("allostatic_assessment.policy_bias:")
+            if isinstance(policy_bias, Mapping):
+                drive_lines.append(
+                    f"survival_weight: {policy_bias.get('survival_weight')}"
+                )
+                drive_lines.append(
+                    f"exploration_weight: {policy_bias.get('exploration_weight')}"
+                )
+            else:
+                drive_lines.append("survival_weight: null")
+                drive_lines.append("exploration_weight: null")
+        else:
+            drive_lines.append("allostatic_assessment.present: false")
+
+        policy_lines: List[str] = ["CANDIDATE POLICIES"]
+        for index, policy in enumerate(policies):
+            policy_lines.append(f"[{index}] policy_id: {policy.get('policy_id')}")
+            policy_lines.append(f"[{index}] description: {policy.get('description')}")
+            policy_lines.append(
+                f"[{index}] tags: {self._serialize_for_prompt(self._normalize_tags(policy.get('tags')))}"
+            )
+            policy_lines.append(
+                "[{}] drive_tags: {}".format(
+                    index,
+                    self._serialize_for_prompt(self._normalize_tags(policy.get("drive_tags"))),
+                )
+            )
+
+        recent_traces: List[Any] = []
+        recent_self_state: List[Any] = []
+        query = getattr(self.memory_manager, "query", None)
+        if callable(query):
+            try:
+                traces = query({"target": "policy_traces", "limit": 5})
+                if isinstance(traces, list):
+                    recent_traces = traces[-5:]
+            except Exception:
+                recent_traces = []
+            try:
+                self_state = query({"target": "self_state", "limit": 3})
+                if isinstance(self_state, list):
+                    recent_self_state = self_state[-3:]
+            except Exception:
+                recent_self_state = []
+
+        memory_lines: List[str] = [
+            "MEMORY CONTEXT",
+            "Recent arbitration history:",
+        ]
+        if recent_traces:
+            for index, trace in enumerate(recent_traces):
+                memory_lines.append(f"trace[{index}]: {self._serialize_for_prompt(trace)}")
+        else:
+            memory_lines.append("none")
+
+        memory_lines.append("Known agent capabilities:")
+        if recent_self_state:
+            for index, snapshot in enumerate(recent_self_state):
+                memory_lines.append(
+                    f"self_state[{index}]: {self._serialize_for_prompt(snapshot)}"
+                )
+        else:
+            memory_lines.append("none")
+
+        instruction = (
+            "INSTRUCTION\n"
+            f"Reason over expected free energy across the next {self.horizon} steps. "
+            "Return JSON only."
+        )
+
+        user_prompt = "\n\n".join(
+            [
+                "\n".join(drive_lines),
+                "\n".join(policy_lines),
+                "\n".join(memory_lines),
+                instruction,
+            ]
+        )
+        return system_prompt, user_prompt
+
+    def _parse_arbitration_response(
+        self,
+        text: str,
+        policies: List[Dict[str, Any]],
+    ) -> Optional[Dict[str, Any]]:
+        def _log_failure(reason: str) -> None:
+            if self.logger is not None:
+                self.logger.event(
+                    "policy.arbitration_parse_error",
+                    {
+                        "reason": reason,
+                    },
+                )
+
+        try:
+            cleaned = self._strip_markdown_fences(text)
+            payload = json.loads(cleaned)
+        except Exception as exc:
+            _log_failure(f"{type(exc).__name__}:{exc}")
+            return None
+
+        if not isinstance(payload, Mapping):
+            _log_failure("response_not_json_object")
+            return None
+
+        selected_index_raw = payload.get("selected_index")
+        selected_index = self._coerce_index(selected_index_raw)
+        if selected_index is None:
+            _log_failure("selected_index_invalid")
+            return None
+        if selected_index < 0 or selected_index >= len(policies):
+            _log_failure("selected_index_out_of_range")
+            return None
+        return policies[selected_index]
+
+    def _urgency_fallback(
+        self,
+        policies: List[Dict[str, Any]],
+        context: Mapping[str, Any],
+    ) -> Optional[Dict[str, Any]]:
+        if not policies:
+            return None
+
+        drive_signals = self._resolve_drive_signals(context.get("drive_signals"))
+        if not drive_signals:
+            return policies[0]
+
+        urgency_by_channel: Dict[str, float] = {}
+        for signal in drive_signals:
+            channel_id = signal.get("channel_id")
+            urgency_raw = signal.get("urgency")
+            if not isinstance(channel_id, str):
                 continue
-            policy_id = record.get("policy_id")
-            if not isinstance(policy_id, str):
+            if not isinstance(urgency_raw, (int, float)):
                 continue
-            out[policy_id] = dict(record)
-        return out
+            channel_key = channel_id.strip().lower()
+            if not channel_key:
+                continue
+            urgency = self._clamp01(float(urgency_raw))
+            urgency_by_channel[channel_key] = max(urgency, urgency_by_channel.get(channel_key, 0.0))
+
+        if not urgency_by_channel:
+            return policies[0]
+
+        best_index = 0
+        best_score = -1.0
+        for index, policy in enumerate(policies):
+            drive_tags = self._normalize_tags(policy.get("drive_tags"))
+            score = 0.0
+            for tag in drive_tags:
+                score = max(score, urgency_by_channel.get(tag, 0.0))
+            if score > best_score:
+                best_score = score
+                best_index = index
+        return policies[best_index]
+
+    def _write_arbitration_trace(
+        self,
+        selected_policy: Dict[str, Any],
+        rationale: str,
+        context: Mapping[str, Any],
+    ) -> None:
+        self.memory_manager.record_policy_trace(
+            {
+                "policy_id": selected_policy["policy_id"],
+                "operation": "arbitrate",
+                "status": "selected",
+                "rationale": rationale,
+                "step": context.get("step"),
+                "ts": _utc_ts(),
+            }
+        )
+
+    def _write_arbitration_fallback_trace(
+        self,
+        selected_policy: Optional[Mapping[str, Any]],
+        rationale: str,
+        context: Mapping[str, Any],
+        status: str,
+    ) -> None:
+        policy_id: Optional[str] = None
+        if isinstance(selected_policy, Mapping):
+            raw_policy_id = selected_policy.get("policy_id")
+            if raw_policy_id is not None:
+                policy_id = str(raw_policy_id)
+        self.memory_manager.record_policy_trace(
+            {
+                "policy_id": policy_id,
+                "operation": "arbitrate",
+                "status": str(status),
+                "rationale": rationale,
+                "step": context.get("step"),
+                "ts": _utc_ts(),
+            }
+        )
 
     @staticmethod
     def _score_from_result(
@@ -344,133 +569,6 @@ class PolicyGenerator:
             if isinstance(raw, (int, float)):
                 return max(0.0, min(1.0, float(raw)))
         return fallback
-
-    def _combine_weighted_scores(
-        self,
-        coherence_score: float,
-        prediction_error_score: float,
-        survival_fit_score: float,
-        urgency_alignment_score: float,
-    ) -> float:
-        weighted_sum = 0.0
-        weight_total = 0.0
-        components = (
-            (self.weight_goal, coherence_score),
-            (self.weight_prediction_error, 1.0 - prediction_error_score),
-            (self.weight_allostatic_survival_fit, survival_fit_score),
-            (self.weight_allostatic_urgency_alignment, urgency_alignment_score),
-        )
-        for weight, score in components:
-            if weight <= 0.0:
-                continue
-            weighted_sum += weight * self._clamp01(score)
-            weight_total += weight
-        if weight_total <= 0.0:
-            return 0.0
-        return self._clamp01(weighted_sum / weight_total)
-
-    def _allostatic_survival_fit_score(
-        self,
-        policy: Mapping[str, Any],
-        allostatic_assessment: Any,
-    ) -> Optional[float]:
-        if not isinstance(allostatic_assessment, Mapping):
-            return None
-        policy_bias_alignment = self._policy_bias_alignment_score(
-            policy=policy,
-            policy_bias=allostatic_assessment.get("policy_bias"),
-        )
-        policy_tokens = self._policy_tokens(policy)
-        allostatic_tokens = self._allostatic_tokens(allostatic_assessment)
-        overlap_score: Optional[float] = None
-        if policy_tokens and allostatic_tokens:
-            overlap = policy_tokens.intersection(allostatic_tokens)
-            union = policy_tokens.union(allostatic_tokens)
-            if union:
-                overlap_score = self._clamp01(float(len(overlap)) / float(len(union)))
-
-        if overlap_score is None:
-            return policy_bias_alignment
-        if policy_bias_alignment is None:
-            return overlap_score
-        return self._clamp01((overlap_score + policy_bias_alignment) / 2.0)
-
-    def _allostatic_urgency_alignment_score(
-        self,
-        policy: Mapping[str, Any],
-        allostatic_assessment: Any,
-    ) -> Optional[float]:
-        if not isinstance(allostatic_assessment, Mapping):
-            return None
-        needs = allostatic_assessment.get("needs")
-        if not isinstance(needs, list):
-            return None
-        policy_tokens = self._policy_tokens(policy)
-        if not policy_tokens:
-            return None
-
-        weighted = 0.0
-        total = 0.0
-        for raw_need in needs:
-            if not isinstance(raw_need, Mapping):
-                continue
-            urgency_raw = raw_need.get("urgency")
-            if not isinstance(urgency_raw, (int, float)):
-                continue
-            urgency = self._clamp01(float(urgency_raw))
-            if urgency <= 0.0:
-                continue
-            need_tokens = self._need_tokens(raw_need)
-            if not need_tokens:
-                continue
-            overlap = policy_tokens.intersection(need_tokens)
-            union = policy_tokens.union(need_tokens)
-            if not union:
-                continue
-            score = float(len(overlap)) / float(len(union))
-            weighted += score * urgency
-            total += urgency
-
-        if total <= 0.0:
-            return None
-        return self._clamp01(weighted / total)
-
-    def _drive_urgency_alignment_score(
-        self,
-        policy: Mapping[str, Any],
-        drive_signals: Any,
-    ) -> Optional[float]:
-        signals = self._resolve_drive_signals(drive_signals)
-        if not signals:
-            return None
-        policy_tokens = self._policy_tokens(policy)
-        if not policy_tokens:
-            return None
-
-        weighted = 0.0
-        total = 0.0
-        for signal in signals:
-            channel_id = signal.get("channel_id")
-            urgency_raw = signal.get("urgency")
-            if not isinstance(channel_id, str):
-                continue
-            if not isinstance(urgency_raw, (int, float)):
-                continue
-            urgency = self._clamp01(float(urgency_raw))
-            if urgency <= 0.0:
-                continue
-
-            preferred_tags = self._preferred_tags_for_drive(channel_id)
-            if not preferred_tags:
-                continue
-            overlap = preferred_tags.intersection(policy_tokens)
-            score = float(len(overlap)) / float(len(preferred_tags))
-            weighted += urgency * score
-            total += urgency
-
-        if total <= 0.0:
-            return None
-        return self._clamp01(weighted / total)
 
     def _policy_tokens(self, policy: Mapping[str, Any]) -> set[str]:
         sources: List[str] = []
@@ -520,86 +618,6 @@ class PolicyGenerator:
             tokens.update(self._name_tokens(source))
         return tokens
 
-    def _policy_bias_alignment_score(
-        self,
-        policy: Mapping[str, Any],
-        policy_bias: Any,
-    ) -> Optional[float]:
-        if not isinstance(policy_bias, Mapping):
-            return None
-
-        survival_weight_raw = policy_bias.get("survival_weight")
-        exploration_weight_raw = policy_bias.get("exploration_weight")
-        if not isinstance(survival_weight_raw, (int, float)):
-            return None
-        survival_weight = self._clamp01(float(survival_weight_raw))
-        if isinstance(exploration_weight_raw, (int, float)):
-            exploration_weight = self._clamp01(float(exploration_weight_raw))
-        else:
-            exploration_weight = self._clamp01(1.0 - survival_weight)
-
-        weight_total = survival_weight + exploration_weight
-        if weight_total <= 0.0:
-            survival_weight = 0.5
-            exploration_weight = 0.5
-        else:
-            survival_weight /= weight_total
-            exploration_weight /= weight_total
-
-        affinity = self._policy_survival_affinity(policy)
-        return self._clamp01(
-            survival_weight * affinity + exploration_weight * (1.0 - affinity)
-        )
-
-    def _policy_survival_affinity(self, policy: Mapping[str, Any]) -> float:
-        tokens = self._policy_tokens(policy)
-        if not tokens:
-            return 0.5
-        survival_markers = {
-            "survival",
-            "health",
-            "heal",
-            "food",
-            "hunger",
-            "oxygen",
-            "air",
-            "escape",
-            "retreat",
-            "shelter",
-            "avoid",
-            "defend",
-            "shield",
-            "protect",
-        }
-        exploration_markers = {
-            "explore",
-            "exploration",
-            "scout",
-            "search",
-            "mine",
-            "gather",
-            "discover",
-            "travel",
-            "wander",
-            "survey",
-        }
-        survival_hits = len(tokens.intersection(survival_markers))
-        exploration_hits = len(tokens.intersection(exploration_markers))
-        total = survival_hits + exploration_hits
-        if total <= 0:
-            return 0.5
-        return self._clamp01(float(survival_hits) / float(total))
-
-    @staticmethod
-    def _allostatic_source(allostatic_assessment: Any) -> Optional[str]:
-        if not isinstance(allostatic_assessment, Mapping):
-            return None
-        source = allostatic_assessment.get("source")
-        if source is None:
-            return None
-        text = str(source).strip()
-        return text or None
-
     def _resolve_drive_signals(self, drive_signals: Any) -> List[Dict[str, Any]]:
         if drive_signals is None:
             return []
@@ -623,24 +641,20 @@ class PolicyGenerator:
                 out.append(dict(vars(item)))
         return out
 
-    def _preferred_tags_for_drive(self, channel_id: str) -> set[str]:
-        normalized = str(channel_id).strip().lower()
-        if not normalized:
-            return set()
-        preferred = set(self._DRIVE_PREFERRED_TAGS.get(normalized, set()))
-        preferred.add(normalized)
-        return preferred
-
     def _infer_drive_tags(self, tags: List[str], descriptor_texts: List[str]) -> List[str]:
-        tokens = set(tags)
+        candidates: List[str] = []
+        seen = set()
+        for token in tags:
+            normalized = str(token).strip().lower()
+            if normalized and normalized not in seen:
+                candidates.append(normalized)
+                seen.add(normalized)
         for text in descriptor_texts:
-            tokens.update(self._name_tokens(text))
-
-        out: List[str] = []
-        for drive_tag, preferred in self._DRIVE_PREFERRED_TAGS.items():
-            if drive_tag in tokens or preferred.intersection(tokens):
-                out.append(drive_tag)
-        return out
+            for token in self._name_tokens(text):
+                if token and token not in seen:
+                    candidates.append(token)
+                    seen.add(token)
+        return candidates
 
     @staticmethod
     def _normalize_tags(raw: Any) -> List[str]:
@@ -671,3 +685,49 @@ class PolicyGenerator:
     @staticmethod
     def _clamp01(value: float) -> float:
         return max(0.0, min(1.0, float(value)))
+
+    @staticmethod
+    def _serialize_for_prompt(value: Any) -> str:
+        try:
+            return json.dumps(value, ensure_ascii=True, sort_keys=True, default=str)
+        except Exception:
+            return str(value)
+
+    @staticmethod
+    def _strip_markdown_fences(text: str) -> str:
+        cleaned = str(text or "").strip()
+        if cleaned.startswith("```"):
+            cleaned = re.sub(r"^```[a-zA-Z0-9_-]*\s*", "", cleaned)
+            cleaned = re.sub(r"\s*```$", "", cleaned)
+        return cleaned.strip()
+
+    @staticmethod
+    def _coerce_index(value: Any) -> Optional[int]:
+        if isinstance(value, bool):
+            return None
+        if isinstance(value, int):
+            return value
+        if isinstance(value, float):
+            if value.is_integer():
+                return int(value)
+            return None
+        if isinstance(value, str):
+            text = value.strip()
+            if not text:
+                return None
+            try:
+                return int(text)
+            except ValueError:
+                return None
+        return None
+
+    def _extract_rationale(self, text: str) -> str:
+        cleaned = self._strip_markdown_fences(text)
+        try:
+            payload = json.loads(cleaned)
+            rationale = payload.get("rationale") if isinstance(payload, Mapping) else None
+            if isinstance(rationale, str):
+                return rationale
+        except Exception:
+            pass
+        return cleaned

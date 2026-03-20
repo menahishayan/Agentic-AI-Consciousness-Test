@@ -4,6 +4,13 @@ from typing import Any, Iterable, Optional
 
 
 class FreeEnergyMinimizer:
+    """Post-selection filter for choosing the lowest-cost proposal.
+
+    Policy arbitration can happen upstream (for example, with an LLM selector).
+    This utility remains useful when execution returns multiple concrete action
+    candidates and one must be chosen by cost.
+    """
+
     def select_action(self, proposals: Any) -> Optional[Any]:
         if proposals is None:
             return None

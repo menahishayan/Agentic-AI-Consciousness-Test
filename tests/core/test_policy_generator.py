@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, Dict, List
 
+from core.llm.types import LLMRequest, LLMResponse
 from core.layers.action_selection import PolicyGenerator
 from core.memory.manager import MemoryManager
 from core.models.signals import ActionProposal
@@ -87,6 +88,16 @@ class _NoPolicyContractAdapter:
 
     def policy_hidden(self) -> str:
         return "hidden_action"
+
+
+class _StaticLLMClient:
+    def __init__(self, text: str) -> None:
+        self.text = text
+        self.requests: List[LLMRequest] = []
+
+    def generate(self, request: LLMRequest) -> LLMResponse:
+        self.requests.append(request)
+        return LLMResponse(text=self.text)
 
 
 def _memory_manager(tmp_path: Path) -> MemoryManager:
@@ -179,3 +190,79 @@ def test_reflection_fallback_is_disabled_when_adapter_contract_is_missing(tmp_pa
     )
 
     assert proposal is None
+
+
+def test_llm_arbitrator_selects_from_response(tmp_path: Path) -> None:
+    memory_manager = _memory_manager(tmp_path)
+    llm_client = _StaticLLMClient(
+        text='{"selected_index": 1, "rationale": "index 1 aligns", "drive_conflict_detected": false, "confidence": 0.88}'
+    )
+    generator = PolicyGenerator(
+        adapter=_DriveAwareAdapter(),
+        adapter_folder="dummy",
+        memory_manager=memory_manager,
+        goal_checker=_NeutralGoalChecker(),
+        prediction_error_calculator=_NeutralPredictionErrorCalculator(),
+        config={},
+        llm_client=llm_client,
+    )
+
+    proposal = generator.propose_action(
+        goals=[],
+        context={
+            "step": 3,
+            "drive_signals": {
+                "signals": [
+                    {"channel_id": "hunger", "urgency": 0.95},
+                    {"channel_id": "safety", "urgency": 0.20},
+                ],
+                "highest_urgency": 0.95,
+            },
+        },
+    )
+
+    assert isinstance(proposal, ActionProposal)
+    assert proposal.action_id == "dummy:policy_explore"
+    assert proposal.action == "explore_action"
+    assert len(llm_client.requests) == 1
+
+    traces = memory_manager.query({"target": "policy_traces", "limit": 10})
+    assert any(
+        isinstance(trace, dict)
+        and trace.get("operation") == "arbitrate"
+        and trace.get("status") == "selected"
+        and trace.get("policy_id") == "dummy:policy_explore"
+        for trace in traces
+    )
+
+
+def test_llm_parse_failure_falls_back_to_urgency(tmp_path: Path) -> None:
+    memory_manager = _memory_manager(tmp_path)
+    llm_client = _StaticLLMClient(text="{selected_index: not-json}")
+    generator = PolicyGenerator(
+        adapter=_DriveAwareAdapter(),
+        adapter_folder="dummy",
+        memory_manager=memory_manager,
+        goal_checker=_NeutralGoalChecker(),
+        prediction_error_calculator=_NeutralPredictionErrorCalculator(),
+        config={},
+        llm_client=llm_client,
+    )
+
+    proposal = generator.propose_action(
+        goals=[],
+        context={
+            "step": 4,
+            "drive_signals": {
+                "signals": [
+                    {"channel_id": "hunger", "urgency": 0.95},
+                    {"channel_id": "safety", "urgency": 0.20},
+                ],
+                "highest_urgency": 0.95,
+            },
+        },
+    )
+
+    assert isinstance(proposal, ActionProposal)
+    assert proposal.action_id == "dummy:policy_seek_food"
+    assert proposal.action == "food_action"

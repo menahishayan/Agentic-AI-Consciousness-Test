@@ -129,6 +129,7 @@ class AgentLoop:
             prediction_error_calculator=self.policy_prediction_error_calculator,
             config=self.policy_config,
             logger=self.logger,
+            llm_client=self.llm_client,
         )
 
     @staticmethod
