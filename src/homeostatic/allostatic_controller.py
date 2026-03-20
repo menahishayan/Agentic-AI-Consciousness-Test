@@ -344,7 +344,12 @@ class AllostaticController:
             if not callable(getter):
                 return 0.0
             try:
-                score = getter(channel_id_a, channel_id_b)
+                score = getter(channel_id_a, channel_id_b, context_vector)
+            except TypeError:
+                try:
+                    score = getter(channel_id_a, channel_id_b)
+                except Exception:
+                    return 0.0
             except Exception:
                 return 0.0
 

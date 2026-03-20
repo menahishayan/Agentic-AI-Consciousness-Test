@@ -5,6 +5,7 @@ from typing import Any, Dict, List, Mapping, Optional
 from core.layers.interoceptive import VitalStateMonitor
 from core.models.state import AgentState
 from core.runtime.loop import AgentLoop
+from homeostatic import DriveSignal, PrioritisedDriveSignals
 from memory.memory_manager import MemoryManager
 
 
@@ -152,6 +153,25 @@ class _CountingMapper:
         return AgentState.from_info(dict(payload))
 
 
+def _drive_signal(
+    channel_id: str,
+    *,
+    urgency: float,
+    projected_value: float = 0.5,
+    tick: int = 0,
+) -> DriveSignal:
+    return DriveSignal(
+        channel_id=channel_id,
+        current_value=0.5,
+        projected_value=projected_value,
+        ticks_to_critical=10.0,
+        urgency=urgency,
+        projection_confidence=0.8,
+        suggested_action_tag=channel_id,
+        tick=tick,
+    )
+
+
 def test_step_zero_maps_observation_once_before_action() -> None:
     adapter = _DriveAwareDummyAdapter()
     mapper = _CountingMapper()
@@ -219,3 +239,79 @@ def test_drive_allostasis_uses_rolling_history_and_emits_signals() -> None:
     assert isinstance(loop._last_drive_signals.signals, list)  # noqa: SLF001
     assert memory_manager.self_state._metadata  # noqa: SLF001
     assert memory_manager.policy_traces._metadata  # noqa: SLF001
+
+
+def test_policy_trace_winner_channel_is_policy_drive_not_top_signal() -> None:
+    class _HungerTaggedAdapter(_DriveAwareDummyAdapter):
+        def get_available_policies(self) -> List[Dict[str, Any]]:
+            return [
+                {
+                    "policy_id": "dummy:policy_noop",
+                    "callable_name": "policy_noop",
+                    "description": "Prefer hunger recovery for testing.",
+                    "tags": ["eat", "collect"],
+                    "drive_tags": ["hunger"],
+                }
+            ]
+
+    loop = AgentLoop(
+        adapter=_HungerTaggedAdapter(),
+        observation_mapper=_CountingMapper(),
+        memory_manager=MemoryManager(),
+        adapter_folder="dummy",
+        policy_config={},
+    )
+    signals = PrioritisedDriveSignals(
+        signals=[
+            _drive_signal("health", urgency=0.95, projected_value=0.2, tick=10),
+            _drive_signal("hunger", urgency=0.70, projected_value=0.1, tick=10),
+            _drive_signal("safety", urgency=0.30, projected_value=0.4, tick=10),
+        ],
+        highest_urgency=0.95,
+        tick=10,
+    )
+
+    loop._record_policy_trace(  # noqa: SLF001
+        selected_policy_id="dummy:policy_noop",
+        drive_signals=signals,
+        reward=0.0,
+        step=10,
+    )
+
+    records = list(loop.memory_manager.policy_traces._metadata.values())  # noqa: SLF001
+    assert len(records) == 1
+    trace = records[0]
+    assert trace.winner_channel_id == "hunger"
+    assert trace.channel_a_id == "hunger"
+    assert trace.channel_b_id == "health"
+    assert trace.outcome_score == 0.0
+
+
+def test_policy_trace_skips_single_signal_conflicts() -> None:
+    loop = AgentLoop(
+        adapter=_DriveAwareDummyAdapter(),
+        observation_mapper=_CountingMapper(),
+        memory_manager=MemoryManager(),
+        adapter_folder="dummy",
+        policy_config={},
+    )
+    single = PrioritisedDriveSignals(
+        signals=[_drive_signal("health", urgency=0.9, tick=2)],
+        highest_urgency=0.9,
+        tick=2,
+    )
+
+    loop._record_policy_trace(  # noqa: SLF001
+        selected_policy_id="dummy:policy_noop",
+        drive_signals=single,
+        reward=1.0,
+        step=2,
+    )
+
+    assert loop.memory_manager.policy_traces._metadata == {}  # noqa: SLF001
+
+
+def test_reward_to_outcome_score_handles_sparse_non_negative_rewards() -> None:
+    assert AgentLoop._reward_to_outcome_score(0.0) == 0.0  # noqa: SLF001
+    assert AgentLoop._reward_to_outcome_score(0.25) == 0.25  # noqa: SLF001
+    assert AgentLoop._reward_to_outcome_score(2.0) == 1.0  # noqa: SLF001

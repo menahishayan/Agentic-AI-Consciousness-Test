@@ -28,18 +28,6 @@
       "allostatic_survival_fit": 0.5,
       "allostatic_urgency_alignment": 0.5
     },
-    "discovery": {
-      "reserved_methods": [
-        "reset",
-        "step",
-        "close",
-        "sample_action",
-        "get_available_vitals",
-        "get_available_policies",
-        "get_action_space_actions",
-        "get_raw_observation"
-      ]
-    },
     "long_term_memory": {
       "path": "data/long_term_memory/policies.json",
       "max_score_history": 200,

@@ -188,25 +188,19 @@ class PolicyTraces:
             return None
 
     def _encode_context_for_record(self, context_vector: np.ndarray, tick: int) -> np.ndarray:
-        values = np.asarray(context_vector, dtype=np.float32).reshape(-1)
-        vector = np.zeros((self._DIM,), dtype=np.float32)
-        length = min(5, values.shape[0])
-        if length > 0:
-            vector[:length] = values[:length]
-        vector[5] = self._normalize_tick(tick)
-        return self._l2_normalize(vector)
+        _ = tick
+        return self._encode_context(context_vector)
 
     def _encode_context_for_query(self, context_vector: np.ndarray) -> np.ndarray:
+        return self._encode_context(context_vector)
+
+    def _encode_context(self, context_vector: np.ndarray) -> np.ndarray:
         values = np.asarray(context_vector, dtype=np.float32).reshape(-1)
         vector = np.zeros((self._DIM,), dtype=np.float32)
         length = min(self._DIM, values.shape[0])
         if length > 0:
             vector[:length] = values[:length]
         return self._l2_normalize(vector)
-
-    def _normalize_tick(self, tick: int) -> float:
-        normalized = (int(tick) % self.episode_length) / float(self.episode_length)
-        return self._clip01(normalized)
 
     @staticmethod
     def _pair_key(channel_a_id: str, channel_b_id: str) -> Tuple[str, str]:

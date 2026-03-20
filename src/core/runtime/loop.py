@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections import deque
 from dataclasses import asdict
+import re
 from typing import Any, Callable, Deque, Dict, List, Mapping, Optional
 
 import numpy as np
@@ -38,6 +39,14 @@ from perceptual import (
 
 
 class AgentLoop:
+    _POLICY_DRIVE_TAG_RULES: Dict[str, set[str]] = {
+        "health": {"heal", "retreat", "defend", "protect", "shield"},
+        "hunger": {"eat", "collect", "cook", "food", "harvest"},
+        "oxygen": {"surface", "ascend", "air", "breath"},
+        "resource_level": {"gather", "mine", "craft", "smelt"},
+        "safety": {"retreat", "avoid", "shelter", "escape"},
+    }
+
     def __init__(
         self,
         adapter: Any,
@@ -76,6 +85,7 @@ class AgentLoop:
             expected_vitals=self._load_available_vitals(adapter),
         )
         self._drive_channels = self._build_drive_channels(allostatic_cfg)
+        self._drive_channel_map = {channel.id: channel for channel in self._drive_channels}
         self._allostatic_config = self._build_allostatic_config(allostatic_cfg)
         self._homeostatic_history: Deque[DriveState] = deque(
             maxlen=max(1, int(self._allostatic_config.history_window))
@@ -326,8 +336,6 @@ class AgentLoop:
             )
             self._record_policy_trace(
                 selected_policy_id=selected_policy_id,
-                homeostatic_state=homeostatic_state,
-                arousal=float(arousal_valence_state.arousal),
                 drive_signals=drive_signals,
                 reward=reward,
                 step=step,
@@ -670,26 +678,45 @@ class AgentLoop:
     def _record_policy_trace(
         self,
         selected_policy_id: str,
-        homeostatic_state: HomeostaticState,
-        arousal: float,
         drive_signals: PrioritisedDriveSignals,
         reward: Any,
         step: int,
     ) -> None:
         signals = list(drive_signals.signals)
-        if not signals:
+        if len(signals) < 2:
             return
 
-        winner = signals[0]
-        runner_up = signals[1] if len(signals) > 1 else winner
+        winner, runner_up = self._trace_channels_for_policy(
+            selected_policy_id=selected_policy_id,
+            signals=signals,
+        )
+        if winner is None or runner_up is None:
+            return
+        if winner.channel_id == runner_up.channel_id:
+            return
+
+        winner_channel = self._drive_channel_map.get(winner.channel_id)
+        runner_up_channel = self._drive_channel_map.get(runner_up.channel_id)
+        survival_weight = 1.0 if (
+            bool(getattr(winner_channel, "irreversible", False))
+            or bool(getattr(runner_up_channel, "irreversible", False))
+        ) else 0.5
+        tick_norm = self._clamp01(
+            float(step % max(1, self._allostatic_config.planning_horizon))
+            / float(max(1, self._allostatic_config.planning_horizon))
+        )
         context_vector = np.asarray(
             [
-                self._clamp01(homeostatic_state.health),
-                self._clamp01(homeostatic_state.hunger),
-                self._clamp01(homeostatic_state.resource_level),
-                self._clamp01(homeostatic_state.threat_proximity),
-                self._clamp01(homeostatic_state.oxygen),
-                self._clamp01(arousal),
+                self._clamp01(winner.urgency),
+                self._clamp01(runner_up.urgency),
+                self._clamp01(max(winner.urgency, runner_up.urgency)),
+                self._clamp(
+                    winner.projected_value - runner_up.projected_value,
+                    -1.0,
+                    1.0,
+                ),
+                self._clamp01(survival_weight),
+                tick_norm,
             ],
             dtype=np.float32,
         )
@@ -703,14 +730,102 @@ class AgentLoop:
             tick=int(step),
         )
 
+    def _trace_channels_for_policy(
+        self,
+        selected_policy_id: str,
+        signals: List[Any],
+    ) -> tuple[Optional[Any], Optional[Any]]:
+        policy_drive_tags = self._policy_drive_tags(selected_policy_id)
+        winner: Optional[Any] = None
+        if policy_drive_tags:
+            for signal in signals:
+                channel_id = str(getattr(signal, "channel_id", "")).strip().lower()
+                if channel_id in policy_drive_tags:
+                    winner = signal
+                    break
+        if winner is None and signals:
+            winner = signals[0]
+
+        if winner is None:
+            return None, None
+
+        winner_channel_id = str(getattr(winner, "channel_id", "")).strip().lower()
+        runner_up: Optional[Any] = None
+        for signal in signals:
+            channel_id = str(getattr(signal, "channel_id", "")).strip().lower()
+            if channel_id == winner_channel_id:
+                continue
+            runner_up = signal
+            break
+        return winner, runner_up
+
+    def _policy_drive_tags(self, policy_id: str) -> set[str]:
+        getter = getattr(self.adapter, "get_available_policies", None)
+        if not callable(getter):
+            return set()
+        try:
+            policies = getter()
+        except Exception:
+            return set()
+        if not isinstance(policies, list):
+            return set()
+
+        descriptor: Optional[Mapping[str, Any]] = None
+        for item in policies:
+            if not isinstance(item, Mapping):
+                continue
+            item_policy_id = item.get("policy_id")
+            if isinstance(item_policy_id, str) and item_policy_id == policy_id:
+                descriptor = item
+                break
+        if descriptor is None:
+            return set()
+
+        drive_tags = descriptor.get("drive_tags")
+        if isinstance(drive_tags, list):
+            normalized = {
+                str(tag).strip().lower()
+                for tag in drive_tags
+                if isinstance(tag, str) and tag.strip()
+            }
+            if normalized:
+                return normalized
+
+        tags = descriptor.get("tags")
+        tokens: set[str] = set()
+        if isinstance(tags, list):
+            for tag in tags:
+                if isinstance(tag, str):
+                    tokens.update(self._name_tokens(tag))
+        description = descriptor.get("description")
+        if isinstance(description, str):
+            tokens.update(self._name_tokens(description))
+        callable_name = descriptor.get("callable_name")
+        if isinstance(callable_name, str):
+            tokens.update(self._name_tokens(callable_name))
+
+        inferred: set[str] = set()
+        for drive_tag, marker_tokens in self._POLICY_DRIVE_TAG_RULES.items():
+            if drive_tag in tokens or marker_tokens.intersection(tokens):
+                inferred.add(drive_tag)
+        return inferred
+
+    @staticmethod
+    def _name_tokens(name: str) -> List[str]:
+        text = str(name).strip().lower()
+        if not text:
+            return []
+        tokens = re.split(r"[^a-z0-9]+", text)
+        return [token for token in tokens if token]
+
     @staticmethod
     def _reward_to_outcome_score(reward: Any) -> float:
         try:
             numeric = float(reward)
         except (TypeError, ValueError):
-            return 0.5
-        # Squash arbitrary reward scale into [0, 1].
-        return max(0.0, min(1.0, (numeric + 1.0) / 2.0))
+            return 0.0
+        # Sparse non-negative reward assumption: 0 is failure/neutral, positives are progress.
+        return max(0.0, min(1.0, numeric))
 
     @staticmethod
     def _build_drive_channels(config: Mapping[str, Any]) -> List[DriveChannel]:

@@ -68,17 +68,6 @@ Minimal shape:
       "goal_coherence": 0.5,
       "prediction_error": 0.5
     },
-    "discovery": {
-      "reserved_methods": [
-        "reset",
-        "step",
-        "close",
-        "sample_action",
-        "get_available_vitals",
-        "get_available_policies",
-        "get_raw_observation"
-      ]
-    },
     "long_term_memory": {
       "path": "data/long_term_memory/policies.json",
       "max_score_history": 200,
@@ -97,14 +86,19 @@ Required adapter methods:
 - `step(action)`
 - `close()`
 - `get_available_vitals() -> list[str]`
+- `get_available_policies() -> list[dict]`
+- `estimate_resource_level(...) -> float`
+- `estimate_threat_proximity(...) -> float`
+- `build_area_id(...) -> str`
 
 Optional adapter methods:
 - `sample_action()`
-- `get_available_policies() -> list[dict]`
+- `estimate_entity_density(...) -> float`
+- `estimate_terrain_novelty(...) -> float`
 
 Policy discovery behavior:
-- `PolicyGenerator` first uses `get_available_policies()` when available.
-- If missing or empty, it discovers policies from adapter public callables, excluding names in `policy_generator.discovery.reserved_methods`.
+- `PolicyGenerator` uses only `get_available_policies()`.
+- Each policy descriptor must include non-empty `tags` and `drive_tags` (drive tags may be inferred from tags/description/callable name if omitted).
 
 ## Notes
 

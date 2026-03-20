@@ -158,6 +158,27 @@ def test_policy_traces_conflict_resolution_and_best_action() -> None:
     assert best_action == "eat"
 
 
+def test_policy_traces_preserves_record_and_query_feature_space() -> None:
+    traces = PolicyTraces(episode_length=100, k_default=5, epsilon=1e-6)
+    context = np.asarray([0.85, 0.60, 0.85, -0.10, 1.0, 0.95], dtype=np.float32)
+    traces.record(
+        channel_a_id="health",
+        channel_b_id="hunger",
+        winner_channel_id="health",
+        action_tag="heal",
+        context_vector=context,
+        outcome_score=1.0,
+        tick=10,
+    )
+
+    assert traces._metadata  # noqa: SLF001
+    record = next(iter(traces._metadata.values()))  # noqa: SLF001
+
+    expected = context / np.linalg.norm(context)
+    assert np.allclose(record.context_vector, expected.astype(np.float32), atol=1e-6)
+    assert traces.get_conflict_resolution_score("health", "hunger", context, k=1) > 0.9
+
+
 def test_memory_manager_delegates_and_lifecycle_clears_expected_scopes() -> None:
     manager = MemoryManager(
         MemoryConfig(
