@@ -13,7 +13,9 @@
     "image_size": [
       160,
       256
-    ]
+    ],
+    "initial_health": 6,
+    "initial_food": 4
   },
   "policy_generator": {
     "weights": {

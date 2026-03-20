@@ -21,7 +21,7 @@ class MemoryConfig:
     faiss_k_default: int = 5
     faiss_epsilon: float = 1e-6
     episode_length: int = 1000
-    long_term_memory_path: str = "data/long_term_memory/policies.json"
+    long_term_memory_path: str = "data/long_term_memory"
     long_term_memory_max_score_history: int = 200
     long_term_memory_max_outcome_history: int = 200
 

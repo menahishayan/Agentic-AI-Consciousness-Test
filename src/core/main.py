@@ -74,7 +74,7 @@ def load_config(path: Path) -> Dict[str, Any]:
                 "allostatic_urgency_alignment": 0.5,
             },
             "long_term_memory": {
-                "path": "data/long_term_memory/policies.json",
+                "path": "data/long_term_memory",
                 "max_score_history": 200,
                 "max_outcome_history": 200,
             },
