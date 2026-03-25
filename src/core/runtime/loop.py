@@ -296,6 +296,7 @@ class AgentLoop:
             "allostatic_assessment": allostatic_assessment,
             "drive_signals": asdict(drive_signals),
             "arousal_valence_state": arousal_payload,
+            "perceptual_prediction_error": asdict(prediction_error_batch),
         }
         skill_plan = self._get_adapter_skill_plan(goals=goals, context=policy_context)
         if skill_plan is not None:

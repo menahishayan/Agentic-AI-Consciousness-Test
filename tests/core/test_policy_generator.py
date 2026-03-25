@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import time
 from typing import Any, Dict, List
 
 from core.llm.types import LLMRequest, LLMResponse
@@ -110,6 +111,15 @@ def _memory_manager(tmp_path: Path) -> MemoryManager:
     )
 
 
+def _wait_for(predicate: Any, timeout_s: float = 1.0) -> bool:
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.01)
+    return bool(predicate())
+
+
 def test_drive_urgency_alignment_prioritizes_matching_policy(tmp_path: Path) -> None:
     memory_manager = _memory_manager(tmp_path)
     generator = PolicyGenerator(
@@ -214,7 +224,7 @@ def test_llm_arbitrator_selects_from_response(tmp_path: Path) -> None:
             "drive_signals": {
                 "signals": [
                     {"channel_id": "hunger", "urgency": 0.95},
-                    {"channel_id": "safety", "urgency": 0.20},
+                    {"channel_id": "resource_level", "urgency": 0.92},
                 ],
                 "highest_urgency": 0.95,
             },
@@ -256,7 +266,7 @@ def test_llm_parse_failure_falls_back_to_urgency(tmp_path: Path) -> None:
             "drive_signals": {
                 "signals": [
                     {"channel_id": "hunger", "urgency": 0.95},
-                    {"channel_id": "safety", "urgency": 0.20},
+                    {"channel_id": "resource_level", "urgency": 0.90},
                 ],
                 "highest_urgency": 0.95,
             },
@@ -372,7 +382,12 @@ def test_llm_prompt_includes_skill_plan_context(tmp_path: Path) -> None:
                 "remaining_count": 2,
                 "metadata": [{"phase_index": 0, "intent_tokens": ["milk", "use"]}],
             },
-            "drive_signals": {"signals": [{"channel_id": "hunger", "urgency": 0.4}]},
+            "drive_signals": {
+                "signals": [
+                    {"channel_id": "hunger", "urgency": 0.95},
+                    {"channel_id": "resource_level", "urgency": 0.90},
+                ]
+            },
             "allostatic_assessment": {"needs": []},
         },
     )
@@ -381,3 +396,149 @@ def test_llm_prompt_includes_skill_plan_context(tmp_path: Path) -> None:
     assert len(llm_client.requests) == 1
     prompt = llm_client.requests[0].messages[1].content
     assert "skill_plan.head_policy_id: dummy:policy_explore" in prompt
+
+
+def test_selective_gate_skips_llm_when_no_trigger_conditions(tmp_path: Path) -> None:
+    memory_manager = _memory_manager(tmp_path)
+    llm_client = _StaticLLMClient(
+        text='{"selected_index": 1, "rationale": "unused", "drive_conflict_detected": false, "confidence": 0.88}'
+    )
+    generator = PolicyGenerator(
+        adapter=_DriveAwareAdapter(),
+        adapter_folder="dummy",
+        memory_manager=memory_manager,
+        goal_checker=_NeutralGoalChecker(),
+        prediction_error_calculator=_NeutralPredictionErrorCalculator(),
+        config={"llm_reeval_interval": 10},
+        llm_client=llm_client,
+    )
+    generator._last_goals_fingerprint = generator._goals_fingerprint([])  # noqa: SLF001
+
+    proposal = generator.propose_action(
+        goals=[],
+        context={
+            "step": 1,
+            "drive_signals": {"signals": [{"channel_id": "hunger", "urgency": 0.4}]},
+            "perceptual_prediction_error": {"aggregate_magnitude": 0.1},
+        },
+    )
+
+    assert isinstance(proposal, ActionProposal)
+    assert proposal.action_id == "dummy:policy_seek_food"
+    assert len(llm_client.requests) == 0
+
+
+def test_goal_change_runs_async_llm_and_returns_reactive_now(tmp_path: Path) -> None:
+    memory_manager = _memory_manager(tmp_path)
+    llm_client = _StaticLLMClient(
+        text='{"selected_index": 1, "rationale": "async result", "drive_conflict_detected": false, "confidence": 0.88}'
+    )
+    generator = PolicyGenerator(
+        adapter=_DriveAwareAdapter(),
+        adapter_folder="dummy",
+        memory_manager=memory_manager,
+        goal_checker=_NeutralGoalChecker(),
+        prediction_error_calculator=_NeutralPredictionErrorCalculator(),
+        config={"llm_reeval_interval": 10},
+        llm_client=llm_client,
+    )
+
+    proposal = generator.propose_action(
+        goals=[{"goal_id": "new_goal"}],
+        context={
+            "step": 1,
+            "drive_signals": {"signals": [{"channel_id": "hunger", "urgency": 0.4}]},
+            "perceptual_prediction_error": {"aggregate_magnitude": 0.1},
+        },
+    )
+
+    # First step returns immediately with reactive fallback.
+    assert isinstance(proposal, ActionProposal)
+    assert proposal.action_id == "dummy:policy_seek_food"
+    assert _wait_for(lambda: len(llm_client.requests) == 1)
+
+    # On a non-urgent periodic step, cached async result is used.
+    follow_up = generator.propose_action(
+        goals=[{"goal_id": "new_goal"}],
+        context={
+            "step": 10,
+            "drive_signals": {"signals": [{"channel_id": "hunger", "urgency": 0.4}]},
+            "perceptual_prediction_error": {"aggregate_magnitude": 0.1},
+        },
+    )
+    assert isinstance(follow_up, ActionProposal)
+    assert follow_up.action_id == "dummy:policy_explore"
+
+
+def test_sustained_prediction_error_triggers_sync_llm_call(tmp_path: Path) -> None:
+    memory_manager = _memory_manager(tmp_path)
+    llm_client = _StaticLLMClient(
+        text='{"selected_index": 1, "rationale": "switch strategy", "drive_conflict_detected": false, "confidence": 0.91}'
+    )
+    generator = PolicyGenerator(
+        adapter=_DriveAwareAdapter(),
+        adapter_folder="dummy",
+        memory_manager=memory_manager,
+        goal_checker=_NeutralGoalChecker(),
+        prediction_error_calculator=_NeutralPredictionErrorCalculator(),
+        config={
+            "pe_high_threshold": 0.6,
+            "pe_streak_threshold": 2,
+            "llm_reeval_interval": 50,
+        },
+        llm_client=llm_client,
+    )
+    generator._last_goals_fingerprint = generator._goals_fingerprint([])  # noqa: SLF001
+
+    first = generator.propose_action(
+        goals=[],
+        context={
+            "step": 1,
+            "drive_signals": {"signals": [{"channel_id": "hunger", "urgency": 0.4}]},
+            "perceptual_prediction_error": {"aggregate_magnitude": 0.9},
+        },
+    )
+    second = generator.propose_action(
+        goals=[],
+        context={
+            "step": 2,
+            "drive_signals": {"signals": [{"channel_id": "hunger", "urgency": 0.4}]},
+            "perceptual_prediction_error": {"aggregate_magnitude": 0.9},
+        },
+    )
+
+    assert isinstance(first, ActionProposal)
+    assert first.action_id == "dummy:policy_seek_food"
+    assert isinstance(second, ActionProposal)
+    assert second.action_id == "dummy:policy_explore"
+    assert len(llm_client.requests) == 1
+
+
+def test_skill_gap_triggers_sync_llm_when_no_matching_policy(tmp_path: Path) -> None:
+    memory_manager = _memory_manager(tmp_path)
+    llm_client = _StaticLLMClient(
+        text='{"selected_index": 1, "rationale": "no direct skill match", "drive_conflict_detected": false, "confidence": 0.77}'
+    )
+    generator = PolicyGenerator(
+        adapter=_DriveAwareAdapter(),
+        adapter_folder="dummy",
+        memory_manager=memory_manager,
+        goal_checker=_NeutralGoalChecker(),
+        prediction_error_calculator=_NeutralPredictionErrorCalculator(),
+        config={"llm_reeval_interval": 50},
+        llm_client=llm_client,
+    )
+    generator._last_goals_fingerprint = generator._goals_fingerprint([])  # noqa: SLF001
+
+    proposal = generator.propose_action(
+        goals=[],
+        context={
+            "step": 1,
+            "drive_signals": {"signals": [{"channel_id": "oxygen", "urgency": 0.95}]},
+            "perceptual_prediction_error": {"aggregate_magnitude": 0.1},
+        },
+    )
+
+    assert isinstance(proposal, ActionProposal)
+    assert proposal.action_id == "dummy:policy_explore"
+    assert len(llm_client.requests) == 1

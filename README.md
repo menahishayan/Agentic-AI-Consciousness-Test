@@ -182,6 +182,13 @@ JAVA_HOME=... PYTHONPATH=src ./.venv/bin/python -m core.main
     "max_expected_error": 1.0,
     "prediction_error_window": 20,
 
+    // Selective LLM arbitration gate
+    "llm_conflict_threshold": 0.8,
+    "skill_gap_urgency_threshold": 0.8,
+    "pe_high_threshold": 0.7,
+    "pe_streak_threshold": 5,
+    "llm_reeval_interval": 10,
+
     // Allostatic / homeostatic controller
     "allostatic_controller": {
       "planning_horizon": 50,

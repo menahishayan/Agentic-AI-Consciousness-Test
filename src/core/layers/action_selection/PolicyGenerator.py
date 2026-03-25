@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import copy
 from datetime import datetime
 import inspect
 import json
 import re
+import threading
 from typing import Any, Dict, Iterable, List, Mapping, Optional
 
 from core.llm.client import LLMClient
@@ -46,8 +48,24 @@ class PolicyGenerator:
                 0.85,
             )
         )
+        self.conflict_threshold = self._clamp01(
+            self._as_float(self.config.get("llm_conflict_threshold"), 0.8)
+        )
+        self.skill_gap_threshold = self._clamp01(
+            self._as_float(self.config.get("skill_gap_urgency_threshold"), self.conflict_threshold)
+        )
+        self.pe_high_threshold = self._clamp01(
+            self._as_float(self.config.get("pe_high_threshold"), 0.7)
+        )
+        self.pe_streak_threshold = max(1, int(self._as_float(self.config.get("pe_streak_threshold"), 5.0)))
+        self.llm_reeval_interval = max(1, int(self._as_float(self.config.get("llm_reeval_interval"), 10.0)))
         model_value = self.config.get("model", "claude-sonnet-4-20250514")
         self.model = str(model_value).strip() or "claude-sonnet-4-20250514"
+        self._pe_streak = 0
+        self._last_goals_fingerprint = ""
+        self._pending_llm_result: Optional[Dict[str, Any]] = None
+        self._llm_thread: Optional[threading.Thread] = None
+        self._llm_state_lock = threading.Lock()
 
     def propose_action(self, goals: Any, context: Mapping[str, Any]) -> Optional[ActionProposal]:
         policies = self.discover_policies()
@@ -264,6 +282,75 @@ class PolicyGenerator:
             )
             return selected
 
+        self._update_pe_streak(context)
+        gate = self._should_call_llm(policies=policies, goals=goals, context=context)
+        reasons = list(gate.get("reasons", []))
+        if self.logger is not None:
+            self.logger.event(
+                "policy.llm_gate",
+                {
+                    "should_call_llm": bool(gate.get("should_call")),
+                    "urgent": bool(gate.get("urgent")),
+                    "reasons": reasons,
+                    "pe_streak": self._pe_streak,
+                },
+                step=context.get("step"),
+            )
+
+        if not bool(gate.get("should_call")):
+            selected = self._urgency_fallback(policies, context)
+            self._write_arbitration_fallback_trace(
+                selected_policy=selected,
+                rationale="reactive_gate:no_trigger",
+                context=context,
+                status="reactive",
+            )
+            return selected
+
+        if not bool(gate.get("urgent")):
+            selected = self._pending_llm_policy(policies)
+            if selected is None:
+                selected = self._urgency_fallback(policies, context)
+            self._write_arbitration_fallback_trace(
+                selected_policy=selected,
+                rationale=f"reactive_gate:{','.join(reasons)}",
+                context=context,
+                status="reactive",
+            )
+            self._start_async_llm_arbitration(
+                policies=policies,
+                goals=goals,
+                context=context,
+                gate_reasons=reasons,
+                goals_fingerprint=str(gate.get("goals_fingerprint", "")),
+            )
+            return selected
+
+        selected = self._run_llm_arbitration(
+            policies=policies,
+            goals=goals,
+            context=context,
+            gate_reasons=reasons,
+            record_trace=True,
+        )
+        self._pe_streak = 0
+        self._last_goals_fingerprint = str(gate.get("goals_fingerprint", ""))
+        if isinstance(selected, Mapping):
+            with self._llm_state_lock:
+                self._pending_llm_result = dict(selected)
+        return selected
+
+    def _run_llm_arbitration(
+        self,
+        policies: List[Dict[str, Any]],
+        goals: Any,
+        context: Mapping[str, Any],
+        gate_reasons: Optional[List[str]] = None,
+        record_trace: bool = True,
+    ) -> Optional[Dict[str, Any]]:
+        if self.llm_client is None:
+            return self._urgency_fallback(policies, context)
+
         system_prompt, user_prompt = self._build_arbitration_prompt(
             policies=policies,
             goals=goals,
@@ -274,6 +361,7 @@ class PolicyGenerator:
         drive_signals = self._resolve_drive_signals(context.get("drive_signals"))
         allostatic_assessment = context.get("allostatic_assessment")
         skill_plan = self._resolve_skill_plan(context.get("skill_plan"))
+        reasons = list(gate_reasons or [])
 
         if self.logger is not None:
             self.logger.llm_request(
@@ -287,6 +375,8 @@ class PolicyGenerator:
                     "drive_signals": drive_signals,
                     "allostatic_assessment": allostatic_assessment,
                     "skill_plan": skill_plan,
+                    "gate_reasons": reasons,
+                    "async": not record_trace,
                 },
                 step=step,
             )
@@ -307,12 +397,13 @@ class PolicyGenerator:
             response_text = str(getattr(response, "text", "") or "")
         except Exception as exc:
             selected = self._urgency_fallback(policies, context)
-            self._write_arbitration_fallback_trace(
-                selected_policy=selected,
-                rationale=f"llm_error:{type(exc).__name__}:{exc}",
-                context=context,
-                status="fallback_error",
-            )
+            if record_trace:
+                self._write_arbitration_fallback_trace(
+                    selected_policy=selected,
+                    rationale=f"llm_error:{type(exc).__name__}:{exc}",
+                    context=context,
+                    status="fallback_error",
+                )
             if self.logger is not None:
                 self.logger.event(
                     "policy.arbitration_error",
@@ -320,6 +411,8 @@ class PolicyGenerator:
                         "error_type": type(exc).__name__,
                         "error": str(exc),
                         "fallback_policy_id": selected.get("policy_id") if selected else None,
+                        "gate_reasons": reasons,
+                        "async": not record_trace,
                     },
                     step=step,
                 )
@@ -327,25 +420,28 @@ class PolicyGenerator:
 
         if self.logger is not None:
             self.logger.llm_response(
-                {"raw": response_text},
+                {"raw": response_text, "async": not record_trace},
                 step=step,
             )
 
         selected = self._parse_arbitration_response(response_text, policies)
         if selected is None:
             fallback = self._urgency_fallback(policies, context)
-            self._write_arbitration_fallback_trace(
-                selected_policy=fallback,
-                rationale=response_text,
-                context=context,
-                status="fallback_parse_error",
-            )
+            if record_trace:
+                self._write_arbitration_fallback_trace(
+                    selected_policy=fallback,
+                    rationale=response_text,
+                    context=context,
+                    status="fallback_parse_error",
+                )
             if self.logger is not None:
                 self.logger.event(
                     "policy.arbitration_parse_error",
                     {
                         "raw_response": response_text,
                         "fallback_policy_id": fallback.get("policy_id") if fallback else None,
+                        "gate_reasons": reasons,
+                        "async": not record_trace,
                     },
                     step=step,
                 )
@@ -357,11 +453,12 @@ class PolicyGenerator:
         drive_conflict = parsed_response.get("drive_conflict_detected", False)
         confidence = parsed_response.get("confidence")
 
-        self._write_arbitration_trace(
-            selected_policy=selected,
-            rationale=rationale,
-            context=context,
-        )
+        if record_trace:
+            self._write_arbitration_trace(
+                selected_policy=selected,
+                rationale=rationale,
+                context=context,
+            )
 
         if self.logger is not None:
             self.logger.event(
@@ -388,11 +485,265 @@ class PolicyGenerator:
                     ),
                     "skill_plan": skill_plan,
                     "candidate_policy_ids": [p.get("policy_id") for p in policies],
+                    "gate_reasons": reasons,
+                    "async": not record_trace,
                 },
                 step=step,
             )
 
         return selected
+
+    def _start_async_llm_arbitration(
+        self,
+        policies: List[Dict[str, Any]],
+        goals: Any,
+        context: Mapping[str, Any],
+        gate_reasons: List[str],
+        goals_fingerprint: str,
+    ) -> None:
+        with self._llm_state_lock:
+            if self._llm_thread is not None and self._llm_thread.is_alive():
+                return
+            self._last_goals_fingerprint = goals_fingerprint
+            policies_copy = [dict(policy) for policy in policies]
+            context_copy = dict(context)
+            try:
+                goals_copy = copy.deepcopy(goals)
+            except Exception:
+                goals_copy = goals
+            thread = threading.Thread(
+                target=self._async_llm_call,
+                args=(policies_copy, goals_copy, context_copy, list(gate_reasons)),
+                daemon=True,
+            )
+            self._llm_thread = thread
+            thread.start()
+
+    def _async_llm_call(
+        self,
+        policies: List[Dict[str, Any]],
+        goals: Any,
+        context: Mapping[str, Any],
+        gate_reasons: List[str],
+    ) -> None:
+        try:
+            selected = self._run_llm_arbitration(
+                policies=policies,
+                goals=goals,
+                context=context,
+                gate_reasons=gate_reasons,
+                record_trace=False,
+            )
+            if isinstance(selected, Mapping):
+                with self._llm_state_lock:
+                    self._pending_llm_result = dict(selected)
+                if self.logger is not None:
+                    self.logger.event(
+                        "policy.arbitration_async_ready",
+                        {
+                            "policy_id": selected.get("policy_id"),
+                            "gate_reasons": gate_reasons,
+                        },
+                        step=context.get("step"),
+                    )
+        except Exception as exc:
+            if self.logger is not None:
+                self.logger.event(
+                    "policy.arbitration_async_error",
+                    {
+                        "error_type": type(exc).__name__,
+                        "error": str(exc),
+                    },
+                    step=context.get("step"),
+                )
+
+    def _pending_llm_policy(
+        self,
+        policies: List[Dict[str, Any]],
+    ) -> Optional[Dict[str, Any]]:
+        with self._llm_state_lock:
+            pending = dict(self._pending_llm_result) if isinstance(self._pending_llm_result, Mapping) else None
+        if pending is None:
+            return None
+        policy_id = pending.get("policy_id")
+        if not isinstance(policy_id, str) or not policy_id.strip():
+            return None
+        return self._find_policy_by_id(policies, policy_id.strip())
+
+    def _should_call_llm(
+        self,
+        policies: List[Dict[str, Any]],
+        goals: Any,
+        context: Mapping[str, Any],
+    ) -> Dict[str, Any]:
+        drive_signals = self._resolve_drive_signals(context.get("drive_signals"))
+        drive_conflict = self._drive_conflict_detected(drive_signals)
+        pe_high = self._pe_streak >= self.pe_streak_threshold
+        skill_gap = self._has_skill_gap(policies=policies, drive_signals=drive_signals, context=context)
+
+        step_raw = context.get("step", 0)
+        try:
+            step = int(step_raw)
+        except (TypeError, ValueError):
+            step = 0
+        periodic = (step % self.llm_reeval_interval) == 0
+
+        goals_fingerprint = self._goals_fingerprint(goals)
+        goal_changed = goals_fingerprint != self._last_goals_fingerprint
+
+        urgent_reasons: List[str] = []
+        non_urgent_reasons: List[str] = []
+        if drive_conflict:
+            urgent_reasons.append("drive_conflict")
+        if pe_high:
+            urgent_reasons.append("sustained_high_prediction_error")
+        if skill_gap:
+            urgent_reasons.append("skill_gap")
+        if periodic:
+            non_urgent_reasons.append("periodic_reeval")
+        if goal_changed:
+            non_urgent_reasons.append("goal_changed")
+
+        reasons = urgent_reasons + non_urgent_reasons
+        return {
+            "should_call": bool(reasons),
+            "urgent": bool(urgent_reasons),
+            "reasons": reasons,
+            "goals_fingerprint": goals_fingerprint,
+            "drive_conflict": drive_conflict,
+            "pe_high": pe_high,
+            "skill_gap": skill_gap,
+            "periodic": periodic,
+            "goal_changed": goal_changed,
+        }
+
+    def _drive_conflict_detected(self, drive_signals: List[Dict[str, Any]]) -> bool:
+        high_urgency: List[Dict[str, Any]] = []
+        for signal in drive_signals:
+            urgency_raw = signal.get("urgency")
+            if not isinstance(urgency_raw, (int, float)):
+                continue
+            if self._clamp01(float(urgency_raw)) > self.conflict_threshold:
+                high_urgency.append(signal)
+        if len(high_urgency) < 2:
+            return False
+        competing_tags: set[str] = set()
+        for signal in high_urgency:
+            candidate = signal.get("suggested_action_tag")
+            if not isinstance(candidate, str) or not candidate.strip():
+                candidate = signal.get("channel_id")
+            if not isinstance(candidate, str):
+                continue
+            normalized = candidate.strip().lower()
+            if normalized:
+                competing_tags.add(normalized)
+        return len(competing_tags) >= 2
+
+    def _has_skill_gap(
+        self,
+        policies: List[Dict[str, Any]],
+        drive_signals: List[Dict[str, Any]],
+        context: Mapping[str, Any],
+    ) -> bool:
+        active_channels: set[str] = set()
+        for signal in drive_signals:
+            channel_id = signal.get("channel_id")
+            urgency = signal.get("urgency")
+            if not isinstance(channel_id, str) or not isinstance(urgency, (int, float)):
+                continue
+            if self._clamp01(float(urgency)) > self.skill_gap_threshold:
+                normalized = channel_id.strip().lower()
+                if normalized:
+                    active_channels.add(normalized)
+        if not active_channels:
+            return False
+
+        matching_skills: List[Dict[str, Any]] = []
+        for policy in policies:
+            drive_tags = set(self._normalize_tags(policy.get("drive_tags")))
+            if drive_tags.intersection(active_channels):
+                matching_skills.append(policy)
+        if not matching_skills:
+            return True
+        return not any(self._skill_preconditions_met(skill, context) for skill in matching_skills)
+
+    def _skill_preconditions_met(self, skill: Mapping[str, Any], context: Mapping[str, Any]) -> bool:
+        hardcoded = skill.get("preconditions_met")
+        if isinstance(hardcoded, bool):
+            return hardcoded
+
+        checkers = (
+            "skill_preconditions_met",
+            "are_skill_preconditions_met",
+            "check_skill_preconditions",
+        )
+        for name in checkers:
+            checker = getattr(self.adapter, name, None)
+            if not callable(checker):
+                continue
+            result: Any = None
+            try:
+                result = checker(skill=skill, context=context)
+            except TypeError:
+                try:
+                    result = checker(skill, context)
+                except TypeError:
+                    try:
+                        result = checker(skill)
+                    except Exception:
+                        result = None
+                except Exception:
+                    result = None
+            except Exception:
+                result = None
+
+            if isinstance(result, bool):
+                return result
+            if isinstance(result, Mapping):
+                for key in ("met", "ok", "is_met"):
+                    value = result.get(key)
+                    if isinstance(value, bool):
+                        return value
+        return True
+
+    def _update_pe_streak(self, context: Mapping[str, Any]) -> int:
+        magnitude = self._extract_prediction_error_magnitude(context)
+        if magnitude is None:
+            self._pe_streak = 0
+            return self._pe_streak
+        if self._clamp01(magnitude) > self.pe_high_threshold:
+            self._pe_streak += 1
+        else:
+            self._pe_streak = 0
+        return self._pe_streak
+
+    def _extract_prediction_error_magnitude(self, context: Mapping[str, Any]) -> Optional[float]:
+        candidates = (
+            context.get("perceptual_prediction_error"),
+            context.get("latest_prediction_error"),
+            context.get("prediction_error"),
+        )
+        for candidate in candidates:
+            if isinstance(candidate, Mapping):
+                for key in ("aggregate_magnitude", "magnitude"):
+                    value = candidate.get(key)
+                    if isinstance(value, (int, float)):
+                        return self._clamp01(float(value))
+            if hasattr(candidate, "aggregate_magnitude"):
+                value = getattr(candidate, "aggregate_magnitude")
+                if isinstance(value, (int, float)):
+                    return self._clamp01(float(value))
+            if hasattr(candidate, "magnitude"):
+                value = getattr(candidate, "magnitude")
+                if isinstance(value, (int, float)):
+                    return self._clamp01(float(value))
+        return None
+
+    def _goals_fingerprint(self, goals: Any) -> str:
+        try:
+            return json.dumps(goals, ensure_ascii=True, sort_keys=True, default=str)
+        except Exception:
+            return str(goals)
 
     def _build_arbitration_prompt(
         self,

@@ -81,6 +81,11 @@ def load_config(path: Path) -> Dict[str, Any]:
             },
             "max_expected_error": 1.0,
             "prediction_error_window": 20,
+            "llm_conflict_threshold": 0.8,
+            "skill_gap_urgency_threshold": 0.8,
+            "pe_high_threshold": 0.7,
+            "pe_streak_threshold": 5,
+            "llm_reeval_interval": 10,
             "allostatic_controller": {
                 "planning_horizon": 50,
                 "history_window": 20,
