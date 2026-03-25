@@ -59,6 +59,10 @@ class PolicyGenerator:
         )
         self.pe_streak_threshold = max(1, int(self._as_float(self.config.get("pe_streak_threshold"), 5.0)))
         self.llm_reeval_interval = max(1, int(self._as_float(self.config.get("llm_reeval_interval"), 10.0)))
+        self.learning_context_window = max(
+            1,
+            int(self._as_float(self.config.get("llm_learning_context_window"), 10.0)),
+        )
         model_value = self.config.get("model", "claude-sonnet-4-20250514")
         self.model = str(model_value).strip() or "claude-sonnet-4-20250514"
         self._pe_streak = 0
@@ -349,7 +353,7 @@ class PolicyGenerator:
         record_trace: bool = True,
     ) -> Optional[Dict[str, Any]]:
         if self.llm_client is None:
-            return self._urgency_fallback(policies, context)
+            return self._urgency_fallback(policies, context, goals=goals)
 
         system_prompt, user_prompt = self._build_arbitration_prompt(
             policies=policies,
@@ -396,7 +400,7 @@ class PolicyGenerator:
             )
             response_text = str(getattr(response, "text", "") or "")
         except Exception as exc:
-            selected = self._urgency_fallback(policies, context)
+            selected = self._urgency_fallback(policies, context, goals=goals)
             if record_trace:
                 self._write_arbitration_fallback_trace(
                     selected_policy=selected,
@@ -426,7 +430,7 @@ class PolicyGenerator:
 
         selected = self._parse_arbitration_response(response_text, policies)
         if selected is None:
-            fallback = self._urgency_fallback(policies, context)
+            fallback = self._urgency_fallback(policies, context, goals=goals)
             if record_trace:
                 self._write_arbitration_fallback_trace(
                     selected_policy=fallback,
@@ -872,41 +876,8 @@ class PolicyGenerator:
                 )
             )
 
-        recent_traces: List[Any] = []
-        recent_self_state: List[Any] = []
-        query = getattr(self.memory_manager, "query", None)
-        if callable(query):
-            try:
-                traces = query({"target": "policy_traces", "limit": 5})
-                if isinstance(traces, list):
-                    recent_traces = traces[-5:]
-            except Exception:
-                recent_traces = []
-            try:
-                self_state = query({"target": "self_state", "limit": 3})
-                if isinstance(self_state, list):
-                    recent_self_state = self_state[-3:]
-            except Exception:
-                recent_self_state = []
-
-        memory_lines: List[str] = [
-            "MEMORY CONTEXT",
-            "Recent arbitration history:",
-        ]
-        if recent_traces:
-            for index, trace in enumerate(recent_traces):
-                memory_lines.append(f"trace[{index}]: {self._serialize_for_prompt(trace)}")
-        else:
-            memory_lines.append("none")
-
-        memory_lines.append("Known agent capabilities:")
-        if recent_self_state:
-            for index, snapshot in enumerate(recent_self_state):
-                memory_lines.append(
-                    f"self_state[{index}]: {self._serialize_for_prompt(snapshot)}"
-                )
-        else:
-            memory_lines.append("none")
+        observation_lines = self._format_observation_context(context.get("world_facts"))
+        learning_lines = self._format_learning_context(window=self.learning_context_window)
 
         instruction = (
             "INSTRUCTION\n"
@@ -917,12 +888,243 @@ class PolicyGenerator:
         user_prompt = "\n\n".join(
             [
                 "\n".join(drive_lines),
+                "\n".join(observation_lines),
                 "\n".join(policy_lines),
-                "\n".join(memory_lines),
+                "\n".join(learning_lines),
                 instruction,
             ]
         )
         return system_prompt, user_prompt
+
+    def _format_observation_context(self, world_facts: Any) -> List[str]:
+        lines: List[str] = ["OBSERVATION CONTEXT"]
+        if not isinstance(world_facts, Mapping):
+            lines.append("world_facts.present: false")
+            return lines
+
+        facts = dict(world_facts)
+        position = facts.get("position")
+        position_map = dict(position) if isinstance(position, Mapping) else {}
+        lines.append("world_facts.present: true")
+        lines.append(f"biome: {facts.get('biome')}")
+        lines.append(f"position.x: {position_map.get('x')}")
+        lines.append(f"position.y: {position_map.get('y')}")
+        lines.append(f"position.z: {position_map.get('z')}")
+        lines.append(f"nearby_crafting_table: {facts.get('nearby_crafting_table')}")
+        lines.append(f"nearby_cow: {facts.get('nearby_cow')}")
+        lines.append(f"has_bucket: {facts.get('has_bucket')}")
+        lines.append(f"bucket_count: {facts.get('bucket_count')}")
+        lines.append(f"inventory_non_air_slots: {facts.get('inventory_non_air_slots')}")
+        lines.append(f"inventory_total_quantity: {facts.get('inventory_total_quantity')}")
+        lines.append(f"inventory_fullness: {facts.get('inventory_fullness')}")
+        return lines
+
+    def _format_learning_context(self, *, window: int) -> List[str]:
+        transitions = self._recent_transition_payloads(limit=window)
+        lines: List[str] = [
+            "LEARNING CONTEXT",
+            f"transition_window: {window}",
+            f"transitions_found: {len(transitions)}",
+        ]
+
+        if transitions:
+            attempts_by_policy: Dict[str, int] = {}
+            zero_reward_by_policy: Dict[str, int] = {}
+            no_progress_by_policy: Dict[str, int] = {}
+            inventory_progress_by_policy: Dict[str, int] = {}
+            bucket_progress_by_policy: Dict[str, int] = {}
+
+            zero_reward_streak = 0
+            no_progress_streak = 0
+
+            for transition in transitions:
+                policy_id = str(transition.get("policy_id") or "unknown")
+                attempts_by_policy[policy_id] = attempts_by_policy.get(policy_id, 0) + 1
+
+                reward = self._as_float(transition.get("reward"), 0.0)
+                inventory_progress = transition.get("inventory_progress")
+                bucket_progress = transition.get("bucket_progress")
+                inventory_changed = self._progress_changed(inventory_progress)
+                bucket_changed = self._progress_changed(bucket_progress)
+                has_progress = inventory_changed or bucket_changed
+
+                if reward <= 0.0:
+                    zero_reward_by_policy[policy_id] = zero_reward_by_policy.get(policy_id, 0) + 1
+                    if not has_progress:
+                        no_progress_by_policy[policy_id] = no_progress_by_policy.get(policy_id, 0) + 1
+                if inventory_changed:
+                    inventory_progress_by_policy[policy_id] = (
+                        inventory_progress_by_policy.get(policy_id, 0) + 1
+                    )
+                if bucket_changed:
+                    bucket_progress_by_policy[policy_id] = (
+                        bucket_progress_by_policy.get(policy_id, 0) + 1
+                    )
+
+            for transition in transitions:
+                reward = self._as_float(transition.get("reward"), 0.0)
+                if reward <= 0.0:
+                    zero_reward_streak += 1
+                else:
+                    break
+            for transition in transitions:
+                reward = self._as_float(transition.get("reward"), 0.0)
+                has_progress = self._progress_changed(transition.get("inventory_progress")) or self._progress_changed(
+                    transition.get("bucket_progress")
+                )
+                if reward <= 0.0 and not has_progress:
+                    no_progress_streak += 1
+                else:
+                    break
+
+            lines.append(f"zero_reward_streak: {zero_reward_streak}")
+            lines.append(f"no_progress_streak: {no_progress_streak}")
+            for policy_id in sorted(attempts_by_policy.keys()):
+                lines.append(f"policy[{policy_id}].attempts: {attempts_by_policy[policy_id]}")
+                lines.append(
+                    f"policy[{policy_id}].zero_reward_attempts: {zero_reward_by_policy.get(policy_id, 0)}"
+                )
+                lines.append(
+                    f"policy[{policy_id}].no_progress_attempts: {no_progress_by_policy.get(policy_id, 0)}"
+                )
+                lines.append(
+                    f"policy[{policy_id}].inventory_progress_steps: {inventory_progress_by_policy.get(policy_id, 0)}"
+                )
+                lines.append(
+                    f"policy[{policy_id}].bucket_progress_steps: {bucket_progress_by_policy.get(policy_id, 0)}"
+                )
+
+            if no_progress_by_policy:
+                stuck_policy = sorted(
+                    no_progress_by_policy.items(),
+                    key=lambda item: (-item[1], item[0]),
+                )[0]
+                lines.append(
+                    "no_progress_summary: policy={} failed {} times with 0 reward and no inventory/bucket change".format(
+                        stuck_policy[0],
+                        stuck_policy[1],
+                    )
+                )
+        else:
+            lines.append("zero_reward_streak: 0")
+            lines.append("no_progress_streak: 0")
+
+        pe_records = self._recent_prediction_error_records(limit=window)
+        lines.append(f"prediction_error_window: {window}")
+        lines.append(f"prediction_errors_found: {len(pe_records)}")
+        if not pe_records:
+            lines.append("prediction_error_summary: none")
+            return lines
+
+        aggregates: Dict[tuple[str, str], Dict[str, float]] = {}
+        for record in pe_records:
+            policy_id = str(record.get("policy_id") or "bootstrap")
+            channel = str(record.get("channel") or "unknown").strip().lower() or "unknown"
+            magnitude = self._extract_prediction_error_magnitude_from_record(record)
+            if magnitude is None:
+                continue
+            key = (policy_id, channel)
+            bucket = aggregates.setdefault(key, {"sum": 0.0, "count": 0.0})
+            bucket["sum"] += float(magnitude)
+            bucket["count"] += 1.0
+
+        if not aggregates:
+            lines.append("prediction_error_summary: none")
+            return lines
+
+        for policy_id, channel in sorted(aggregates.keys()):
+            stats = aggregates[(policy_id, channel)]
+            count = int(stats["count"])
+            mean = float(stats["sum"] / float(max(1, count)))
+            lines.append(
+                f"pe_summary[policy={policy_id}|channel={channel}]: mean={mean:.3f}, samples={count}"
+            )
+        return lines
+
+    def _recent_transition_payloads(self, *, limit: int) -> List[Dict[str, Any]]:
+        getter = getattr(self.memory_manager, "get_recent", None)
+        if not callable(getter):
+            return []
+        try:
+            entries = getter(limit, entry_type="transition")
+        except TypeError:
+            try:
+                entries = getter(limit)
+            except Exception:
+                return []
+        except Exception:
+            return []
+
+        if not isinstance(entries, list):
+            return []
+        out: List[Dict[str, Any]] = []
+        for entry in entries:
+            if isinstance(entry, Mapping):
+                payload = entry.get("payload")
+                entry_type = entry.get("entry_type")
+                tick = entry.get("tick")
+            else:
+                payload = getattr(entry, "payload", None)
+                entry_type = getattr(entry, "entry_type", None)
+                tick = getattr(entry, "tick", None)
+            if entry_type != "transition":
+                continue
+            if not isinstance(payload, Mapping):
+                continue
+            row = dict(payload)
+            row.setdefault("tick", tick)
+            out.append(row)
+        return out
+
+    def _recent_prediction_error_records(self, *, limit: int) -> List[Dict[str, Any]]:
+        query_prediction_errors = getattr(self.memory_manager, "query_prediction_errors", None)
+        if callable(query_prediction_errors):
+            try:
+                records = query_prediction_errors(limit=limit)
+                if isinstance(records, list):
+                    return [dict(record) for record in records if isinstance(record, Mapping)]
+            except Exception:
+                pass
+
+        query = getattr(self.memory_manager, "query", None)
+        if not callable(query):
+            return []
+        try:
+            records = query({"target": "prediction_errors", "limit": limit})
+        except Exception:
+            return []
+        if not isinstance(records, list):
+            return []
+        return [dict(record) for record in records if isinstance(record, Mapping)]
+
+    def _extract_prediction_error_magnitude_from_record(
+        self,
+        record: Mapping[str, Any],
+    ) -> Optional[float]:
+        magnitude = record.get("magnitude")
+        if isinstance(magnitude, (int, float)):
+            return self._clamp01(abs(float(magnitude)))
+        nested = record.get("error")
+        if isinstance(nested, Mapping):
+            nested_magnitude = nested.get("magnitude")
+            if isinstance(nested_magnitude, (int, float)):
+                return self._clamp01(abs(float(nested_magnitude)))
+        return None
+
+    def _progress_changed(self, progress: Any) -> bool:
+        if isinstance(progress, Mapping):
+            changed = progress.get("changed")
+            if isinstance(changed, bool):
+                return changed
+            for key in ("slot_delta", "quantity_delta", "fullness_delta", "bucket_count_delta"):
+                value = progress.get(key)
+                if isinstance(value, (int, float)) and abs(float(value)) > 0.0:
+                    return True
+            for key in ("acquired_bucket",):
+                value = progress.get(key)
+                if isinstance(value, bool) and value:
+                    return True
+        return False
 
     def _parse_arbitration_response(
         self,

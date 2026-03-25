@@ -134,6 +134,76 @@ def test_local_skill_plan_queue_builds_and_advances() -> None:
     assert updated["remaining_count"] == max(0, plan["remaining_count"] - 1)
 
 
+def _first_phase_intent_tokens(plan: Dict[str, Any]) -> List[str]:
+    metadata = plan.get("metadata")
+    if not isinstance(metadata, list) or not metadata:
+        return []
+    first = metadata[0]
+    if not isinstance(first, dict):
+        return []
+    raw_tokens = first.get("intent_tokens")
+    if not isinstance(raw_tokens, list):
+        return []
+    return [str(token) for token in raw_tokens]
+
+
+def test_local_harvest_milk_plan_reorders_by_world_facts() -> None:
+    adapter = _local_adapter()
+    goals = adapter.get_task_goals()
+
+    craft_first = adapter.get_skill_plan(
+        goals=goals,
+        context={
+            "world_facts": {
+                "has_bucket": False,
+                "nearby_crafting_table": True,
+                "nearby_cow": False,
+            }
+        },
+    )
+    explore_first = adapter.get_skill_plan(
+        goals=goals,
+        context={
+            "world_facts": {
+                "has_bucket": False,
+                "nearby_crafting_table": False,
+                "nearby_cow": False,
+            }
+        },
+    )
+    use_first = adapter.get_skill_plan(
+        goals=goals,
+        context={
+            "world_facts": {
+                "has_bucket": True,
+                "nearby_crafting_table": False,
+                "nearby_cow": True,
+            }
+        },
+    )
+
+    assert _first_phase_intent_tokens(craft_first) == ["bucket", "craft", "collect"]
+    assert _first_phase_intent_tokens(explore_first) == ["explore", "move", "search"]
+    assert _first_phase_intent_tokens(use_first) == ["cow", "milk", "harvest", "interact", "use"]
+
+
+def test_missing_cow_signal_defaults_to_not_nearby_for_local_plan() -> None:
+    adapter = _local_adapter()
+    goals = adapter.get_task_goals()
+
+    plan = adapter.get_skill_plan(
+        goals=goals,
+        context={
+            "world_facts": {
+                "has_bucket": True,
+                "nearby_crafting_table": False,
+            }
+        },
+    )
+
+    assert _first_phase_intent_tokens(plan) == ["explore", "move", "search"]
+
+
 def test_remote_parity_resource_drive_and_tags_without_socket() -> None:
     adapter = _remote_adapter_without_socket()
 
@@ -160,3 +230,53 @@ def test_remote_parity_resource_drive_and_tags_without_socket() -> None:
     )
     assert score == pytest.approx(0.16)
     assert malformed == pytest.approx(0.4)
+
+
+def test_remote_harvest_milk_plan_reorders_and_regenerates_by_world_facts() -> None:
+    adapter = _remote_adapter_without_socket()
+    goals = adapter.get_task_goals()
+
+    first = adapter.get_skill_plan(
+        goals=goals,
+        context={
+            "world_facts": {
+                "has_bucket": False,
+                "nearby_crafting_table": True,
+                "nearby_cow": False,
+            }
+        },
+    )
+    first_signature = adapter._last_skill_plan_signature  # noqa: SLF001
+
+    second = adapter.get_skill_plan(
+        goals=goals,
+        context={
+            "world_facts": {
+                "has_bucket": True,
+                "nearby_crafting_table": False,
+                "nearby_cow": True,
+            }
+        },
+    )
+    second_signature = adapter._last_skill_plan_signature  # noqa: SLF001
+
+    assert _first_phase_intent_tokens(first) == ["bucket", "craft", "collect"]
+    assert _first_phase_intent_tokens(second) == ["cow", "milk", "harvest", "interact", "use"]
+    assert first_signature != second_signature
+
+
+def test_missing_cow_signal_defaults_to_not_nearby_for_remote_plan() -> None:
+    adapter = _remote_adapter_without_socket()
+    goals = adapter.get_task_goals()
+
+    plan = adapter.get_skill_plan(
+        goals=goals,
+        context={
+            "world_facts": {
+                "has_bucket": True,
+                "nearby_crafting_table": False,
+            }
+        },
+    )
+
+    assert _first_phase_intent_tokens(plan) == ["explore", "move", "search"]

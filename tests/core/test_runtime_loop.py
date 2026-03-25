@@ -509,3 +509,58 @@ def test_skill_plan_is_injected_and_notified_after_selection() -> None:
 
     assert adapter.notified
     assert adapter.notified[-1] == "dummy:policy_noop"
+
+
+def test_policy_context_contains_world_facts_before_arbitration() -> None:
+    class _CapturePolicyGenerator:
+        def __init__(self) -> None:
+            self.last_context: Dict[str, Any] = {}
+
+        def propose_action(self, goals: Any, context: Mapping[str, Any]) -> ActionProposal:
+            _ = goals
+            self.last_context = dict(context)
+            return ActionProposal(action_id="dummy:policy_noop", action="noop")
+
+    loop = AgentLoop(
+        adapter=_DriveAwareDummyAdapter(),
+        observation_mapper=_CountingMapper(),
+        memory_manager=MemoryManager(),
+        adapter_folder="dummy",
+        policy_config={},
+    )
+    capture = _CapturePolicyGenerator()
+    loop.policy_generator = capture
+
+    loop.run_step(0)
+
+    assert "world_facts" in capture.last_context
+    world_facts = capture.last_context["world_facts"]
+    assert isinstance(world_facts, Mapping)
+    assert world_facts.get("biome") == "plains"
+    assert world_facts.get("nearby_cow") is False
+
+
+def test_transition_entry_is_written_to_working_memory() -> None:
+    loop = AgentLoop(
+        adapter=_DriveAwareDummyAdapter(),
+        observation_mapper=_CountingMapper(),
+        memory_manager=MemoryManager(),
+        adapter_folder="dummy",
+        policy_config={},
+    )
+
+    loop.run_step(0)
+
+    transitions = loop.memory_manager.get_recent(1, entry_type="transition")
+    assert transitions
+    entry = transitions[0]
+    payload = entry.payload
+
+    assert entry.tick == 0
+    assert payload.get("policy_id") == "dummy:policy_noop"
+    assert payload.get("reward") == 1.0
+    assert payload.get("done") is False
+    assert isinstance(payload.get("prev_facts"), Mapping)
+    assert isinstance(payload.get("next_facts"), Mapping)
+    assert isinstance(payload.get("inventory_progress"), Mapping)
+    assert isinstance(payload.get("bucket_progress"), Mapping)

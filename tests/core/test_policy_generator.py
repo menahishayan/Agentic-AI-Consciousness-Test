@@ -6,7 +6,7 @@ from typing import Any, Dict, List
 
 from core.llm.types import LLMRequest, LLMResponse
 from core.layers.action_selection import PolicyGenerator
-from core.memory.manager import MemoryManager
+from core.memory import MemoryManager, WorkingMemoryEntry
 from core.models.signals import ActionProposal
 
 
@@ -484,6 +484,142 @@ def test_llm_prompt_includes_skill_plan_context(tmp_path: Path) -> None:
     assert len(llm_client.requests) == 1
     prompt = llm_client.requests[0].messages[1].content
     assert "skill_plan.head_policy_id: dummy:policy_explore" in prompt
+
+
+def test_llm_prompt_includes_observation_and_learning_context(tmp_path: Path) -> None:
+    memory_manager = _memory_manager(tmp_path)
+    memory_manager.record_working(
+        WorkingMemoryEntry(
+            tick=1,
+            entry_type="transition",
+            payload={
+                "policy_id": "dummy:policy_seek_food",
+                "reward": 0.0,
+                "done": False,
+                "prev_facts": {"has_bucket": False},
+                "next_facts": {"has_bucket": False},
+                "inventory_progress": {"changed": False, "slot_delta": 0},
+                "bucket_progress": {"changed": False, "bucket_count_delta": 0},
+            },
+            priority=0.6,
+        )
+    )
+    memory_manager.record_working(
+        WorkingMemoryEntry(
+            tick=2,
+            entry_type="transition",
+            payload={
+                "policy_id": "dummy:policy_explore",
+                "reward": 1.0,
+                "done": False,
+                "prev_facts": {"has_bucket": False},
+                "next_facts": {"has_bucket": True},
+                "inventory_progress": {"changed": True, "slot_delta": 1},
+                "bucket_progress": {"changed": True, "bucket_count_delta": 1},
+            },
+            priority=0.6,
+        )
+    )
+    memory_manager.record_pe(
+        "plains:0:0",
+        {
+            "policy_id": "dummy:policy_seek_food",
+            "channel": "resource_level",
+            "magnitude": 0.7,
+            "tick": 1,
+        },
+        policy_id="dummy:policy_seek_food",
+    )
+
+    llm_client = _StaticLLMClient(
+        text='{"selected_index": 0, "rationale": "follow context", "drive_conflict_detected": true, "confidence": 0.8}'
+    )
+    generator = PolicyGenerator(
+        adapter=_DriveAwareAdapter(),
+        adapter_folder="dummy",
+        memory_manager=memory_manager,
+        goal_checker=_NeutralGoalChecker(),
+        prediction_error_calculator=_NeutralPredictionErrorCalculator(),
+        config={},
+        llm_client=llm_client,
+    )
+
+    proposal = generator.propose_action(
+        goals=[{"goal_id": "task:harvest_milk"}],
+        context={
+            "step": 8,
+            "world_facts": {
+                "biome": "forest",
+                "position": {"x": 10.0, "y": 64.0, "z": 3.0},
+                "nearby_crafting_table": True,
+                "nearby_cow": False,
+                "has_bucket": False,
+                "bucket_count": 0,
+                "inventory_non_air_slots": 2,
+                "inventory_total_quantity": 4,
+                "inventory_fullness": 0.06,
+            },
+            "drive_signals": {
+                "signals": [
+                    {"channel_id": "hunger", "urgency": 0.95},
+                    {"channel_id": "resource_level", "urgency": 0.92},
+                ]
+            },
+            "allostatic_assessment": {"needs": []},
+        },
+    )
+
+    assert isinstance(proposal, ActionProposal)
+    assert len(llm_client.requests) == 1
+    prompt = llm_client.requests[0].messages[1].content
+    assert "OBSERVATION CONTEXT" in prompt
+    assert "biome: forest" in prompt
+    assert "nearby_crafting_table: True" in prompt
+    assert "LEARNING CONTEXT" in prompt
+    assert "transitions_found: 2" in prompt
+    assert "prediction_errors_found: 1" in prompt
+
+
+def test_learning_context_summarizes_repeated_no_progress_failures(tmp_path: Path) -> None:
+    memory_manager = _memory_manager(tmp_path)
+    for tick in range(1, 4):
+        memory_manager.record_working(
+            WorkingMemoryEntry(
+                tick=tick,
+                entry_type="transition",
+                payload={
+                    "policy_id": "dummy:policy_seek_food",
+                    "reward": 0.0,
+                    "done": False,
+                    "prev_facts": {"has_bucket": False},
+                    "next_facts": {"has_bucket": False},
+                    "inventory_progress": {"changed": False, "slot_delta": 0},
+                    "bucket_progress": {"changed": False, "bucket_count_delta": 0},
+                },
+                priority=0.6,
+            )
+        )
+
+    generator = PolicyGenerator(
+        adapter=_DriveAwareAdapter(),
+        adapter_folder="dummy",
+        memory_manager=memory_manager,
+        goal_checker=_NeutralGoalChecker(),
+        prediction_error_calculator=_NeutralPredictionErrorCalculator(),
+        config={},
+    )
+
+    _, prompt = generator._build_arbitration_prompt(  # noqa: SLF001
+        policies=generator.discover_policies(),
+        goals=[],
+        context={"step": 5, "drive_signals": {"signals": []}},
+    )
+
+    assert "no_progress_streak: 3" in prompt
+    assert (
+        "no_progress_summary: policy=dummy:policy_seek_food failed 3 times with 0 reward and no inventory/bucket change"
+        in prompt
+    )
 
 
 def test_selective_gate_skips_llm_when_no_trigger_conditions(tmp_path: Path) -> None:

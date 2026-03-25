@@ -164,8 +164,8 @@ class MineDojoAdapter:
         goals: Any = None,
         context: Optional[Mapping[str, Any]] = None,
     ) -> Dict[str, Any]:
-        _ = context
-        signature = self._skill_plan_signature(goals)
+        world_facts = self._world_facts_from_context(context)
+        signature = self._skill_plan_signature(goals, world_facts=world_facts)
         should_refresh = False
         if signature != self._last_skill_plan_signature:
             should_refresh = True
@@ -178,6 +178,7 @@ class MineDojoAdapter:
             queue, metadata = build_skill_plan_queue(
                 task_id=self._task_id,
                 policies=self._policies,
+                world_facts=world_facts,
             )
             self._skill_plan_queue = list(queue)
             self._skill_plan_metadata = list(metadata)
@@ -969,7 +970,11 @@ class MineDojoAdapter:
     def _clip01(value: float) -> float:
         return max(0.0, min(1.0, float(value)))
 
-    def _skill_plan_signature(self, goals: Any) -> str:
+    def _skill_plan_signature(
+        self,
+        goals: Any,
+        world_facts: Optional[Mapping[str, Any]] = None,
+    ) -> str:
         goal_tokens: List[str] = []
         if isinstance(goals, list):
             for goal in goals:
@@ -982,8 +987,29 @@ class MineDojoAdapter:
                     goal_tokens.append(token)
         elif goals is not None:
             goal_tokens.append(str(goals).strip().lower())
+        facts = world_facts if isinstance(world_facts, Mapping) else {}
+        world_signature = [
+            f"has_bucket:{int(self._as_bool(facts.get('has_bucket'), False))}",
+            f"nearby_cow:{int(self._as_bool(facts.get('nearby_cow'), False))}",
+            f"nearby_crafting_table:{int(self._as_bool(facts.get('nearby_crafting_table'), False))}",
+        ]
         deduped = list(dict.fromkeys(sorted(goal_tokens)))
-        return f"{self._task_id}|{'|'.join(deduped)}"
+        return f"{self._task_id}|{'|'.join(deduped)}|{'|'.join(world_signature)}"
+
+    def _world_facts_from_context(
+        self,
+        context: Optional[Mapping[str, Any]],
+    ) -> Dict[str, bool]:
+        if not isinstance(context, Mapping):
+            return {}
+        facts = context.get("world_facts")
+        if not isinstance(facts, Mapping):
+            return {}
+        return {
+            "has_bucket": self._as_bool(facts.get("has_bucket"), False),
+            "nearby_cow": self._as_bool(facts.get("nearby_cow"), False),
+            "nearby_crafting_table": self._as_bool(facts.get("nearby_crafting_table"), False),
+        }
 
 
 def create_adapter(config: Optional[Mapping[str, Any]] = None) -> Any:

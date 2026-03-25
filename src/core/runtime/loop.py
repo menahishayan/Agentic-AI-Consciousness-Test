@@ -27,7 +27,7 @@ from core.layers.predictive import PredictionErrorCalculator as PolicyPrediction
 from core.models.signals import ActionProposal
 from core.models.state import AgentState
 from core.observability.logger import RunLogger
-from core.memory import MemoryManager
+from core.memory import MemoryManager, WorkingMemoryEntry
 from core.perceptual import (
     ObservationSnapshot,
     PEConfig,
@@ -219,6 +219,11 @@ class AgentLoop:
             homeostatic_state=homeostatic_state,
             area_id=area_id,
         )
+        world_facts = self._build_world_facts(
+            state=current_state,
+            info=self._last_info,
+            obs=self._last_obs,
+        )
         prediction_error_batch = self.perceptual_prediction_error_calculator.update(
             perceptual_snapshot,
             last_action=self._last_selected_policy_id,
@@ -297,6 +302,7 @@ class AgentLoop:
             "drive_signals": asdict(drive_signals),
             "arousal_valence_state": arousal_payload,
             "perceptual_prediction_error": asdict(prediction_error_batch),
+            "world_facts": dict(world_facts),
         }
         skill_plan = self._get_adapter_skill_plan(goals=goals, context=policy_context)
         if skill_plan is not None:
@@ -349,10 +355,23 @@ class AgentLoop:
             homeostatic_state=post_homeostatic_state,
             area_id=post_area_id,
         )
+        next_world_facts = self._build_world_facts(
+            state=state,
+            info=self._last_info,
+            obs=self._last_obs,
+        )
         self.perceptual_prediction_error_calculator.observe_transition(
             prev_observation=perceptual_snapshot,
             action_id=selected_policy_or_bootstrap,
             next_observation=post_perceptual_snapshot,
+        )
+        self._record_transition_memory(
+            step=step,
+            policy_id=selected_policy_or_bootstrap,
+            reward=reward,
+            done=done,
+            prev_facts=world_facts,
+            next_facts=next_world_facts,
         )
         self._record_vital_state(step=step, phase="post_step")
         if self.logger is not None:
@@ -670,6 +689,119 @@ class AgentLoop:
             tick=int(step),
         )
 
+    def _build_world_facts(
+        self,
+        state: AgentState,
+        info: Any,
+        obs: Any,
+    ) -> Dict[str, Any]:
+        _ = obs
+        info_map = self._as_mapping(info)
+        biome = self._as_mapping(getattr(state, "biome", None))
+        position = self._as_mapping(getattr(state, "position", None))
+        nearby = self._as_mapping(getattr(state, "nearby", None))
+        inventory_state = self._as_mapping(getattr(state, "inventory_state", None))
+
+        biome_name = str(
+            biome.get("biome_name")
+            or info_map.get("biome_name")
+            or "unknown"
+        ).strip().lower() or "unknown"
+
+        xpos = self._as_optional_float(position.get("xpos"))
+        ypos = self._as_optional_float(position.get("ypos"))
+        zpos = self._as_optional_float(position.get("zpos"))
+        if xpos is None:
+            xpos = self._as_optional_float(info_map.get("xpos"))
+        if ypos is None:
+            ypos = self._as_optional_float(info_map.get("ypos"))
+        if zpos is None:
+            zpos = self._as_optional_float(info_map.get("zpos"))
+
+        raw_inventory = inventory_state.get("inventory")
+        if not isinstance(raw_inventory, list):
+            info_inventory = info_map.get("inventory")
+            raw_inventory = info_inventory if isinstance(info_inventory, list) else []
+        inventory_non_air_slots, inventory_total_quantity, bucket_count = self._inventory_metrics(raw_inventory)
+
+        nearby_crafting_table = self._resolve_world_bool(
+            [
+                nearby.get("nearby_crafting_table"),
+                info_map.get("nearby_crafting_table"),
+                info_map.get("nearby_workbench"),
+                info_map.get("workbench_nearby"),
+            ],
+            default=False,
+        )
+        nearby_cow = self._resolve_world_bool(
+            [
+                info_map.get("nearby_cow"),
+                info_map.get("cow_nearby"),
+                info_map.get("has_nearby_cow"),
+                self._entity_nearby(info_map, target="cow"),
+            ],
+            default=False,
+        )
+
+        max_slots = self._as_non_negative_int(getattr(self.adapter, "_max_inventory_slots", 36))
+        if max_slots <= 0:
+            max_slots = max(1, len(raw_inventory))
+        inventory_fullness = self._clamp01(float(inventory_non_air_slots) / float(max_slots))
+
+        return {
+            "biome": biome_name,
+            "position": {
+                "x": self._round_optional(xpos),
+                "y": self._round_optional(ypos),
+                "z": self._round_optional(zpos),
+            },
+            "nearby_crafting_table": nearby_crafting_table,
+            "nearby_cow": nearby_cow,
+            "has_bucket": bucket_count > 0,
+            "bucket_count": int(bucket_count),
+            "inventory_non_air_slots": int(inventory_non_air_slots),
+            "inventory_total_quantity": int(inventory_total_quantity),
+            "inventory_fullness": float(inventory_fullness),
+        }
+
+    def _record_transition_memory(
+        self,
+        *,
+        step: int,
+        policy_id: str,
+        reward: Any,
+        done: Any,
+        prev_facts: Mapping[str, Any],
+        next_facts: Mapping[str, Any],
+    ) -> None:
+        recorder = getattr(self.memory_manager, "record_working", None)
+        if not callable(recorder):
+            return
+
+        inventory_progress = self._inventory_progress(prev_facts, next_facts)
+        bucket_progress = self._bucket_progress(prev_facts, next_facts)
+        payload = {
+            "policy_id": str(policy_id),
+            "reward": reward,
+            "done": bool(done),
+            "prev_facts": dict(prev_facts),
+            "next_facts": dict(next_facts),
+            "inventory_progress": inventory_progress,
+            "bucket_progress": bucket_progress,
+        }
+        try:
+            recorder(
+                WorkingMemoryEntry(
+                    tick=int(step),
+                    entry_type="transition",
+                    payload=payload,
+                    priority=0.6,
+                )
+            )
+        except Exception:
+            # Working-memory recording is supplemental and must not interrupt runtime.
+            return
+
     def _prediction_error_from_batch(
         self,
         batch: PredictionErrorBatch,
@@ -939,6 +1071,121 @@ class AgentLoop:
                 inferred.add(drive_tag)
         return inferred
 
+    def _inventory_progress(
+        self,
+        prev_facts: Mapping[str, Any],
+        next_facts: Mapping[str, Any],
+    ) -> Dict[str, Any]:
+        prev_slots = self._as_non_negative_int(prev_facts.get("inventory_non_air_slots"))
+        next_slots = self._as_non_negative_int(next_facts.get("inventory_non_air_slots"))
+        prev_quantity = self._as_non_negative_int(prev_facts.get("inventory_total_quantity"))
+        next_quantity = self._as_non_negative_int(next_facts.get("inventory_total_quantity"))
+        prev_fullness = self._clamp01(prev_facts.get("inventory_fullness", 0.0))
+        next_fullness = self._clamp01(next_facts.get("inventory_fullness", 0.0))
+        slot_delta = int(next_slots - prev_slots)
+        quantity_delta = int(next_quantity - prev_quantity)
+        fullness_delta = float(round(next_fullness - prev_fullness, 4))
+        return {
+            "slot_delta": slot_delta,
+            "quantity_delta": quantity_delta,
+            "fullness_delta": fullness_delta,
+            "changed": bool(slot_delta or quantity_delta or abs(fullness_delta) > 0.0),
+        }
+
+    def _bucket_progress(
+        self,
+        prev_facts: Mapping[str, Any],
+        next_facts: Mapping[str, Any],
+    ) -> Dict[str, Any]:
+        prev_has_bucket = bool(prev_facts.get("has_bucket", False))
+        next_has_bucket = bool(next_facts.get("has_bucket", False))
+        prev_bucket_count = self._as_non_negative_int(prev_facts.get("bucket_count"))
+        next_bucket_count = self._as_non_negative_int(next_facts.get("bucket_count"))
+        count_delta = int(next_bucket_count - prev_bucket_count)
+        return {
+            "had_bucket": prev_has_bucket,
+            "has_bucket": next_has_bucket,
+            "bucket_count_delta": count_delta,
+            "acquired_bucket": (not prev_has_bucket) and next_has_bucket,
+            "changed": bool((prev_has_bucket != next_has_bucket) or count_delta != 0),
+        }
+
+    def _inventory_metrics(self, inventory_items: Any) -> tuple[int, int, int]:
+        if not isinstance(inventory_items, list):
+            return 0, 0, 0
+        non_air_slots = 0
+        total_quantity = 0
+        bucket_count = 0
+        for item in inventory_items:
+            if not isinstance(item, Mapping):
+                continue
+            name = str(item.get("name") or "").strip().lower()
+            quantity = self._as_non_negative_int(item.get("quantity"))
+            if quantity <= 0:
+                continue
+            total_quantity += quantity
+            if name and name != "air":
+                non_air_slots += 1
+            if "bucket" in self._name_tokens(name):
+                bucket_count += quantity
+        return non_air_slots, total_quantity, bucket_count
+
+    def _entity_nearby(
+        self,
+        info_map: Mapping[str, Any],
+        *,
+        target: str,
+    ) -> bool:
+        target_tokens = set(self._name_tokens(target))
+        if not target_tokens:
+            return False
+
+        for key in ("nearby_entities", "entities", "mobs", "entity_names", "nearby"):
+            if self._contains_entity_token(info_map.get(key), target_tokens, depth=2):
+                return True
+        return False
+
+    def _contains_entity_token(
+        self,
+        value: Any,
+        target_tokens: set[str],
+        *,
+        depth: int,
+    ) -> bool:
+        if depth < 0 or value is None:
+            return False
+        if isinstance(value, str):
+            tokens = set(self._name_tokens(value))
+            return bool(tokens.intersection(target_tokens))
+        if isinstance(value, Mapping):
+            for field in ("name", "id", "type", "entity", "mob", "kind"):
+                field_value = value.get(field)
+                if isinstance(field_value, str):
+                    if set(self._name_tokens(field_value)).intersection(target_tokens):
+                        return True
+            for key, item in value.items():
+                key_tokens = set(self._name_tokens(str(key)))
+                if key_tokens.intersection(target_tokens):
+                    bool_value = self._as_optional_bool(item)
+                    if bool_value is True:
+                        return True
+                if self._contains_entity_token(item, target_tokens, depth=depth - 1):
+                    return True
+            return False
+        if isinstance(value, list):
+            for item in value:
+                if self._contains_entity_token(item, target_tokens, depth=depth - 1):
+                    return True
+            return False
+        return False
+
+    def _resolve_world_bool(self, values: List[Any], default: bool) -> bool:
+        for value in values:
+            parsed = self._as_optional_bool(value)
+            if parsed is not None:
+                return parsed
+        return default
+
     @staticmethod
     def _name_tokens(name: str) -> List[str]:
         text = str(name).strip().lower()
@@ -1123,6 +1370,37 @@ class AgentLoop:
             return float(value)
         except (TypeError, ValueError):
             return None
+
+    @staticmethod
+    def _as_non_negative_int(value: Any) -> int:
+        try:
+            numeric = int(float(value))
+        except (TypeError, ValueError):
+            return 0
+        return max(0, numeric)
+
+    @staticmethod
+    def _as_optional_bool(value: Any) -> Optional[bool]:
+        if isinstance(value, bool):
+            return value
+        if value is None:
+            return None
+        if isinstance(value, (int, float)):
+            return bool(value)
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            if normalized in {"1", "true", "yes", "y", "on"}:
+                return True
+            if normalized in {"0", "false", "no", "n", "off"}:
+                return False
+            return None
+        return None
+
+    @staticmethod
+    def _round_optional(value: Optional[float], digits: int = 2) -> Optional[float]:
+        if not isinstance(value, (int, float)):
+            return None
+        return round(float(value), int(digits))
 
     @staticmethod
     def _clamp01(value: Any) -> float:

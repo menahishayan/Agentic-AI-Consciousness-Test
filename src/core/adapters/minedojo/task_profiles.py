@@ -100,14 +100,33 @@ def drive_channels_for_task(task_id: str) -> List[DriveChannel]:
     return channels
 
 
-def task_phase_intents(task_id: str) -> List[List[str]]:
+def task_phase_intents(
+    task_id: str,
+    world_facts: Optional[Mapping[str, Any]] = None,
+) -> List[List[str]]:
     normalized = normalize_task_id(task_id)
     if normalized == "harvest_milk":
-        return [
-            ["bucket", "craft", "collect"],
-            ["cow", "milk", "harvest", "interact", "use"],
-            ["explore", "move", "search"],
-        ]
+        facts = world_facts if isinstance(world_facts, Mapping) else {}
+        has_bucket = _as_bool(facts.get("has_bucket"), default=False)
+        nearby_cow = _as_bool(facts.get("nearby_cow"), default=False)
+        craft_possible = _as_bool(facts.get("nearby_crafting_table"), default=False)
+
+        craft_phase = ["bucket", "craft", "collect"]
+        use_phase = ["cow", "milk", "harvest", "interact", "use"]
+        explore_phase = ["explore", "move", "search"]
+
+        if has_bucket and nearby_cow:
+            # Ready to harvest now: use/interact first.
+            return [use_phase, explore_phase, craft_phase]
+        if has_bucket and not nearby_cow:
+            # Bucket acquired, still searching for a cow.
+            return [explore_phase, use_phase, craft_phase]
+        if craft_possible:
+            # No bucket yet but crafting is feasible in the current area.
+            return [craft_phase, explore_phase, use_phase]
+        # No bucket and no nearby crafting support: explore first.
+        return [explore_phase, craft_phase, use_phase]
+
     return [
         ["explore", "move", "search"],
         ["collect", "resource", "gather"],
@@ -119,9 +138,10 @@ def build_skill_plan_queue(
     *,
     task_id: str,
     policies: Sequence[Mapping[str, Any]],
+    world_facts: Optional[Mapping[str, Any]] = None,
 ) -> Tuple[List[str], List[Dict[str, Any]]]:
     normalized = normalize_task_id(task_id)
-    intents = task_phase_intents(normalized)
+    intents = task_phase_intents(normalized, world_facts=world_facts)
 
     queue: List[str] = []
     metadata: List[Dict[str, Any]] = []
@@ -205,6 +225,22 @@ def clip01(value: Any) -> float:
     except (TypeError, ValueError):
         numeric = 0.0
     return max(0.0, min(1.0, numeric))
+
+
+def _as_bool(value: Any, default: bool) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes", "y", "on"}:
+            return True
+        if normalized in {"0", "false", "no", "n", "off"}:
+            return False
+    return default
 
 
 def _select_policy_for_intent(
