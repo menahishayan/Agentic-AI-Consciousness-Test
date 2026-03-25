@@ -96,6 +96,8 @@ def load_config(path: Path) -> Dict[str, Any]:
                 "sigma_clip": 3.0,
                 "default_precision": 0.5,
                 "min_precision": 0.3,
+                "world_model_alpha": 0.1,
+                "action_confidence_threshold": 20,
             },
             "memory": {
                 "working_memory_capacity": 100,

@@ -7,6 +7,7 @@ from typing import Any, Dict, List, Mapping, Optional
 import numpy as np
 
 from core.coordination.messages import AgentMessage
+from core.layers.predictive import WorldModelGenerator
 
 
 SOURCE_MAP: Dict[str, str] = {
@@ -63,6 +64,8 @@ class PEConfig:
     sigma_clip: float = 3.0
     default_precision: float = 0.5
     min_precision: float = 0.3
+    world_model_alpha: float = 0.1
+    action_confidence_threshold: int = 20
 
 
 class PredictionErrorCalculator:
@@ -80,13 +83,24 @@ class PredictionErrorCalculator:
         self._baseline: Dict[str, float] = {}
         self._variance: Dict[str, float] = {}
         self._buffered_prediction: Optional[Dict[str, float]] = None
+        self._world_model = WorldModelGenerator(
+            channels=CHANNELS,
+            alpha=self.config.world_model_alpha,
+            min_precision=self.config.min_precision,
+            confidence_threshold=self.config.action_confidence_threshold,
+        )
 
-    def update(self, observation: ObservationSnapshot) -> PredictionErrorBatch:
+    def update(
+        self,
+        observation: ObservationSnapshot,
+        last_action: Optional[str] = None,
+    ) -> PredictionErrorBatch:
         observed_channels = self._observation_channels(observation)
+        if not self._baseline:
+            self._initialize_baseline(observed_channels)
 
         if self._buffered_prediction is None:
-            self._initialize_baseline(observed_channels)
-            self._buffered_prediction = dict(self._baseline)
+            self._update_baseline(observed_channels)
             return PredictionErrorBatch(
                 errors=[],
                 aggregate_magnitude=0.0,
@@ -94,13 +108,16 @@ class PredictionErrorCalculator:
                 tick=int(observation.tick),
             )
 
-        precision = self._estimate_precision(observation.area_id)
+        action_id = self._resolve_action_id(last_action, observation)
+        area_precision = self._estimate_area_precision(observation.area_id)
         errors: List[PredictionError] = []
         for channel in CHANNELS:
             predicted = self._buffered_prediction.get(channel, observed_channels[channel])
             observed = observed_channels[channel]
             variance = max(self._variance.get(channel, self.config.epsilon**2), self.config.epsilon**2)
             std = max(math.sqrt(variance), self.config.epsilon)
+            action_precision = self._estimate_action_precision(action_id, channel)
+            precision = self._combine_precision(area_precision, action_precision)
 
             normalized = abs(observed - predicted) / std
             # sigma_clip=3.0 maps 3-sigma deviation to approximately 1.0.
@@ -133,8 +150,27 @@ class PredictionErrorCalculator:
         self._record_errors(observation.area_id, errors)
 
         self._update_baseline(observed_channels)
-        self._buffered_prediction = dict(self._baseline)
+        self._buffered_prediction = None
         return batch
+
+    def prepare_next_prediction(self, observation: ObservationSnapshot, action_id: Any) -> None:
+        observed_channels = self._observation_channels(observation)
+        if not self._baseline:
+            self._initialize_baseline(observed_channels)
+        resolved_action = self._resolve_action_id(action_id, observation)
+        self._buffered_prediction = self._world_model.predict(observed_channels, resolved_action)
+
+    def observe_transition(
+        self,
+        prev_observation: ObservationSnapshot,
+        action_id: Any,
+        next_observation: ObservationSnapshot,
+    ) -> None:
+        self._world_model.update(
+            prev_observation=prev_observation,
+            action_id=self._resolve_action_id(action_id, prev_observation),
+            next_observation=next_observation,
+        )
 
     def get_prediction(self) -> Dict[str, float]:
         if self._buffered_prediction is None:
@@ -145,6 +181,7 @@ class PredictionErrorCalculator:
         self._baseline.clear()
         self._variance.clear()
         self._buffered_prediction = None
+        self._world_model.reset()
 
     def get_variance(self) -> Dict[str, float]:
         return dict(self._variance)
@@ -165,7 +202,7 @@ class PredictionErrorCalculator:
             self._baseline[channel] = self._clip01(updated_mean)
             self._variance[channel] = max(updated_var, self.config.epsilon**2)
 
-    def _estimate_precision(self, area_id: str) -> float:
+    def _estimate_area_precision(self, area_id: str) -> float:
         getter = getattr(self.memory_manager, "get_area_familiarity", None)
         if not callable(getter):
             return self.config.default_precision
@@ -177,6 +214,15 @@ class PredictionErrorCalculator:
         familiarity = self._clip01(familiarity)
         precision = self.config.min_precision + familiarity * (1.0 - self.config.min_precision)
         return self._clip01(precision)
+
+    def _estimate_action_precision(self, action_id: str, channel: str) -> float:
+        return self._world_model.confidence(action_id, channel)
+
+    def _combine_precision(self, area_precision: float, action_precision: float) -> float:
+        area = self._clip(area_precision, self.config.min_precision, 1.0)
+        action = self._clip(action_precision, self.config.min_precision, 1.0)
+        combined = math.sqrt(area * action)
+        return self._clip(combined, self.config.min_precision, 1.0)
 
     def _record_errors(self, area_id: str, errors: List[PredictionError]) -> None:
         if self.memory_manager is None:
@@ -268,13 +314,38 @@ class PredictionErrorCalculator:
         min_precision = PredictionErrorCalculator._clip01(
             PredictionErrorCalculator._as_float(getattr(config, "min_precision", 0.3), 0.3)
         )
+        world_model_alpha = PredictionErrorCalculator._clip(
+            PredictionErrorCalculator._as_float(getattr(config, "world_model_alpha", 0.1), 0.1),
+            1e-6,
+            1.0,
+        )
+        action_confidence_threshold = max(
+            1,
+            int(
+                PredictionErrorCalculator._as_float(
+                    getattr(config, "action_confidence_threshold", 20),
+                    20.0,
+                )
+            ),
+        )
         return PEConfig(
             alpha=alpha,
             epsilon=epsilon,
             sigma_clip=sigma_clip,
             default_precision=default_precision,
             min_precision=min_precision,
+            world_model_alpha=world_model_alpha,
+            action_confidence_threshold=action_confidence_threshold,
         )
+
+    @staticmethod
+    def _resolve_action_id(last_action: Any, observation: ObservationSnapshot) -> str:
+        if isinstance(last_action, str) and last_action.strip():
+            return last_action.strip()
+        observed_last_action = getattr(observation, "last_action", None)
+        if isinstance(observed_last_action, str) and observed_last_action.strip():
+            return observed_last_action.strip()
+        return "bootstrap"
 
     @staticmethod
     def _clip01(value: float) -> float:

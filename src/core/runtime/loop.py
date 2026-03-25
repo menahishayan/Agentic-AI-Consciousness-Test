@@ -220,7 +220,8 @@ class AgentLoop:
             area_id=area_id,
         )
         prediction_error_batch = self.perceptual_prediction_error_calculator.update(
-            perceptual_snapshot
+            perceptual_snapshot,
+            last_action=self._last_selected_policy_id,
         )
         self._last_perceptual_batch = prediction_error_batch
         latest_prediction_error = self._prediction_error_from_batch(
@@ -308,12 +309,17 @@ class AgentLoop:
         selected_policy_id = (
             action_proposal.action_id if isinstance(action_proposal, ActionProposal) else None
         )
+        selected_policy_or_bootstrap = selected_policy_id or "bootstrap"
         if selected_policy_id:
             self._notify_adapter_policy_selected(
                 policy_id=selected_policy_id,
                 goals=goals,
                 context=policy_context,
             )
+        self.perceptual_prediction_error_calculator.prepare_next_prediction(
+            observation=perceptual_snapshot,
+            action_id=selected_policy_or_bootstrap,
+        )
 
         obs, reward, done, info = self.adapter.step(action)
         self._last_obs = obs
@@ -323,6 +329,29 @@ class AgentLoop:
             raw_obs=obs,
             info=info,
             vital_state_monitor=self.vital_state_monitor,
+        )
+        post_workspace_messages = self.workspace.broadcast()
+        post_homeostatic_state = self._build_homeostatic_state(
+            step=step + 1,
+            state=state,
+            workspace_messages=post_workspace_messages,
+        )
+        post_area_id = self._build_area_id(
+            step=step + 1,
+            state=state,
+            info=self._last_info,
+            obs=self._last_obs,
+        )
+        post_perceptual_snapshot = self._build_perceptual_snapshot(
+            step=step + 1,
+            state=state,
+            homeostatic_state=post_homeostatic_state,
+            area_id=post_area_id,
+        )
+        self.perceptual_prediction_error_calculator.observe_transition(
+            prev_observation=perceptual_snapshot,
+            action_id=selected_policy_or_bootstrap,
+            next_observation=post_perceptual_snapshot,
         )
         self._record_vital_state(step=step, phase="post_step")
         if self.logger is not None:
@@ -1068,6 +1097,11 @@ class AgentLoop:
             sigma_clip=AgentLoop._clamp(config.get("sigma_clip", 3.0), 1e-6, 10.0),  # type: ignore[arg-type]
             default_precision=AgentLoop._clamp(config.get("default_precision", 0.5), 0.0, 1.0),  # type: ignore[arg-type]
             min_precision=AgentLoop._clamp(config.get("min_precision", 0.3), 0.0, 1.0),  # type: ignore[arg-type]
+            world_model_alpha=AgentLoop._clamp(config.get("world_model_alpha", 0.1), 1e-6, 1.0),  # type: ignore[arg-type]
+            action_confidence_threshold=max(
+                1,
+                int(config.get("action_confidence_threshold", 20)),
+            ),
         )
 
     @staticmethod

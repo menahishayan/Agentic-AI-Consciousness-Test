@@ -11,6 +11,7 @@ from core.layers.interoceptive import (
 from core.memory import MemoryManager
 from core.models.signals import ActionProposal
 from core.models.state import AgentState
+from core.perceptual import PredictionErrorBatch
 from core.runtime.loop import AgentLoop
 
 
@@ -192,6 +193,51 @@ def test_step_zero_maps_observation_once_before_action() -> None:
 
     # One pre-action mapping + one post-step mapping.
     assert mapper.calls == 2
+
+
+def test_perceptual_prediction_flow_calls_update_prepare_and_observe_in_order() -> None:
+    class _CapturePerceptualCalculator:
+        def __init__(self) -> None:
+            self.calls: List[tuple[Any, ...]] = []
+
+        def update(self, observation: Any, last_action: Any = None) -> PredictionErrorBatch:
+            self.calls.append(("update", int(observation.tick), str(last_action)))
+            return PredictionErrorBatch(
+                errors=[],
+                aggregate_magnitude=0.0,
+                dominant_source="",
+                tick=int(observation.tick),
+            )
+
+        def prepare_next_prediction(self, observation: Any, action_id: Any) -> None:
+            self.calls.append(("prepare", int(observation.tick), str(action_id)))
+
+        def observe_transition(self, prev_observation: Any, action_id: Any, next_observation: Any) -> None:
+            self.calls.append(
+                (
+                    "observe",
+                    int(prev_observation.tick),
+                    str(action_id),
+                    int(next_observation.tick),
+                )
+            )
+
+    adapter = _DriveAwareDummyAdapter()
+    loop = AgentLoop(
+        adapter=adapter,
+        observation_mapper=_CountingMapper(),
+        memory_manager=MemoryManager(),
+        adapter_folder="dummy",
+        policy_config={},
+    )
+    capture = _CapturePerceptualCalculator()
+    loop.perceptual_prediction_error_calculator = capture
+
+    loop.run_step(0)
+
+    assert capture.calls[0] == ("update", 0, "bootstrap")
+    assert capture.calls[1] == ("prepare", 0, "dummy:policy_noop")
+    assert capture.calls[2] == ("observe", 0, "dummy:policy_noop", 1)
 
 
 def test_prediction_error_is_attributed_to_previous_selected_policy() -> None:
