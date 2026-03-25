@@ -117,6 +117,68 @@ class _NoPolicyContractAdapter:
         return "hidden_action"
 
 
+class _StopwordOverlapAdapter(_DriveAwareAdapter):
+    def get_available_policies(self) -> List[Dict[str, Any]]:
+        return [
+            {
+                "policy_id": "dummy:policy_craft_or_smelt",
+                "callable_name": "policy_craft_or_smelt",
+                "description": "Craft or smelt resources.",
+                "tags": ["craft", "smelt"],
+                "drive_tags": ["resource_level"],
+            },
+            {
+                "policy_id": "dummy:policy_use_bucket",
+                "callable_name": "policy_use_bucket",
+                "description": "Use a bucket to collect milk.",
+                "tags": ["bucket", "use", "collect"],
+                "drive_tags": ["resource_level"],
+            },
+        ]
+
+    def policy_craft_or_smelt(self) -> str:
+        return "craft_or_smelt_action"
+
+    def policy_use_bucket(self) -> str:
+        return "use_bucket_action"
+
+
+class _PlanCycleAdapter(_DriveAwareAdapter):
+    def get_available_policies(self) -> List[Dict[str, Any]]:
+        return [
+            {
+                "policy_id": "dummy:policy_craft",
+                "callable_name": "policy_craft",
+                "description": "Craft an item.",
+                "tags": ["craft"],
+                "drive_tags": ["resource_level"],
+            },
+            {
+                "policy_id": "dummy:policy_use",
+                "callable_name": "policy_use",
+                "description": "Use an interactable target.",
+                "tags": ["use", "interact"],
+                "drive_tags": ["resource_level"],
+            },
+            {
+                "policy_id": "dummy:policy_move_forward",
+                "callable_name": "policy_move_forward",
+                "description": "Move forward to explore.",
+                "tags": ["move", "explore"],
+                "drive_tags": ["resource_level"],
+            },
+        ]
+
+    def policy_craft(self) -> str:
+        return "craft_action"
+
+    def policy_use(self) -> str:
+        return "use_action"
+
+    def policy_move_forward(self) -> str:
+        return "move_forward_action"
+
+
 class _StaticLLMClient:
     def __init__(self, text: str) -> None:
         self.text = text
@@ -532,6 +594,215 @@ def test_goal_change_with_pending_result_runs_async_and_uses_cached_policy(tmp_p
     assert isinstance(follow_up, ActionProposal)
     assert follow_up.action_id == "dummy:policy_explore"
     assert _wait_for(lambda: len(llm_client.requests) == 1)
+
+
+def test_goal_directed_fallback_filters_stopword_overlap_noise(tmp_path: Path) -> None:
+    memory_manager = _memory_manager(tmp_path)
+    generator = PolicyGenerator(
+        adapter=_StopwordOverlapAdapter(),
+        adapter_folder="dummy",
+        memory_manager=memory_manager,
+        goal_checker=_NeutralGoalChecker(),
+        prediction_error_calculator=_NeutralPredictionErrorCalculator(),
+        config={},
+    )
+
+    proposal = generator.propose_action(
+        goals="using or bucket",
+        context={
+            "step": 3,
+            "drive_signals": {"signals": []},
+        },
+    )
+
+    assert isinstance(proposal, ActionProposal)
+    assert proposal.action_id == "dummy:policy_use_bucket"
+
+
+def test_exhausted_skill_plan_cycles_phase_policies_round_robin(tmp_path: Path) -> None:
+    memory_manager = _memory_manager(tmp_path)
+    generator = PolicyGenerator(
+        adapter=_PlanCycleAdapter(),
+        adapter_folder="dummy",
+        memory_manager=memory_manager,
+        goal_checker=_NeutralGoalChecker(),
+        prediction_error_calculator=_NeutralPredictionErrorCalculator(),
+        config={},
+    )
+
+    skill_plan = {
+        "head_policy_id": None,
+        "remaining_policy_ids": [],
+        "remaining_count": 0,
+        "metadata": [
+            {
+                "phase_index": 0,
+                "intent_tokens": ["bucket", "craft", "collect"],
+                "selected_policy_id": "dummy:policy_craft",
+            },
+            {
+                "phase_index": 1,
+                "intent_tokens": ["cow", "milk", "harvest", "interact", "use"],
+                "selected_policy_id": "dummy:policy_use",
+            },
+            {
+                "phase_index": 2,
+                "intent_tokens": ["explore", "move", "search"],
+                "selected_policy_id": "dummy:policy_move_forward",
+            },
+        ],
+    }
+
+    selected_ids: List[str] = []
+    for step in (3, 4, 5):
+        proposal = generator.propose_action(
+            goals=[],
+            context={
+                "step": step,
+                "skill_plan": skill_plan,
+                "drive_signals": {"signals": []},
+            },
+        )
+        assert isinstance(proposal, ActionProposal)
+        selected_ids.append(proposal.action_id)
+
+    assert selected_ids == [
+        "dummy:policy_craft",
+        "dummy:policy_use",
+        "dummy:policy_move_forward",
+    ]
+
+
+def test_periodic_reeval_is_sync_when_skill_plan_is_exhausted(tmp_path: Path) -> None:
+    memory_manager = _memory_manager(tmp_path)
+    llm_client = _StaticLLMClient(
+        text='{"selected_index": 1, "rationale": "refresh strategy", "drive_conflict_detected": false, "confidence": 0.8}'
+    )
+    generator = PolicyGenerator(
+        adapter=_DriveAwareAdapter(),
+        adapter_folder="dummy",
+        memory_manager=memory_manager,
+        goal_checker=_NeutralGoalChecker(),
+        prediction_error_calculator=_NeutralPredictionErrorCalculator(),
+        config={"llm_reeval_interval": 10},
+        llm_client=llm_client,
+    )
+    generator._last_goals_fingerprint = generator._goals_fingerprint([])  # noqa: SLF001
+
+    proposal = generator.propose_action(
+        goals=[],
+        context={
+            "step": 10,
+            "skill_plan": {
+                "head_policy_id": None,
+                "remaining_policy_ids": [],
+                "remaining_count": 0,
+                "metadata": [],
+            },
+            "drive_signals": {"signals": [{"channel_id": "hunger", "urgency": 0.4}]},
+            "perceptual_prediction_error": {"aggregate_magnitude": 0.1},
+        },
+    )
+
+    assert isinstance(proposal, ActionProposal)
+    assert proposal.action_id == "dummy:policy_explore"
+    assert len(llm_client.requests) == 1
+
+
+def test_should_call_llm_marks_exhausted_periodic_as_urgent(tmp_path: Path) -> None:
+    memory_manager = _memory_manager(tmp_path)
+    generator = PolicyGenerator(
+        adapter=_DriveAwareAdapter(),
+        adapter_folder="dummy",
+        memory_manager=memory_manager,
+        goal_checker=_NeutralGoalChecker(),
+        prediction_error_calculator=_NeutralPredictionErrorCalculator(),
+        config={"llm_reeval_interval": 10},
+    )
+    generator._last_goals_fingerprint = generator._goals_fingerprint([])  # noqa: SLF001
+
+    policies = generator.discover_policies()
+    gate = generator._should_call_llm(  # noqa: SLF001
+        policies=policies,
+        goals=[],
+        context={
+            "step": 10,
+            "skill_plan": {
+                "head_policy_id": None,
+                "remaining_policy_ids": [],
+                "remaining_count": 0,
+                "metadata": [{"phase_index": 0, "intent_tokens": ["bucket"]}],
+            },
+            "drive_signals": {"signals": [{"channel_id": "hunger", "urgency": 0.4}]},
+        },
+    )
+
+    assert gate["should_call"] is True
+    assert gate["urgent"] is True
+    assert "periodic_reeval_plan_exhausted" in gate["reasons"]
+    assert "periodic_reeval" not in gate["reasons"]
+
+
+def test_should_call_llm_keeps_periodic_non_urgent_with_active_plan(tmp_path: Path) -> None:
+    memory_manager = _memory_manager(tmp_path)
+    generator = PolicyGenerator(
+        adapter=_DriveAwareAdapter(),
+        adapter_folder="dummy",
+        memory_manager=memory_manager,
+        goal_checker=_NeutralGoalChecker(),
+        prediction_error_calculator=_NeutralPredictionErrorCalculator(),
+        config={"llm_reeval_interval": 10},
+    )
+    generator._last_goals_fingerprint = generator._goals_fingerprint([])  # noqa: SLF001
+
+    policies = generator.discover_policies()
+    gate = generator._should_call_llm(  # noqa: SLF001
+        policies=policies,
+        goals=[],
+        context={
+            "step": 10,
+            "skill_plan": {
+                "head_policy_id": "dummy:policy_seek_food",
+                "remaining_policy_ids": ["dummy:policy_seek_food"],
+                "remaining_count": 1,
+                "metadata": [{"phase_index": 0, "intent_tokens": ["collect"]}],
+            },
+            "drive_signals": {"signals": [{"channel_id": "hunger", "urgency": 0.4}]},
+        },
+    )
+
+    assert gate["should_call"] is True
+    assert gate["urgent"] is False
+    assert gate["reasons"] == ["periodic_reeval"]
+
+
+def test_goal_directed_fallback_uses_skill_plan_intent_tokens(tmp_path: Path) -> None:
+    memory_manager = _memory_manager(tmp_path)
+    generator = PolicyGenerator(
+        adapter=_StopwordOverlapAdapter(),
+        adapter_folder="dummy",
+        memory_manager=memory_manager,
+        goal_checker=_NeutralGoalChecker(),
+        prediction_error_calculator=_NeutralPredictionErrorCalculator(),
+        config={},
+    )
+
+    proposal = generator.propose_action(
+        goals=[{"goal": "do or act"}],
+        context={
+            "step": 3,
+            "skill_plan": {
+                "head_policy_id": None,
+                "remaining_policy_ids": [],
+                "remaining_count": 0,
+                "metadata": [{"phase_index": 0, "intent_tokens": ["bucket"]}],
+            },
+            "drive_signals": {"signals": []},
+        },
+    )
+
+    assert isinstance(proposal, ActionProposal)
+    assert proposal.action_id == "dummy:policy_use_bucket"
 
 
 def test_sustained_prediction_error_triggers_sync_llm_call(tmp_path: Path) -> None:

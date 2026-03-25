@@ -349,7 +349,7 @@ class PolicyGenerator:
         record_trace: bool = True,
     ) -> Optional[Dict[str, Any]]:
         if self.llm_client is None:
-            return self._urgency_fallback(policies, context, goals=goals)
+            return self._urgency_fallback(policies, context)
 
         system_prompt, user_prompt = self._build_arbitration_prompt(
             policies=policies,
@@ -396,7 +396,7 @@ class PolicyGenerator:
             )
             response_text = str(getattr(response, "text", "") or "")
         except Exception as exc:
-            selected = self._urgency_fallback(policies, context, goals=goals)
+            selected = self._urgency_fallback(policies, context)
             if record_trace:
                 self._write_arbitration_fallback_trace(
                     selected_policy=selected,
@@ -426,7 +426,7 @@ class PolicyGenerator:
 
         selected = self._parse_arbitration_response(response_text, policies)
         if selected is None:
-            fallback = self._urgency_fallback(policies, context, goals=goals)
+            fallback = self._urgency_fallback(policies, context)
             if record_trace:
                 self._write_arbitration_fallback_trace(
                     selected_policy=fallback,
@@ -590,8 +590,6 @@ class PolicyGenerator:
 
         goals_fingerprint = self._goals_fingerprint(goals)
         goal_changed = goals_fingerprint != self._last_goals_fingerprint
-        with self._llm_state_lock:
-            pending_llm_result_available = self._pending_llm_result is not None
 
         urgent_reasons: List[str] = []
         non_urgent_reasons: List[str] = []
@@ -602,12 +600,38 @@ class PolicyGenerator:
         if skill_gap:
             urgent_reasons.append("skill_gap")
         if periodic:
-            non_urgent_reasons.append("periodic_reeval")
-        if goal_changed:
-            if pending_llm_result_available:
-                non_urgent_reasons.append("goal_changed")
+            # Periodic reeval is urgent (synchronous) when the skill plan is
+            # exhausted (remaining_count == 0 or head is None).  An exhausted
+            # plan means the agent has consumed its prior without reaching the
+            # goal — exactly the high-precision prediction-error condition Seth
+            # describes that demands a full generative-model update, not a
+            # background thread that will likely outlive the remaining episode.
+            skill_plan_raw = context.get("skill_plan")
+            plan_exhausted = False
+            if isinstance(skill_plan_raw, Mapping):
+                remaining = skill_plan_raw.get("remaining_count", 1)
+                head = skill_plan_raw.get("head_policy_id")
+                plan_exhausted = (
+                    (isinstance(remaining, int) and remaining == 0)
+                    or head is None
+                )
+            if plan_exhausted:
+                urgent_reasons.append("periodic_reeval_plan_exhausted")
             else:
+                non_urgent_reasons.append("periodic_reeval")
+        if goal_changed:
+            # A new goal with no prior LLM deliberation is treated as urgent:
+            # encountering a new goal generates a high-precision prediction error
+            # that requires an immediate (synchronous) generative-model update.
+            # Seth's beast machine does not defer its initial response to a new
+            # prior — it resolves prediction error before acting.
+            # Once a result already exists the update can be deferred (async).
+            with self._llm_state_lock:
+                has_pending = self._pending_llm_result is not None
+            if not has_pending:
                 urgent_reasons.append("goal_changed")
+            else:
+                non_urgent_reasons.append("goal_changed")
 
         reasons = urgent_reasons + non_urgent_reasons
         return {
@@ -620,7 +644,6 @@ class PolicyGenerator:
             "skill_gap": skill_gap,
             "periodic": periodic,
             "goal_changed": goal_changed,
-            "pending_llm_result_available": pending_llm_result_available,
         }
 
     def _drive_conflict_detected(self, drive_signals: List[Dict[str, Any]]) -> bool:
@@ -955,13 +978,34 @@ class PolicyGenerator:
             if isinstance(raw_head, str) and raw_head.strip():
                 planned_policy_id = raw_head.strip()
 
+            # When the skill plan is exhausted (head=None, remaining=0) but
+            # metadata is available, cycle through the curated phases round-robin.
+            # This keeps the agent attempting the goal-relevant action sequence
+            # rather than drifting to a random or cached policy while waiting
+            # for LLM deliberation — consistent with Seth's continuous active
+            # inference under uncertainty.
+            if planned_policy_id is None:
+                meta = skill_plan.get("metadata")
+                if isinstance(meta, list) and meta:
+                    step = context.get("step", 0) or 0
+                    phase = meta[int(step) % len(meta)]
+                    phase_pid = phase.get("selected_policy_id")
+                    if isinstance(phase_pid, str) and phase_pid.strip():
+                        planned_policy_id = phase_pid.strip()
+
         drive_signals = self._resolve_drive_signals(context.get("drive_signals"))
         if not drive_signals:
             if planned_policy_id:
                 planned = self._find_policy_by_id(policies, planned_policy_id)
                 if planned is not None:
                     return planned
-            return self._goal_directed_fallback(policies, goals)
+            # No drive urgency and no skill plan: attempt goal-directed selection
+            # before falling back to the first policy in the list.
+            if goals:
+                goal_selected = self._goal_directed_fallback(policies, goals, context)
+                if goal_selected is not None:
+                    return goal_selected
+            return policies[0]
 
         urgency_by_channel: Dict[str, float] = {}
         for signal in drive_signals:
@@ -982,7 +1026,11 @@ class PolicyGenerator:
                 planned = self._find_policy_by_id(policies, planned_policy_id)
                 if planned is not None:
                     return planned
-            return self._goal_directed_fallback(policies, goals)
+            if goals:
+                goal_selected = self._goal_directed_fallback(policies, goals, context)
+                if goal_selected is not None:
+                    return goal_selected
+            return policies[0]
 
         best_index = 0
         best_score = -1.0
@@ -997,82 +1045,98 @@ class PolicyGenerator:
             if score > best_score:
                 best_score = score
                 best_index = index
-        if best_score <= 0.0:
-            return self._goal_directed_fallback(policies, goals)
+
+        # When no drive signal matches any policy tag (all scores stayed at 0),
+        # attempt goal-directed selection rather than silently picking no_op.
+        # This is the homeostatic equilibrium → goal pursuit transition in Seth's
+        # framework: a calm body is free to pursue allostatic goals.
+        if best_score <= 0.0 and goals:
+            goal_selected = self._goal_directed_fallback(policies, goals, context)
+            if goal_selected is not None:
+                return goal_selected
+
         return policies[best_index]
+
+    # Common English stop-words and generic terms that appear in almost every
+    # policy description and goal string — matches on these are meaningless.
+    _GOAL_STOP_WORDS: frozenset = frozenset({
+        "a", "an", "the", "and", "or", "of", "in", "to", "by", "with",
+        "for", "on", "at", "is", "it", "as", "be", "are", "was", "were",
+        "has", "have", "had", "will", "can", "do", "not", "this", "that",
+        "from", "up", "out", "into", "its", "their", "you", "your",
+        "action", "space", "primitive", "minedojo",
+        "s", "t", "d",
+    })
 
     def _goal_directed_fallback(
         self,
         policies: List[Dict[str, Any]],
         goals: Any,
+        context: Optional[Mapping[str, Any]] = None,
     ) -> Optional[Dict[str, Any]]:
-        if not policies:
+        """Select a policy via goal-keyword overlap when drive urgency is zero.
+
+        Token sources in descending quality:
+        1. Skill plan intent_tokens per phase (adapter-curated, no noise).
+        2. Goal ``goal`` / ``task_id`` fields (compact, low noise).
+        3. Goal ``description`` (verbose, filtered through stop-words).
+        """
+        goal_tokens: set = set()
+
+        # Priority 1: skill plan intent tokens (curated by adapter)
+        if isinstance(context, Mapping):
+            skill_plan_raw = context.get("skill_plan")
+            if isinstance(skill_plan_raw, Mapping):
+                for phase in skill_plan_raw.get("metadata", []):
+                    if not isinstance(phase, Mapping):
+                        continue
+                    for tok in phase.get("intent_tokens", []):
+                        if isinstance(tok, str) and tok.strip():
+                            goal_tokens.add(tok.strip().lower())
+
+        # Priority 2: goal struct compact fields
+        goals_list = goals if isinstance(goals, list) else [goals]
+        for goal in goals_list:
+            if isinstance(goal, Mapping):
+                for field in ("goal", "task_id"):
+                    text = goal.get(field)
+                    if isinstance(text, str):
+                        goal_tokens.update(self._name_tokens(text))
+                if not goal_tokens:
+                    desc = goal.get("description")
+                    if isinstance(desc, str):
+                        goal_tokens.update(self._name_tokens(desc))
+            elif isinstance(goal, str):
+                goal_tokens.update(self._name_tokens(goal))
+
+        goal_tokens -= self._GOAL_STOP_WORDS
+        if not goal_tokens:
             return None
 
-        goal_tokens = self._goal_tokens(goals)
         best_policy: Optional[Dict[str, Any]] = None
-        best_score = -1
-        first_non_noop: Optional[Dict[str, Any]] = None
-
+        best_overlap = 0
         for policy in policies:
-            if self._is_noop_policy(policy):
+            pid = str(policy.get("policy_id") or "").strip()
+            # Never select no_op as a goal-directed action.
+            if pid.endswith(":no_op") or pid == "no_op":
                 continue
-            if first_non_noop is None:
-                first_non_noop = policy
-            if not goal_tokens:
-                continue
-            policy_tokens = self._policy_tokens(policy)
-            overlap_score = len(goal_tokens.intersection(policy_tokens))
-            if overlap_score > best_score:
-                best_score = overlap_score
+            policy_tokens: set = set()
+            pid_tokens = set(self._name_tokens(pid)) - self._GOAL_STOP_WORDS
+            policy_tokens.update(pid_tokens)
+            drive_tags = self._normalize_tags(policy.get("drive_tags"))
+            policy_tokens.update(t for t in drive_tags if t not in self._GOAL_STOP_WORDS)
+            if not policy_tokens:
+                desc = policy.get("description")
+                if isinstance(desc, str):
+                    policy_tokens.update(
+                        t for t in self._name_tokens(desc) if t not in self._GOAL_STOP_WORDS
+                    )
+            overlap = len(goal_tokens & policy_tokens)
+            if overlap > best_overlap:
+                best_overlap = overlap
                 best_policy = policy
 
-        if best_policy is not None and best_score > 0:
-            return best_policy
-        if first_non_noop is not None:
-            return first_non_noop
-        return policies[0]
-
-    def _goal_tokens(self, goals: Any) -> set[str]:
-        sources: List[str] = []
-        if isinstance(goals, list):
-            for goal in goals:
-                if isinstance(goal, Mapping):
-                    for key in ("goal_id", "description", "goal", "task_id"):
-                        value = goal.get(key)
-                        if value is not None:
-                            sources.append(str(value))
-                else:
-                    sources.append(str(goal))
-        elif isinstance(goals, Mapping):
-            for key in ("goal_id", "description", "goal", "task_id"):
-                value = goals.get(key)
-                if value is not None:
-                    sources.append(str(value))
-        elif goals is not None:
-            sources.append(str(goals))
-
-        tokens: set[str] = set()
-        for source in sources:
-            tokens.update(self._name_tokens(source))
-        return tokens
-
-    def _is_noop_policy(self, policy: Mapping[str, Any]) -> bool:
-        policy_id = str(policy.get("policy_id") or "").strip().lower()
-        callable_name = str(policy.get("callable_name") or "").strip().lower()
-        tags = set(self._normalize_tags(policy.get("tags")))
-        drive_tags = set(self._normalize_tags(policy.get("drive_tags")))
-        markers = {"noop", "no_op", "idle", "wait", "do_nothing"}
-
-        if any(marker in policy_id for marker in markers):
-            return True
-        if any(marker in callable_name for marker in markers):
-            return True
-        if tags.intersection(markers):
-            return True
-        if drive_tags.intersection(markers):
-            return True
-        return False
+        return best_policy if best_overlap > 0 else None
 
     def _write_arbitration_trace(
         self,
