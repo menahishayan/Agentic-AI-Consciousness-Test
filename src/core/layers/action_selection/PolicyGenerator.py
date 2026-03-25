@@ -6,10 +6,12 @@ import inspect
 import json
 import re
 import threading
+import uuid
 from typing import Any, Dict, Iterable, List, Mapping, Optional
 
 from core.llm.client import LLMClient
 from core.llm.types import LLMMessage, LLMRequest
+from core.memory import WorkingMemoryEntry
 from core.models.signals import ActionProposal
 from core.observability.logger import RunLogger
 
@@ -63,6 +65,38 @@ class PolicyGenerator:
             1,
             int(self._as_float(self.config.get("llm_learning_context_window"), 10.0)),
         )
+        self.plan_default_window_size = max(
+            1,
+            int(self._as_float(self.config.get("plan_default_window_size"), 20.0)),
+        )
+        self.plan_min_window_size = max(
+            1,
+            int(self._as_float(self.config.get("plan_min_window_size"), 5.0)),
+        )
+        self.plan_max_window_size = max(
+            self.plan_min_window_size,
+            int(self._as_float(self.config.get("plan_max_window_size"), 100.0)),
+        )
+        self.movement_phase_min_window = max(
+            1,
+            int(self._as_float(self.config.get("movement_phase_min_window"), 20.0)),
+        )
+        self.plan_max_phases = max(
+            1,
+            int(self._as_float(self.config.get("plan_max_phases"), 5.0)),
+        )
+        self.plan_window_escalation_streak = max(
+            1,
+            int(self._as_float(self.config.get("plan_window_escalation_streak"), 3.0)),
+        )
+        self.plan_stall_step_threshold = max(
+            1,
+            int(self._as_float(self.config.get("plan_stall_step_threshold"), 20.0)),
+        )
+        self.plan_stall_x_threshold = max(
+            0.0,
+            self._as_float(self.config.get("plan_stall_x_threshold"), 0.5),
+        )
         model_value = self.config.get("model", "claude-sonnet-4-20250514")
         self.model = str(model_value).strip() or "claude-sonnet-4-20250514"
         self._pe_streak = 0
@@ -70,6 +104,8 @@ class PolicyGenerator:
         self._pending_llm_result: Optional[Dict[str, Any]] = None
         self._llm_thread: Optional[threading.Thread] = None
         self._llm_state_lock = threading.Lock()
+        self._active_plan_cache: Optional[Dict[str, Any]] = None
+        self._plan_window_elapsed_nonurgent_streak = 0
 
     def propose_action(self, goals: Any, context: Mapping[str, Any]) -> Optional[ActionProposal]:
         policies = self.discover_policies()
@@ -297,9 +333,15 @@ class PolicyGenerator:
                     "urgent": bool(gate.get("urgent")),
                     "reasons": reasons,
                     "pe_streak": self._pe_streak,
+                    "plan_window_elapsed_nonurgent_streak": self._plan_window_elapsed_nonurgent_streak,
                 },
                 step=context.get("step"),
             )
+
+        if bool(gate.get("plan_window_elapsed")) and not bool(gate.get("urgent")):
+            self._plan_window_elapsed_nonurgent_streak += 1
+        else:
+            self._plan_window_elapsed_nonurgent_streak = 0
 
         if not bool(gate.get("should_call")):
             selected = self._urgency_fallback(policies, context, goals=goals)
@@ -312,7 +354,7 @@ class PolicyGenerator:
             return selected
 
         if not bool(gate.get("urgent")):
-            selected = self._pending_llm_policy(policies)
+            selected = self._pending_llm_policy(policies, context=context)
             if selected is None:
                 selected = self._urgency_fallback(policies, context, goals=goals)
             self._write_arbitration_fallback_trace(
@@ -337,6 +379,7 @@ class PolicyGenerator:
             gate_reasons=reasons,
             record_trace=True,
         )
+        self._plan_window_elapsed_nonurgent_streak = 0
         self._pe_streak = 0
         self._last_goals_fingerprint = str(gate.get("goals_fingerprint", ""))
         if isinstance(selected, Mapping):
@@ -428,7 +471,13 @@ class PolicyGenerator:
                 step=step,
             )
 
-        selected = self._parse_arbitration_response(response_text, policies)
+        parsed_response = self._parse_full_response(response_text)
+        selected, generated_plan = self._select_policy_and_plan_from_response(
+            parsed_response=parsed_response,
+            raw_response=response_text,
+            policies=policies,
+            context=context,
+        )
         if selected is None:
             fallback = self._urgency_fallback(policies, context, goals=goals)
             if record_trace:
@@ -451,11 +500,14 @@ class PolicyGenerator:
                 )
             return fallback
 
-        parsed_response = self._parse_full_response(response_text)
         rationale = parsed_response.get("rationale", self._extract_rationale(response_text))
         reasoning = parsed_response.get("reasoning", "")
         drive_conflict = parsed_response.get("drive_conflict_detected", False)
         confidence = parsed_response.get("confidence")
+        if generated_plan is not None:
+            self._store_active_plan(generated_plan, step=step)
+            selected = dict(selected)
+            selected["_llm_plan"] = generated_plan
 
         if record_trace:
             self._write_arbitration_trace(
@@ -488,6 +540,7 @@ class PolicyGenerator:
                         else []
                     ),
                     "skill_plan": skill_plan,
+                    "llm_plan": generated_plan,
                     "candidate_policy_ids": [p.get("policy_id") for p in policies],
                     "gate_reasons": reasons,
                     "async": not record_trace,
@@ -564,6 +617,7 @@ class PolicyGenerator:
     def _pending_llm_policy(
         self,
         policies: List[Dict[str, Any]],
+        context: Optional[Mapping[str, Any]] = None,
     ) -> Optional[Dict[str, Any]]:
         with self._llm_state_lock:
             pending = dict(self._pending_llm_result) if isinstance(self._pending_llm_result, Mapping) else None
@@ -572,7 +626,16 @@ class PolicyGenerator:
         policy_id = pending.get("policy_id")
         if not isinstance(policy_id, str) or not policy_id.strip():
             return None
-        return self._find_policy_by_id(policies, policy_id.strip())
+        selected = self._find_policy_by_id(policies, policy_id.strip())
+        if selected is None:
+            return None
+        pending_plan = pending.get("_llm_plan") or pending.get("plan")
+        if isinstance(pending_plan, Mapping):
+            step = context.get("step") if isinstance(context, Mapping) else None
+            self._store_active_plan(dict(pending_plan), step=step)
+            selected = dict(selected)
+            selected["_llm_plan"] = dict(pending_plan)
+        return selected
 
     def _should_call_llm(
         self,
@@ -590,19 +653,66 @@ class PolicyGenerator:
             step = int(step_raw)
         except (TypeError, ValueError):
             step = 0
+        active_plan = self._get_active_plan()
+        plan_window_elapsed = self._active_plan_window_elapsed(
+            active_plan=active_plan,
+            context=context,
+            step=step,
+        )
+        plan_stalled = self._active_plan_stalled(
+            active_plan=active_plan,
+            context=context,
+            step=step,
+        )
+        triggered_interrupts = self._triggered_interrupt_conditions(
+            active_plan=active_plan,
+            context=context,
+            step=step,
+        )
         periodic = (step % self.llm_reeval_interval) == 0
+        if active_plan is not None and not plan_window_elapsed and not triggered_interrupts:
+            periodic = False
 
         goals_fingerprint = self._goals_fingerprint(goals)
         goal_changed = goals_fingerprint != self._last_goals_fingerprint
 
         urgent_reasons: List[str] = []
         non_urgent_reasons: List[str] = []
+        if self._has_irreversible_emergency(context.get("allostatic_assessment")):
+            urgent_reasons.append("irreversible_plan_preemption")
         if drive_conflict:
             urgent_reasons.append("drive_conflict")
         if pe_high:
             urgent_reasons.append("sustained_high_prediction_error")
         if skill_gap:
             urgent_reasons.append("skill_gap")
+        if plan_stalled:
+            urgent_reasons.append("plan_stall_zero_displacement")
+        if plan_window_elapsed:
+            if self._plan_window_elapsed_nonurgent_streak >= self.plan_window_escalation_streak:
+                urgent_reasons.append("plan_window_elapsed_escalated")
+            else:
+                non_urgent_reasons.append("plan_window_elapsed")
+        for reason in triggered_interrupts:
+            if self._interrupt_reason_is_urgent(reason):
+                urgent_reasons.append(f"plan_interrupt:{reason}")
+            else:
+                non_urgent_reasons.append(f"plan_interrupt:{reason}")
+        if active_plan is not None:
+            if plan_stalled:
+                self._set_active_plan_status(
+                    active_plan=active_plan,
+                    status="suspended",
+                    step=step,
+                    reason="zero_displacement_stall",
+                )
+            elif triggered_interrupts:
+                self._set_active_plan_status(
+                    active_plan=active_plan,
+                    status="suspended",
+                    step=step,
+                    reason=";".join(triggered_interrupts),
+                )
         if periodic:
             # Periodic reeval is urgent (synchronous) when the skill plan is
             # exhausted (remaining_count == 0 or head is None).  An exhausted
@@ -646,6 +756,10 @@ class PolicyGenerator:
             "drive_conflict": drive_conflict,
             "pe_high": pe_high,
             "skill_gap": skill_gap,
+            "active_plan": active_plan,
+            "plan_window_elapsed": plan_window_elapsed,
+            "plan_stalled": plan_stalled,
+            "plan_interrupts": triggered_interrupts,
             "periodic": periodic,
             "goal_changed": goal_changed,
         }
@@ -787,17 +901,24 @@ class PolicyGenerator:
         system_prompt = (
             "You are an active inference arbitration system under the free energy principle.\n"
             "Select the action that minimizes expected free energy by reducing homeostatic deficits while managing epistemic uncertainty.\n"
-            "Reason only from the provided drive states and policy descriptors.\n"
+            "Reason only from the provided drive states, observation context, learning context, and policy descriptors.\n"
             "Do not use prior knowledge about what any action physically does in the world.\n"
             "When a skill plan is provided, prefer the plan head unless an irreversible drive is in emergency.\n"
+            "Window guidance: movement/exploration phases should usually use window_size >= 20 (often 20-60).\n"
+            "Use window_size < 20 only for high-confidence goal-completion or safety-critical phases.\n"
             "Output only valid JSON with this schema:\n"
-            '{"reasoning": "<step-by-step chain of thought: identify which drives are most urgent, '
-            "explain any conflicts between drives, evaluate each candidate policy against the drive state, "
-            'and justify your final selection>", '
-            '"selected_index": <int>, '
-            '"rationale": "<one-sentence summary of the decision>", '
-            '"drive_conflict_detected": <bool>, '
-            '"confidence": <float 0-1>}'
+            "{"
+            '"reasoning": "<brief reasoning>", '
+            '"rationale": "<one-sentence summary>", '
+            '"confidence": <float 0-1>, '
+            '"window_size": <int recommended max plan window>, '
+            '"interrupt_conditions": ["<condition string>", "..."], '
+            '"phases": ['
+            '{"action": "<policy_id or policy index>", "until": "<termination condition>", "max_steps": <optional int>}'
+            "]"
+            "}\n"
+            "Use at most 5 phases. Each phase should specify an action and a termination condition.\n"
+            "Backward compatibility: include selected_index if you cannot produce phases."
         )
 
         drive_signals = self._resolve_drive_signals(context.get("drive_signals"))
@@ -1009,6 +1130,42 @@ class PolicyGenerator:
             lines.append("zero_reward_streak: 0")
             lines.append("no_progress_streak: 0")
 
+        position_delta = self._transition_position_delta(transitions)
+        if position_delta is not None:
+            lines.append(f"position_delta_blocks: {position_delta:.2f}")
+            lines.append(f"position_changed_meaningfully: {position_delta >= 3.0}")
+        else:
+            lines.append("position_delta_blocks: null")
+            lines.append("position_changed_meaningfully: false")
+
+        plan_snapshot = self._latest_plan_payload()
+        if isinstance(plan_snapshot, Mapping):
+            lines.append("plan_summary.present: true")
+            lines.append(f"plan_summary.status: {plan_snapshot.get('status')}")
+            lines.append(f"plan_summary.window_size: {plan_snapshot.get('window_size')}")
+            lines.append(f"plan_summary.current_phase_index: {plan_snapshot.get('current_phase_index')}")
+            history = plan_snapshot.get("history")
+            if isinstance(history, list) and history:
+                lines.append(f"plan_summary.history_events: {len(history)}")
+                recent_events = history[-3:]
+                for index, event in enumerate(recent_events):
+                    if not isinstance(event, Mapping):
+                        continue
+                    lines.append(
+                        "plan_event[{}]: event={}, phase_index={}, reason={}, step={}, world_facts={}".format(
+                            index,
+                            event.get("event"),
+                            event.get("phase_index"),
+                            event.get("reason"),
+                            event.get("step"),
+                            self._serialize_for_prompt(event.get("world_facts")),
+                        )
+                    )
+            else:
+                lines.append("plan_summary.history_events: 0")
+        else:
+            lines.append("plan_summary.present: false")
+
         pe_records = self._recent_prediction_error_records(limit=window)
         lines.append(f"prediction_error_window: {window}")
         lines.append(f"prediction_errors_found: {len(pe_records)}")
@@ -1076,6 +1233,72 @@ class PolicyGenerator:
             out.append(row)
         return out
 
+    def _latest_plan_payload(self) -> Optional[Dict[str, Any]]:
+        getter = getattr(self.memory_manager, "get_recent", None)
+        if not callable(getter):
+            return None
+        try:
+            entries = getter(1, entry_type="active_plan")
+        except TypeError:
+            try:
+                entries = getter(1)
+            except Exception:
+                return None
+        except Exception:
+            return None
+        if not isinstance(entries, list) or not entries:
+            return None
+        entry = entries[0]
+        payload = getattr(entry, "payload", None)
+        if isinstance(entry, Mapping):
+            payload = entry.get("payload", payload)
+        if not isinstance(payload, Mapping):
+            return None
+        return dict(payload)
+
+    def _transition_position_delta(self, transitions: List[Mapping[str, Any]]) -> Optional[float]:
+        if not transitions:
+            return None
+        earliest = transitions[-1]
+        latest = transitions[0]
+        start_position = self._extract_position(earliest.get("prev_facts"))
+        end_position = self._extract_position(latest.get("next_facts"))
+        if start_position is None or end_position is None:
+            return None
+        dx = float(end_position[0] - start_position[0])
+        dz = float(end_position[1] - start_position[1])
+        return (dx**2 + dz**2) ** 0.5
+
+    def _extract_position(self, facts: Any) -> Optional[tuple[float, float]]:
+        if not isinstance(facts, Mapping):
+            return None
+        position = facts.get("position")
+        if not isinstance(position, Mapping):
+            return None
+        x = position.get("x")
+        z = position.get("z")
+        if not isinstance(x, (int, float)) or not isinstance(z, (int, float)):
+            return None
+        return float(x), float(z)
+
+    def _compact_world_facts(self, world_facts: Any) -> Dict[str, Any]:
+        if not isinstance(world_facts, Mapping):
+            return {}
+        position = world_facts.get("position")
+        position_map = dict(position) if isinstance(position, Mapping) else {}
+        return {
+            "biome": world_facts.get("biome"),
+            "position": {
+                "x": position_map.get("x"),
+                "y": position_map.get("y"),
+                "z": position_map.get("z"),
+            },
+            "nearby_crafting_table": world_facts.get("nearby_crafting_table"),
+            "nearby_cow": world_facts.get("nearby_cow"),
+            "has_bucket": world_facts.get("has_bucket"),
+            "bucket_count": world_facts.get("bucket_count"),
+        }
+
     def _recent_prediction_error_records(self, *, limit: int) -> List[Dict[str, Any]]:
         query_prediction_errors = getattr(self.memory_manager, "query_prediction_errors", None)
         if callable(query_prediction_errors):
@@ -1126,6 +1349,683 @@ class PolicyGenerator:
                     return True
         return False
 
+    def _select_policy_and_plan_from_response(
+        self,
+        *,
+        parsed_response: Mapping[str, Any],
+        raw_response: str,
+        policies: List[Dict[str, Any]],
+        context: Mapping[str, Any],
+    ) -> tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
+        plan = self._normalize_plan_from_response(
+            payload=parsed_response,
+            policies=policies,
+            context=context,
+        )
+        if plan is not None:
+            phases = plan.get("phases")
+            if isinstance(phases, list) and phases:
+                first_phase = phases[0]
+                if isinstance(first_phase, Mapping):
+                    policy_id = first_phase.get("policy_id")
+                    if isinstance(policy_id, str) and policy_id.strip():
+                        selected = self._find_policy_by_id(policies, policy_id.strip())
+                        if selected is not None:
+                            return selected, plan
+
+        selected = self._parse_arbitration_response(raw_response, policies)
+        if selected is None:
+            return None, None
+
+        fallback_plan = self._build_default_plan(
+            selected_policy_id=str(selected.get("policy_id") or ""),
+            payload=parsed_response,
+            context=context,
+        )
+        return selected, fallback_plan
+
+    def _normalize_plan_from_response(
+        self,
+        *,
+        payload: Mapping[str, Any],
+        policies: List[Dict[str, Any]],
+        context: Mapping[str, Any],
+    ) -> Optional[Dict[str, Any]]:
+        raw_phases = payload.get("phases")
+        if not isinstance(raw_phases, list) or not raw_phases:
+            return None
+
+        phases: List[Dict[str, Any]] = []
+        for index, raw_phase in enumerate(raw_phases[: self.plan_max_phases]):
+            if not isinstance(raw_phase, Mapping):
+                continue
+            policy_id = self._resolve_phase_policy_id(raw_phase.get("action"), policies)
+            if policy_id is None:
+                policy_id = self._resolve_phase_policy_id(raw_phase.get("policy_id"), policies)
+            if policy_id is None:
+                policy_id = self._resolve_phase_policy_id(raw_phase.get("selected_index"), policies)
+            if policy_id is None:
+                continue
+            until_raw = raw_phase.get("until")
+            until = str(until_raw).strip() if until_raw is not None else ""
+            max_steps = self._coerce_positive_int(raw_phase.get("max_steps"))
+            phases.append(
+                {
+                    "phase_index": index,
+                    "policy_id": policy_id,
+                    "until": until,
+                    "max_steps": max_steps,
+                }
+            )
+
+        if not phases:
+            return None
+
+        return self._build_plan_payload(
+            phases=phases,
+            payload=payload,
+            context=context,
+        )
+
+    def _build_default_plan(
+        self,
+        *,
+        selected_policy_id: str,
+        payload: Mapping[str, Any],
+        context: Mapping[str, Any],
+    ) -> Optional[Dict[str, Any]]:
+        if not selected_policy_id:
+            return None
+        phases = [
+            {
+                "phase_index": 0,
+                "policy_id": selected_policy_id,
+                "until": "",
+                "max_steps": None,
+            }
+        ]
+        return self._build_plan_payload(
+            phases=phases,
+            payload=payload,
+            context=context,
+        )
+
+    def _build_plan_payload(
+        self,
+        *,
+        phases: List[Dict[str, Any]],
+        payload: Mapping[str, Any],
+        context: Mapping[str, Any],
+    ) -> Dict[str, Any]:
+        step_raw = context.get("step", 0)
+        step = self._coerce_non_negative_int(step_raw) or 0
+        requested_window = self._coerce_positive_int(payload.get("window_size"))
+        window_size = requested_window if requested_window is not None else self.plan_default_window_size
+        window_floor = self._minimum_window_for_phases(phases)
+        window_size = max(window_floor, min(self.plan_max_window_size, int(window_size)))
+        initial_plan_x = self._current_world_x(context)
+        initial_plan_z = self._current_world_z(context)
+
+        interrupt_conditions: List[str] = []
+        raw_interrupts = payload.get("interrupt_conditions")
+        if isinstance(raw_interrupts, list):
+            for item in raw_interrupts:
+                if isinstance(item, str) and item.strip():
+                    interrupt_conditions.append(item.strip())
+                elif isinstance(item, Mapping):
+                    condition = item.get("condition")
+                    if isinstance(condition, str) and condition.strip():
+                        interrupt_conditions.append(condition.strip())
+
+        return {
+            "plan_id": f"plan_{uuid.uuid4().hex[:8]}",
+            "status": "active",
+            "created_step": step,
+            "window_size": window_size,
+            "window_expires_step": step + window_size,
+            "window_minimum_applied": window_floor,
+            "interrupt_conditions": interrupt_conditions,
+            "phases": phases,
+            "current_phase_index": 0,
+            "phase_started_step": step,
+            "initial_plan_x": initial_plan_x,
+            "initial_plan_z": initial_plan_z,
+            "confidence": payload.get("confidence"),
+            "rationale": payload.get("rationale"),
+            "history": [],
+        }
+
+    def _resolve_phase_policy_id(
+        self,
+        value: Any,
+        policies: List[Dict[str, Any]],
+    ) -> Optional[str]:
+        if isinstance(value, str):
+            text = value.strip()
+            if not text:
+                return None
+            for policy in policies:
+                policy_id = str(policy.get("policy_id") or "").strip()
+                if not policy_id:
+                    continue
+                if text == policy_id:
+                    return policy_id
+            index = self._coerce_index(text)
+            if isinstance(index, int) and 0 <= index < len(policies):
+                return str(policies[index].get("policy_id") or "").strip() or None
+            return None
+        index = self._coerce_index(value)
+        if isinstance(index, int) and 0 <= index < len(policies):
+            return str(policies[index].get("policy_id") or "").strip() or None
+        return None
+
+    def _store_active_plan(self, active_plan: Mapping[str, Any], step: Any) -> None:
+        if not isinstance(active_plan, Mapping):
+            return
+        payload = dict(active_plan)
+        normalized_step = self._coerce_non_negative_int(step)
+        if normalized_step is None:
+            normalized_step = self._coerce_non_negative_int(payload.get("created_step")) or 0
+        payload.setdefault("status", "active")
+        payload.setdefault("created_step", normalized_step)
+        payload.setdefault("phase_started_step", normalized_step)
+        payload.setdefault("current_phase_index", 0)
+        payload.setdefault("history", [])
+        self._active_plan_cache = dict(payload) if payload.get("status") == "active" else None
+        self._record_working_entry(
+            step=normalized_step,
+            entry_type="active_plan",
+            payload=payload,
+            priority=0.85,
+        )
+
+    def _set_active_plan_status(
+        self,
+        *,
+        active_plan: Mapping[str, Any],
+        status: str,
+        step: int,
+        reason: str,
+    ) -> None:
+        if not isinstance(active_plan, Mapping):
+            return
+        payload = dict(active_plan)
+        payload["status"] = str(status)
+        payload["status_reason"] = str(reason)
+        history = payload.get("history")
+        if isinstance(history, list):
+            events = list(history)
+        else:
+            events = []
+        events.append(
+            {
+                "event": "status_change",
+                "step": int(step),
+                "status": str(status),
+                "reason": str(reason),
+            }
+        )
+        payload["history"] = events[-50:]
+        self._active_plan_cache = dict(payload) if payload.get("status") == "active" else None
+        self._record_working_entry(
+            step=int(step),
+            entry_type="active_plan",
+            payload=payload,
+            priority=0.85,
+        )
+
+    def _get_active_plan(self) -> Optional[Dict[str, Any]]:
+        if isinstance(self._active_plan_cache, Mapping):
+            return dict(self._active_plan_cache)
+        getter = getattr(self.memory_manager, "get_recent", None)
+        if not callable(getter):
+            return None
+        try:
+            recent = getter(1, entry_type="active_plan")
+        except TypeError:
+            try:
+                recent = getter(1)
+            except Exception:
+                return None
+        except Exception:
+            return None
+        if not isinstance(recent, list) or not recent:
+            return None
+        entry = recent[0]
+        payload = getattr(entry, "payload", None)
+        if isinstance(entry, Mapping):
+            payload = entry.get("payload", payload)
+        if not isinstance(payload, Mapping):
+            return None
+        plan = dict(payload)
+        if str(plan.get("status") or "active") != "active":
+            return None
+        self._active_plan_cache = dict(plan)
+        return plan
+
+    def _record_working_entry(
+        self,
+        *,
+        step: int,
+        entry_type: str,
+        payload: Mapping[str, Any],
+        priority: float,
+    ) -> None:
+        recorder = getattr(self.memory_manager, "record_working", None)
+        if not callable(recorder):
+            return
+        try:
+            recorder(
+                WorkingMemoryEntry(
+                    tick=int(step),
+                    entry_type=str(entry_type),
+                    payload=dict(payload),
+                    priority=float(priority),
+                )
+            )
+        except Exception:
+            return
+
+    def _select_policy_from_active_plan(
+        self,
+        *,
+        policies: List[Dict[str, Any]],
+        context: Mapping[str, Any],
+    ) -> Optional[Dict[str, Any]]:
+        active_plan = self._get_active_plan()
+        if active_plan is None:
+            return None
+        step = context.get("step", 0)
+        step_i = int(step) if isinstance(step, int) else 0
+
+        if self._active_plan_window_elapsed(active_plan=active_plan, context=context, step=step_i):
+            self._set_active_plan_status(
+                active_plan=active_plan,
+                status="expired",
+                step=step_i,
+                reason="window_elapsed",
+            )
+            return None
+
+        interrupts = self._triggered_interrupt_conditions(
+            active_plan=active_plan,
+            context=context,
+            step=step_i,
+        )
+        if interrupts:
+            self._set_active_plan_status(
+                active_plan=active_plan,
+                status="suspended",
+                step=step_i,
+                reason=";".join(interrupts),
+            )
+            return None
+
+        phases = active_plan.get("phases")
+        if not isinstance(phases, list) or not phases:
+            self._set_active_plan_status(
+                active_plan=active_plan,
+                status="suspended",
+                step=step_i,
+                reason="no_phases",
+            )
+            return None
+
+        current_index = self._coerce_non_negative_int(active_plan.get("current_phase_index")) or 0
+        current_index = max(0, min(len(phases) - 1, current_index))
+        phase = phases[current_index]
+        if not isinstance(phase, Mapping):
+            return None
+        phase_started = self._coerce_non_negative_int(active_plan.get("phase_started_step"))
+        if phase_started is None:
+            phase_started = self._coerce_non_negative_int(active_plan.get("created_step")) or step_i
+        steps_elapsed = max(0, step_i - phase_started)
+
+        should_terminate, reason = self._phase_should_terminate(
+            phase=phase,
+            context=context,
+            steps_elapsed=steps_elapsed,
+        )
+        if should_terminate:
+            if current_index + 1 < len(phases):
+                active_plan = dict(active_plan)
+                active_plan["current_phase_index"] = current_index + 1
+                active_plan["phase_started_step"] = step_i
+                history = list(active_plan.get("history") or [])
+                history.append(
+                    {
+                        "event": "phase_terminated",
+                        "phase_index": current_index,
+                        "reason": reason,
+                        "step": step_i,
+                        "world_facts": self._compact_world_facts(context.get("world_facts")),
+                    }
+                )
+                active_plan["history"] = history[-50:]
+                self._store_active_plan(active_plan, step=step_i)
+                phase = phases[current_index + 1]
+            else:
+                self._set_active_plan_status(
+                    active_plan=active_plan,
+                    status="completed",
+                    step=step_i,
+                    reason=reason,
+                )
+                return None
+
+        if not isinstance(phase, Mapping):
+            return None
+        policy_id = phase.get("policy_id")
+        if not isinstance(policy_id, str) or not policy_id.strip():
+            return None
+        return self._find_policy_by_id(policies, policy_id.strip())
+
+    def _phase_should_terminate(
+        self,
+        *,
+        phase: Mapping[str, Any],
+        context: Mapping[str, Any],
+        steps_elapsed: int,
+    ) -> tuple[bool, str]:
+        max_steps = self._coerce_positive_int(phase.get("max_steps"))
+        if isinstance(max_steps, int) and steps_elapsed >= max_steps:
+            return True, "max_steps"
+        condition = phase.get("until")
+        if isinstance(condition, str) and condition.strip():
+            if self._evaluate_condition_expression(condition.strip(), context=context, steps_elapsed=steps_elapsed):
+                return True, f"condition:{condition.strip()}"
+        return False, ""
+
+    def _active_plan_window_elapsed(
+        self,
+        *,
+        active_plan: Optional[Mapping[str, Any]],
+        context: Mapping[str, Any],
+        step: int,
+    ) -> bool:
+        if not isinstance(active_plan, Mapping):
+            return False
+        created_step = self._coerce_non_negative_int(active_plan.get("created_step"))
+        if created_step is None:
+            created_step = step
+        window_size = self._coerce_positive_int(active_plan.get("window_size"))
+        if window_size is None:
+            window_size = self.plan_default_window_size
+        effective_window = self._effective_window_size(window_size=window_size, context=context)
+        return (step - created_step) >= effective_window
+
+    def _active_plan_stalled(
+        self,
+        *,
+        active_plan: Optional[Mapping[str, Any]],
+        context: Mapping[str, Any],
+        step: int,
+    ) -> bool:
+        if not isinstance(active_plan, Mapping):
+            return False
+        created_step = self._coerce_non_negative_int(active_plan.get("created_step"))
+        if created_step is None:
+            created_step = step
+        steps_in_plan = max(0, int(step) - int(created_step))
+        if steps_in_plan <= self.plan_stall_step_threshold:
+            return False
+
+        initial_x = active_plan.get("initial_plan_x")
+        current_x = self._current_world_x(context)
+        if not isinstance(initial_x, (int, float)) or not isinstance(current_x, (int, float)):
+            return False
+        return abs(float(current_x) - float(initial_x)) < float(self.plan_stall_x_threshold)
+
+    def _triggered_interrupt_conditions(
+        self,
+        *,
+        active_plan: Optional[Mapping[str, Any]],
+        context: Mapping[str, Any],
+        step: int,
+    ) -> List[str]:
+        if not isinstance(active_plan, Mapping):
+            return []
+        created_step = self._coerce_non_negative_int(active_plan.get("created_step"))
+        if created_step is None:
+            created_step = step
+        steps_elapsed = max(0, int(step) - created_step)
+
+        raw_conditions = active_plan.get("interrupt_conditions")
+        if not isinstance(raw_conditions, list):
+            return []
+        triggered: List[str] = []
+        for item in raw_conditions:
+            if not isinstance(item, str) or not item.strip():
+                continue
+            condition = item.strip()
+            if self._evaluate_condition_expression(condition, context=context, steps_elapsed=steps_elapsed):
+                triggered.append(condition)
+        return triggered
+
+    def _effective_window_size(self, *, window_size: int, context: Mapping[str, Any]) -> int:
+        base = max(self.plan_min_window_size, min(self.plan_max_window_size, int(window_size)))
+        arousal = 0.0
+        arousal_state = context.get("arousal_valence_state")
+        if isinstance(arousal_state, Mapping):
+            arousal = self._clamp01(self._as_float(arousal_state.get("arousal"), 0.0))
+        if arousal >= 0.8:
+            base = int(round(base * 0.25))
+        elif arousal >= 0.6:
+            base = int(round(base * 0.5))
+        elif arousal <= 0.2:
+            base = int(round(base * 1.5))
+        return max(self.plan_min_window_size, min(self.plan_max_window_size, base))
+
+    def _current_world_x(self, context: Mapping[str, Any]) -> Optional[float]:
+        world_facts = context.get("world_facts")
+        if not isinstance(world_facts, Mapping):
+            return None
+        position = world_facts.get("position")
+        if not isinstance(position, Mapping):
+            return None
+        x = position.get("x")
+        if not isinstance(x, (int, float)):
+            return None
+        return float(x)
+
+    def _current_world_z(self, context: Mapping[str, Any]) -> Optional[float]:
+        world_facts = context.get("world_facts")
+        if not isinstance(world_facts, Mapping):
+            return None
+        position = world_facts.get("position")
+        if not isinstance(position, Mapping):
+            return None
+        z = position.get("z")
+        if not isinstance(z, (int, float)):
+            return None
+        return float(z)
+
+    def _minimum_window_for_phases(self, phases: List[Mapping[str, Any]]) -> int:
+        if phases and all(
+            self._is_movement_policy_id(str(phase.get("policy_id") or ""))
+            for phase in phases
+            if isinstance(phase, Mapping)
+        ):
+            return max(self.plan_min_window_size, self.movement_phase_min_window)
+        return self.plan_min_window_size
+
+    def _is_movement_policy_id(self, policy_id: str) -> bool:
+        tokens = set(self._name_tokens(str(policy_id)))
+        if not tokens:
+            return False
+        movement_tokens = {"move", "forward", "back", "left", "right", "strafe", "sprint", "explore"}
+        return bool(tokens.intersection(movement_tokens))
+
+    def _interrupt_reason_is_urgent(self, condition: str) -> bool:
+        lowered = str(condition or "").strip().lower()
+        return any(token in lowered for token in ("health", "oxygen", "threat", "critical"))
+
+    def _evaluate_condition_expression(
+        self,
+        expression: str,
+        *,
+        context: Mapping[str, Any],
+        steps_elapsed: int,
+    ) -> bool:
+        normalized = str(expression or "").strip()
+        if not normalized:
+            return False
+        variables = self._condition_variables(context=context, steps_elapsed=steps_elapsed)
+        or_parts = re.split(r"\s+\bOR\b\s+|\s*\|\|\s*", normalized, flags=re.IGNORECASE)
+        for or_part in or_parts:
+            and_parts = re.split(r"\s+\bAND\b\s+|\s*&&\s*", or_part, flags=re.IGNORECASE)
+            if and_parts and all(self._evaluate_condition_atom(atom, variables) for atom in and_parts):
+                return True
+        return False
+
+    def _evaluate_condition_atom(self, atom: str, variables: Mapping[str, Any]) -> bool:
+        text = str(atom or "").strip()
+        if not text:
+            return False
+        if text.upper().startswith("NOT "):
+            return not self._evaluate_condition_atom(text[4:], variables)
+        if text.startswith("!"):
+            return not self._evaluate_condition_atom(text[1:], variables)
+
+        match = re.match(r"^([A-Za-z0-9_.]+)\s*(==|!=|<=|>=|<|>)\s*(.+)$", text)
+        if match is None:
+            value = variables.get(text)
+            if isinstance(value, bool):
+                return value
+            if isinstance(value, (int, float)):
+                return float(value) != 0.0
+            return bool(value)
+
+        key, operator, raw_rhs = match.group(1), match.group(2), match.group(3)
+        lhs = variables.get(key)
+        rhs = self._parse_condition_value(raw_rhs, variables)
+        return self._compare_condition_values(lhs, rhs, operator)
+
+    def _parse_condition_value(self, raw: str, variables: Mapping[str, Any]) -> Any:
+        text = str(raw or "").strip()
+        if text.startswith(("'", '"')) and text.endswith(("'", '"')) and len(text) >= 2:
+            return text[1:-1]
+        lowered = text.lower()
+        if lowered == "true":
+            return True
+        if lowered == "false":
+            return False
+        try:
+            return float(text)
+        except (TypeError, ValueError):
+            pass
+        if text in variables:
+            return variables[text]
+        return text
+
+    def _compare_condition_values(self, lhs: Any, rhs: Any, operator: str) -> bool:
+        if isinstance(lhs, bool) or isinstance(rhs, bool):
+            lhs_bool = bool(lhs)
+            rhs_bool = bool(rhs)
+            if operator == "==":
+                return lhs_bool == rhs_bool
+            if operator == "!=":
+                return lhs_bool != rhs_bool
+            return False
+
+        if isinstance(lhs, (int, float)) and isinstance(rhs, (int, float)):
+            left = float(lhs)
+            right = float(rhs)
+            if operator == "==":
+                return left == right
+            if operator == "!=":
+                return left != right
+            if operator == "<":
+                return left < right
+            if operator == "<=":
+                return left <= right
+            if operator == ">":
+                return left > right
+            if operator == ">=":
+                return left >= right
+            return False
+
+        left_text = str(lhs)
+        right_text = str(rhs)
+        if operator == "==":
+            return left_text == right_text
+        if operator == "!=":
+            return left_text != right_text
+        return False
+
+    def _condition_variables(
+        self,
+        *,
+        context: Mapping[str, Any],
+        steps_elapsed: int,
+    ) -> Dict[str, Any]:
+        variables: Dict[str, Any] = {"steps_elapsed": int(max(0, steps_elapsed))}
+
+        world_facts = context.get("world_facts")
+        if isinstance(world_facts, Mapping):
+            for key, value in world_facts.items():
+                if isinstance(value, Mapping):
+                    for sub_key, sub_value in value.items():
+                        variables[f"{key}.{sub_key}"] = sub_value
+                        variables[f"{key}_{sub_key}"] = sub_value
+                else:
+                    variables[str(key)] = value
+            if "nearby_cow" in world_facts:
+                variables["cow_visible"] = bool(world_facts.get("nearby_cow"))
+            if "has_bucket" in world_facts:
+                variables["bucket_acquired"] = bool(world_facts.get("has_bucket"))
+
+        drive_signals = self._resolve_drive_signals(context.get("drive_signals"))
+        for signal in drive_signals:
+            channel_id = signal.get("channel_id")
+            if not isinstance(channel_id, str) or not channel_id.strip():
+                continue
+            key = channel_id.strip().lower()
+            current_value = signal.get("current_value")
+            urgency = signal.get("urgency")
+            if isinstance(current_value, (int, float)):
+                variables[key] = float(current_value)
+            if isinstance(urgency, (int, float)):
+                variables[f"{key}_urgency"] = float(urgency)
+
+        state = context.get("state")
+        homeostasis = getattr(state, "homeostasis", None)
+        if homeostasis is not None:
+            life = getattr(homeostasis, "life", None)
+            food = getattr(homeostasis, "food", None)
+            air = getattr(homeostasis, "air", None)
+            if isinstance(life, (int, float)):
+                variables.setdefault("health", self._clamp01(float(life) / 20.0))
+            if isinstance(food, (int, float)):
+                variables.setdefault("hunger", self._clamp01(float(food) / 20.0))
+            if isinstance(air, (int, float)):
+                variables.setdefault("oxygen", self._clamp01(float(air) / 300.0))
+        return variables
+
+    @staticmethod
+    def _coerce_positive_int(value: Any) -> Optional[int]:
+        if isinstance(value, bool):
+            return None
+        try:
+            out = int(float(value))
+        except (TypeError, ValueError):
+            return None
+        if out <= 0:
+            return None
+        return out
+
+    @staticmethod
+    def _coerce_non_negative_int(value: Any) -> Optional[int]:
+        if isinstance(value, bool):
+            return None
+        try:
+            out = int(float(value))
+        except (TypeError, ValueError):
+            return None
+        if out < 0:
+            return None
+        return out
+
     def _parse_arbitration_response(
         self,
         text: str,
@@ -1174,6 +2074,13 @@ class PolicyGenerator:
         emergency_override = self._has_irreversible_emergency(
             context.get("allostatic_assessment")
         )
+        if not emergency_override:
+            active_plan_selected = self._select_policy_from_active_plan(
+                policies=policies,
+                context=context,
+            )
+            if active_plan_selected is not None:
+                return active_plan_selected
         planned_policy_id: Optional[str] = None
         if skill_plan and not emergency_override:
             raw_head = skill_plan.get("head_policy_id")

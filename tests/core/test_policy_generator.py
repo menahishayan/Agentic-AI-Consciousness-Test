@@ -1013,3 +1013,284 @@ def test_skill_gap_triggers_sync_llm_when_no_matching_policy(tmp_path: Path) -> 
     assert isinstance(proposal, ActionProposal)
     assert proposal.action_id == "dummy:policy_explore"
     assert len(llm_client.requests) == 1
+
+
+def test_llm_plan_is_stored_and_reused_between_calls(tmp_path: Path) -> None:
+    memory_manager = _memory_manager(tmp_path)
+    llm_client = _StaticLLMClient(
+        text=(
+            '{"reasoning":"plan","rationale":"explore first","confidence":0.8,'
+            '"window_size":30,"interrupt_conditions":["health < 0.5"],'
+            '"phases":[{"action":"dummy:policy_explore","until":"cow_visible == true OR steps_elapsed >= 3"},'
+            '{"action":"dummy:policy_seek_food","until":"has_bucket == true"}]}'
+        )
+    )
+    generator = PolicyGenerator(
+        adapter=_DriveAwareAdapter(),
+        adapter_folder="dummy",
+        memory_manager=memory_manager,
+        goal_checker=_NeutralGoalChecker(),
+        prediction_error_calculator=_NeutralPredictionErrorCalculator(),
+        config={},
+        llm_client=llm_client,
+    )
+
+    first = generator.propose_action(
+        goals=[{"goal_id": "task:harvest_milk"}],
+        context={
+            "step": 0,
+            "drive_signals": {"signals": [{"channel_id": "health", "urgency": 0.1, "current_value": 0.9}]},
+            "perceptual_prediction_error": {"aggregate_magnitude": 0.1},
+            "world_facts": {"has_bucket": False, "nearby_cow": False, "position": {"x": 0.0, "z": 0.0}},
+            "arousal_valence_state": {"arousal": 0.2},
+        },
+    )
+    second = generator.propose_action(
+        goals=[{"goal_id": "task:harvest_milk"}],
+        context={
+            "step": 1,
+            "drive_signals": {"signals": [{"channel_id": "health", "urgency": 0.1, "current_value": 0.9}]},
+            "perceptual_prediction_error": {"aggregate_magnitude": 0.1},
+            "world_facts": {"has_bucket": False, "nearby_cow": False, "position": {"x": 1.0, "z": 0.0}},
+            "arousal_valence_state": {"arousal": 0.2},
+        },
+    )
+
+    assert isinstance(first, ActionProposal)
+    assert isinstance(second, ActionProposal)
+    assert first.action_id == "dummy:policy_explore"
+    assert second.action_id == "dummy:policy_explore"
+    assert len(llm_client.requests) == 1
+
+    active_plan_entries = memory_manager.get_recent(1, entry_type="active_plan")
+    assert active_plan_entries
+    assert active_plan_entries[0].payload.get("status") == "active"
+
+
+def test_plan_interrupt_condition_triggers_sync_replan(tmp_path: Path) -> None:
+    memory_manager = _memory_manager(tmp_path)
+    llm_client = _StaticLLMClient(
+        text=(
+            '{"reasoning":"plan","rationale":"explore first","confidence":0.8,'
+            '"window_size":30,"interrupt_conditions":["health < 0.5"],'
+            '"phases":[{"action":"dummy:policy_explore","until":"steps_elapsed >= 5"}]}'
+        )
+    )
+    generator = PolicyGenerator(
+        adapter=_DriveAwareAdapter(),
+        adapter_folder="dummy",
+        memory_manager=memory_manager,
+        goal_checker=_NeutralGoalChecker(),
+        prediction_error_calculator=_NeutralPredictionErrorCalculator(),
+        config={},
+        llm_client=llm_client,
+    )
+
+    first = generator.propose_action(
+        goals=[{"goal_id": "task:harvest_milk"}],
+        context={
+            "step": 0,
+            "drive_signals": {"signals": [{"channel_id": "health", "urgency": 0.1, "current_value": 0.9}]},
+            "perceptual_prediction_error": {"aggregate_magnitude": 0.1},
+            "world_facts": {"has_bucket": False, "nearby_cow": False, "position": {"x": 0.0, "z": 0.0}},
+            "arousal_valence_state": {"arousal": 0.2},
+        },
+    )
+    second = generator.propose_action(
+        goals=[{"goal_id": "task:harvest_milk"}],
+        context={
+            "step": 1,
+            "drive_signals": {"signals": [{"channel_id": "health", "urgency": 0.2, "current_value": 0.4}]},
+            "perceptual_prediction_error": {"aggregate_magnitude": 0.1},
+            "world_facts": {"has_bucket": False, "nearby_cow": False, "position": {"x": 1.0, "z": 0.0}},
+            "arousal_valence_state": {"arousal": 0.2},
+        },
+    )
+
+    assert isinstance(first, ActionProposal)
+    assert isinstance(second, ActionProposal)
+    assert len(llm_client.requests) == 2
+
+
+def test_high_arousal_compresses_plan_window_for_replanning(tmp_path: Path) -> None:
+    memory_manager = _memory_manager(tmp_path)
+    generator = PolicyGenerator(
+        adapter=_DriveAwareAdapter(),
+        adapter_folder="dummy",
+        memory_manager=memory_manager,
+        goal_checker=_NeutralGoalChecker(),
+        prediction_error_calculator=_NeutralPredictionErrorCalculator(),
+        config={},
+    )
+    generator._last_goals_fingerprint = generator._goals_fingerprint([])  # noqa: SLF001
+    generator._store_active_plan(  # noqa: SLF001
+        {
+            "plan_id": "plan_test",
+            "status": "active",
+            "created_step": 0,
+            "window_size": 60,
+            "interrupt_conditions": [],
+            "phases": [
+                {
+                    "phase_index": 0,
+                    "policy_id": "dummy:policy_explore",
+                    "until": "",
+                    "max_steps": None,
+                }
+            ],
+            "current_phase_index": 0,
+            "phase_started_step": 0,
+            "history": [],
+        },
+        step=0,
+    )
+
+    gate = generator._should_call_llm(  # noqa: SLF001
+        policies=generator.discover_policies(),
+        goals=[],
+        context={
+            "step": 20,
+            "drive_signals": {"signals": [{"channel_id": "health", "urgency": 0.1, "current_value": 0.9}]},
+            "arousal_valence_state": {"arousal": 0.9},
+        },
+    )
+
+    assert gate["should_call"] is True
+    assert "plan_window_elapsed" in gate["reasons"]
+
+
+def test_zero_displacement_stall_triggers_urgent_replan(tmp_path: Path) -> None:
+    memory_manager = _memory_manager(tmp_path)
+    generator = PolicyGenerator(
+        adapter=_DriveAwareAdapter(),
+        adapter_folder="dummy",
+        memory_manager=memory_manager,
+        goal_checker=_NeutralGoalChecker(),
+        prediction_error_calculator=_NeutralPredictionErrorCalculator(),
+        config={},
+    )
+    generator._last_goals_fingerprint = generator._goals_fingerprint([])  # noqa: SLF001
+    generator._store_active_plan(  # noqa: SLF001
+        {
+            "plan_id": "plan_stall",
+            "status": "active",
+            "created_step": 0,
+            "window_size": 60,
+            "interrupt_conditions": [],
+            "phases": [{"phase_index": 0, "policy_id": "dummy:policy_explore", "until": ""}],
+            "current_phase_index": 0,
+            "phase_started_step": 0,
+            "initial_plan_x": 10.0,
+            "history": [],
+        },
+        step=0,
+    )
+
+    gate = generator._should_call_llm(  # noqa: SLF001
+        policies=generator.discover_policies(),
+        goals=[],
+        context={
+            "step": 25,
+            "world_facts": {"position": {"x": 10.2, "z": 0.0}},
+            "drive_signals": {"signals": [{"channel_id": "health", "urgency": 0.1, "current_value": 0.9}]},
+        },
+    )
+
+    assert gate["should_call"] is True
+    assert gate["urgent"] is True
+    assert "plan_stall_zero_displacement" in gate["reasons"]
+
+
+def test_plan_window_elapsed_escalates_to_urgent_after_streak(tmp_path: Path) -> None:
+    memory_manager = _memory_manager(tmp_path)
+    generator = PolicyGenerator(
+        adapter=_DriveAwareAdapter(),
+        adapter_folder="dummy",
+        memory_manager=memory_manager,
+        goal_checker=_NeutralGoalChecker(),
+        prediction_error_calculator=_NeutralPredictionErrorCalculator(),
+        config={},
+    )
+    generator._last_goals_fingerprint = generator._goals_fingerprint([])  # noqa: SLF001
+    generator._store_active_plan(  # noqa: SLF001
+        {
+            "plan_id": "plan_window",
+            "status": "active",
+            "created_step": 0,
+            "window_size": 5,
+            "interrupt_conditions": [],
+            "phases": [{"phase_index": 0, "policy_id": "dummy:policy_explore", "until": ""}],
+            "current_phase_index": 0,
+            "phase_started_step": 0,
+            "initial_plan_x": 0.0,
+            "history": [],
+        },
+        step=0,
+    )
+
+    generator._plan_window_elapsed_nonurgent_streak = 2  # noqa: SLF001
+    nonurgent_gate = generator._should_call_llm(  # noqa: SLF001
+        policies=generator.discover_policies(),
+        goals=[],
+        context={
+            "step": 12,
+            "world_facts": {"position": {"x": 3.0, "z": 0.0}},
+            "drive_signals": {"signals": [{"channel_id": "health", "urgency": 0.1, "current_value": 0.9}]},
+        },
+    )
+    assert nonurgent_gate["urgent"] is False
+    assert "plan_window_elapsed" in nonurgent_gate["reasons"]
+
+    generator._plan_window_elapsed_nonurgent_streak = 3  # noqa: SLF001
+    urgent_gate = generator._should_call_llm(  # noqa: SLF001
+        policies=generator.discover_policies(),
+        goals=[],
+        context={
+            "step": 13,
+            "world_facts": {"position": {"x": 3.0, "z": 0.0}},
+            "drive_signals": {"signals": [{"channel_id": "health", "urgency": 0.1, "current_value": 0.9}]},
+        },
+    )
+    assert urgent_gate["urgent"] is True
+    assert "plan_window_elapsed_escalated" in urgent_gate["reasons"]
+
+
+def test_movement_plan_window_is_clamped_and_prompt_has_guidance(tmp_path: Path) -> None:
+    memory_manager = _memory_manager(tmp_path)
+    llm_client = _StaticLLMClient(
+        text=(
+            '{"reasoning":"movement plan","rationale":"explore","confidence":0.7,'
+            '"window_size":5,"interrupt_conditions":[],"phases":['
+            '{"action":"dummy:policy_explore","until":"steps_elapsed >= 30"}]}'
+        )
+    )
+    generator = PolicyGenerator(
+        adapter=_DriveAwareAdapter(),
+        adapter_folder="dummy",
+        memory_manager=memory_manager,
+        goal_checker=_NeutralGoalChecker(),
+        prediction_error_calculator=_NeutralPredictionErrorCalculator(),
+        config={},
+        llm_client=llm_client,
+    )
+
+    proposal = generator.propose_action(
+        goals=[{"goal_id": "task:harvest_milk"}],
+        context={
+            "step": 0,
+            "drive_signals": {"signals": [{"channel_id": "health", "urgency": 0.1, "current_value": 0.9}]},
+            "perceptual_prediction_error": {"aggregate_magnitude": 0.1},
+            "world_facts": {"position": {"x": 0.0, "z": 0.0}, "nearby_cow": False, "has_bucket": False},
+            "arousal_valence_state": {"arousal": 0.2},
+        },
+    )
+
+    assert isinstance(proposal, ActionProposal)
+    assert proposal.action_id == "dummy:policy_explore"
+    assert llm_client.requests
+    system_prompt = llm_client.requests[0].messages[0].content
+    assert "movement/exploration phases should usually use window_size >= 20" in system_prompt
+
+    plan_entries = memory_manager.get_recent(1, entry_type="active_plan")
+    assert plan_entries
+    assert int(plan_entries[0].payload.get("window_size", 0)) >= 20
