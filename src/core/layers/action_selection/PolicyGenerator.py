@@ -39,6 +39,13 @@ class PolicyGenerator:
 
         self.temperature = self._as_float(self.config.get("temperature"), 0.3)
         self.horizon = max(1, int(self._as_float(self.config.get("horizon"), 5.0)))
+        self.skill_plan_bias = max(0.0, self._as_float(self.config.get("skill_plan_bias"), 0.25))
+        self.skill_plan_emergency_threshold = self._clamp01(
+            self._as_float(
+                self.config.get("skill_plan_emergency_urgency_threshold"),
+                0.85,
+            )
+        )
         model_value = self.config.get("model", "claude-sonnet-4-20250514")
         self.model = str(model_value).strip() or "claude-sonnet-4-20250514"
 
@@ -266,6 +273,7 @@ class PolicyGenerator:
         step = context.get("step")
         drive_signals = self._resolve_drive_signals(context.get("drive_signals"))
         allostatic_assessment = context.get("allostatic_assessment")
+        skill_plan = self._resolve_skill_plan(context.get("skill_plan"))
 
         if self.logger is not None:
             self.logger.llm_request(
@@ -278,6 +286,7 @@ class PolicyGenerator:
                     "candidate_policy_ids": [p.get("policy_id") for p in policies],
                     "drive_signals": drive_signals,
                     "allostatic_assessment": allostatic_assessment,
+                    "skill_plan": skill_plan,
                 },
                 step=step,
             )
@@ -377,6 +386,7 @@ class PolicyGenerator:
                         if isinstance(allostatic_assessment, Mapping)
                         else []
                     ),
+                    "skill_plan": skill_plan,
                     "candidate_policy_ids": [p.get("policy_id") for p in policies],
                 },
                 step=step,
@@ -395,6 +405,7 @@ class PolicyGenerator:
             "Select the action that minimizes expected free energy by reducing homeostatic deficits while managing epistemic uncertainty.\n"
             "Reason only from the provided drive states and policy descriptors.\n"
             "Do not use prior knowledge about what any action physically does in the world.\n"
+            "When a skill plan is provided, prefer the plan head unless an irreversible drive is in emergency.\n"
             "Output only valid JSON with this schema:\n"
             '{"reasoning": "<step-by-step chain of thought: identify which drives are most urgent, '
             "explain any conflicts between drives, evaluate each candidate policy against the drive state, "
@@ -407,6 +418,7 @@ class PolicyGenerator:
 
         drive_signals = self._resolve_drive_signals(context.get("drive_signals"))
         allostatic_assessment = context.get("allostatic_assessment")
+        skill_plan = self._resolve_skill_plan(context.get("skill_plan"))
 
         drive_lines: List[str] = [
             "DRIVE STATE",
@@ -450,6 +462,21 @@ class PolicyGenerator:
                 drive_lines.append("exploration_weight: null")
         else:
             drive_lines.append("allostatic_assessment.present: false")
+
+        drive_lines.append(f"skill_plan.present: {bool(skill_plan)}")
+        if skill_plan:
+            drive_lines.append(
+                f"skill_plan.head_policy_id: {skill_plan.get('head_policy_id')}"
+            )
+            drive_lines.append(
+                f"skill_plan.remaining_count: {skill_plan.get('remaining_count')}"
+            )
+            drive_lines.append(
+                f"skill_plan.remaining_policy_ids: {self._serialize_for_prompt(skill_plan.get('remaining_policy_ids'))}"
+            )
+            drive_lines.append(
+                f"skill_plan.metadata: {self._serialize_for_prompt(skill_plan.get('metadata'))}"
+            )
 
         policy_lines: List[str] = ["CANDIDATE POLICIES"]
         for index, policy in enumerate(policies):
@@ -560,8 +587,22 @@ class PolicyGenerator:
         if not policies:
             return None
 
+        skill_plan = self._resolve_skill_plan(context.get("skill_plan"))
+        emergency_override = self._has_irreversible_emergency(
+            context.get("allostatic_assessment")
+        )
+        planned_policy_id: Optional[str] = None
+        if skill_plan and not emergency_override:
+            raw_head = skill_plan.get("head_policy_id")
+            if isinstance(raw_head, str) and raw_head.strip():
+                planned_policy_id = raw_head.strip()
+
         drive_signals = self._resolve_drive_signals(context.get("drive_signals"))
         if not drive_signals:
+            if planned_policy_id:
+                planned = self._find_policy_by_id(policies, planned_policy_id)
+                if planned is not None:
+                    return planned
             return policies[0]
 
         urgency_by_channel: Dict[str, float] = {}
@@ -579,15 +620,22 @@ class PolicyGenerator:
             urgency_by_channel[channel_key] = max(urgency, urgency_by_channel.get(channel_key, 0.0))
 
         if not urgency_by_channel:
+            if planned_policy_id:
+                planned = self._find_policy_by_id(policies, planned_policy_id)
+                if planned is not None:
+                    return planned
             return policies[0]
 
         best_index = 0
         best_score = -1.0
         for index, policy in enumerate(policies):
+            policy_id = str(policy.get("policy_id") or "").strip()
             drive_tags = self._normalize_tags(policy.get("drive_tags"))
             score = 0.0
             for tag in drive_tags:
                 score = max(score, urgency_by_channel.get(tag, 0.0))
+            if planned_policy_id and policy_id == planned_policy_id:
+                score += self.skill_plan_bias
             if score > best_score:
                 best_score = score
                 best_index = index
@@ -715,6 +763,43 @@ class PolicyGenerator:
             if hasattr(item, "__dict__"):
                 out.append(dict(vars(item)))
         return out
+
+    @staticmethod
+    def _resolve_skill_plan(skill_plan: Any) -> Dict[str, Any]:
+        if isinstance(skill_plan, Mapping):
+            return dict(skill_plan)
+        if hasattr(skill_plan, "__dict__"):
+            mapped = vars(skill_plan)
+            if isinstance(mapped, Mapping):
+                return dict(mapped)
+        return {}
+
+    @staticmethod
+    def _find_policy_by_id(
+        policies: List[Dict[str, Any]],
+        policy_id: str,
+    ) -> Optional[Dict[str, Any]]:
+        for policy in policies:
+            candidate = str(policy.get("policy_id") or "").strip()
+            if candidate and candidate == policy_id:
+                return policy
+        return None
+
+    def _has_irreversible_emergency(self, allostatic_assessment: Any) -> bool:
+        if not isinstance(allostatic_assessment, Mapping):
+            return False
+        needs = allostatic_assessment.get("needs")
+        if not isinstance(needs, list):
+            return False
+        for need in needs:
+            if not isinstance(need, Mapping):
+                continue
+            if need.get("irreversible") is not True:
+                continue
+            urgency = need.get("urgency")
+            if isinstance(urgency, (int, float)) and self._clamp01(float(urgency)) >= self.skill_plan_emergency_threshold:
+                return True
+        return False
 
     def _infer_drive_tags(self, tags: List[str], descriptor_texts: List[str]) -> List[str]:
         candidates: List[str] = []

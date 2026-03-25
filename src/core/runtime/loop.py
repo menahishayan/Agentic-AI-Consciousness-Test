@@ -41,7 +41,7 @@ class AgentLoop:
         "health": {"heal", "retreat", "defend", "protect", "shield"},
         "hunger": {"eat", "collect", "cook", "food", "harvest"},
         "oxygen": {"surface", "ascend", "air", "breath"},
-        "resource_level": {"gather", "mine", "craft", "smelt"},
+        "resource_level": {"gather", "mine", "craft", "smelt", "harvest", "interact"},
         "safety": {"retreat", "avoid", "shelter", "escape"},
     }
 
@@ -84,7 +84,7 @@ class AgentLoop:
         self.vital_state_monitor = VitalStateMonitor(
             expected_vitals=self._load_available_vitals(adapter),
         )
-        self._drive_channels = self._build_drive_channels(allostatic_cfg)
+        self._drive_channels = self._resolve_drive_channels(adapter, allostatic_cfg)
         self._drive_channel_map = {channel.id: channel for channel in self._drive_channels}
         self._allostatic_config = self._build_allostatic_config(allostatic_cfg)
         self._homeostatic_history: Deque[DriveState] = deque(
@@ -178,7 +178,9 @@ class AgentLoop:
 
         self._record_vital_state(step=step, phase="pre_action")
         workspace_messages = self.workspace.broadcast()
-        goals = self._extract_goals(workspace_messages)
+        workspace_goals = self._extract_goals(workspace_messages)
+        adapter_goals = self._get_adapter_task_goals()
+        goals = self._merge_goals(workspace_goals, adapter_goals)
 
         homeostatic_state = self._build_homeostatic_state(
             step=step,
@@ -294,6 +296,9 @@ class AgentLoop:
             "drive_signals": asdict(drive_signals),
             "arousal_valence_state": arousal_payload,
         }
+        skill_plan = self._get_adapter_skill_plan(goals=goals, context=policy_context)
+        if skill_plan is not None:
+            policy_context["skill_plan"] = skill_plan
         action_proposal = self.policy_generator.propose_action(
             goals=goals,
             context=policy_context,
@@ -303,6 +308,12 @@ class AgentLoop:
         selected_policy_id = (
             action_proposal.action_id if isinstance(action_proposal, ActionProposal) else None
         )
+        if selected_policy_id:
+            self._notify_adapter_policy_selected(
+                policy_id=selected_policy_id,
+                goals=goals,
+                context=policy_context,
+            )
 
         obs, reward, done, info = self.adapter.step(action)
         self._last_obs = obs
@@ -396,6 +407,86 @@ class AgentLoop:
                     goals.extend(payload_goals)
         return goals
 
+    def _get_adapter_task_goals(self) -> List[Any]:
+        getter = getattr(self.adapter, "get_task_goals", None)
+        if not callable(getter):
+            return []
+        try:
+            raw = getter()
+        except Exception:
+            return []
+        if isinstance(raw, list):
+            return list(raw)
+        if raw is None:
+            return []
+        return [raw]
+
+    def _merge_goals(self, workspace_goals: List[Any], adapter_goals: List[Any]) -> List[Any]:
+        merged: List[Any] = []
+        seen: set[str] = set()
+
+        def _goal_key(goal: Any) -> str:
+            if isinstance(goal, Mapping):
+                candidate = goal.get("goal_id") or goal.get("description") or goal.get("goal")
+            else:
+                candidate = goal
+            return str(candidate or "").strip().lower()
+
+        for goal in list(workspace_goals) + list(adapter_goals):
+            key = _goal_key(goal)
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            merged.append(goal)
+        return merged
+
+    def _get_adapter_skill_plan(
+        self,
+        goals: List[Any],
+        context: Mapping[str, Any],
+    ) -> Optional[Dict[str, Any]]:
+        getter = getattr(self.adapter, "get_skill_plan", None)
+        if not callable(getter):
+            return None
+        try:
+            plan = getter(goals=goals, context=context)
+        except TypeError:
+            try:
+                plan = getter(goals, context)
+            except Exception:
+                return None
+        except Exception:
+            return None
+        if isinstance(plan, Mapping):
+            return dict(plan)
+        return None
+
+    def _notify_adapter_policy_selected(
+        self,
+        policy_id: str,
+        goals: List[Any],
+        context: Mapping[str, Any],
+    ) -> None:
+        notifier = getattr(self.adapter, "notify_policy_selected", None)
+        if not callable(notifier):
+            return
+
+        payload = {
+            "step": context.get("step"),
+            "goals": goals,
+            "skill_plan": context.get("skill_plan"),
+            "allostatic_assessment": context.get("allostatic_assessment"),
+        }
+        try:
+            notifier(policy_id=policy_id, context=payload)
+        except TypeError:
+            try:
+                notifier(policy_id, payload)
+            except Exception:
+                pass
+        except Exception:
+            pass
+
     def _record_vital_state(self, step: int, phase: str) -> None:
         self.memory_manager.snapshot_self_state(
             {
@@ -482,6 +573,7 @@ class AgentLoop:
         for signal in drive_signals.signals:
             need = {
                 "need_id": f"stabilize_{signal.channel_id}",
+                "channel_id": str(signal.channel_id),
                 "urgency": self._clamp01(signal.urgency),
                 "time_to_critical_steps": max(0, int(round(signal.ticks_to_critical))),
                 "actions": [signal.suggested_action_tag] if signal.suggested_action_tag else [],
@@ -491,6 +583,9 @@ class AgentLoop:
                     f"projected={signal.projected_value:.3f}",
                 ],
             }
+            channel = self._drive_channel_map.get(str(signal.channel_id))
+            if channel is not None:
+                need["irreversible"] = bool(channel.irreversible)
             needs.append(need)
             if signal.suggested_action_tag:
                 tags.append(str(signal.suggested_action_tag).strip().lower())
@@ -899,6 +994,49 @@ class AgentLoop:
                 )
             )
         return out or default_channels
+
+    @staticmethod
+    def _resolve_drive_channels(adapter: Any, config: Mapping[str, Any]) -> List[DriveChannel]:
+        getter = getattr(adapter, "get_drive_channels", None)
+        if callable(getter):
+            try:
+                raw_channels = getter()
+                channels = AgentLoop._coerce_drive_channels(raw_channels)
+                if channels:
+                    return channels
+            except Exception:
+                pass
+        return AgentLoop._build_drive_channels(config)
+
+    @staticmethod
+    def _coerce_drive_channels(raw_channels: Any) -> List[DriveChannel]:
+        if not isinstance(raw_channels, list):
+            return []
+        out: List[DriveChannel] = []
+        for item in raw_channels:
+            if isinstance(item, DriveChannel):
+                out.append(item)
+                continue
+            if not isinstance(item, Mapping):
+                continue
+            channel_id = item.get("id")
+            if not isinstance(channel_id, str) or not channel_id.strip():
+                continue
+            out.append(
+                DriveChannel(
+                    id=channel_id.strip(),
+                    setpoint=AgentLoop._clamp(item.get("setpoint", 0.8), 0.0, 1.0),
+                    critical_threshold=AgentLoop._clamp(
+                        item.get("critical_threshold", 0.3),
+                        0.0,
+                        1.0,
+                    ),
+                    irreversible=bool(item.get("irreversible", False)),
+                    recovery_cost_ticks=max(0, int(item.get("recovery_cost_ticks", 20))),
+                    suggested_action_tag=str(item.get("suggested_action_tag", "")).strip(),
+                )
+            )
+        return out
 
     @staticmethod
     def _build_allostatic_config(config: Mapping[str, Any]) -> AllostaticConfig:

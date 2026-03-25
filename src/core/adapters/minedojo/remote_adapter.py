@@ -23,6 +23,14 @@ import struct
 from copy import deepcopy
 from typing import Any, Dict, List, Mapping, Optional, Tuple
 
+from core.adapters.minedojo.task_profiles import (
+    build_skill_plan_queue,
+    drive_channels_for_task,
+    estimate_inventory_score,
+    normalize_task_id,
+    task_goal_payload,
+)
+
 _DEFAULT_HOST = "127.0.0.1"
 _DEFAULT_PORT = 9876
 
@@ -74,12 +82,33 @@ class RemoteMineDojoAdapter:
         "health":         {"heal", "retreat", "defend", "protect", "shield", "escape"},
         "hunger":         {"eat", "collect", "cook", "food", "harvest", "fish", "drink"},
         "oxygen":         {"surface", "ascend", "air", "breath"},
-        "resource_level": {"gather", "mine", "craft", "smelt", "chop", "dig"},
+        "resource_level": {
+            "gather",
+            "mine",
+            "craft",
+            "smelt",
+            "chop",
+            "dig",
+            "harvest",
+            "interact",
+            "bucket",
+            "milk",
+        },
         "safety":         {"retreat", "avoid", "shelter", "defend", "escape"},
     }
 
     def __init__(self, config: Optional[Mapping[str, Any]] = None) -> None:
         self._config = dict(config or {})
+        self._task_id = normalize_task_id(self._config.get("task_id", "harvest_milk"))
+        self._task_goal = task_goal_payload(self._task_id)
+        try:
+            self._max_inventory_slots = max(1, int(self._config.get("max_inventory_slots", 36)))
+        except (TypeError, ValueError):
+            self._max_inventory_slots = 36
+        self._skill_plan_queue: List[str] = []
+        self._skill_plan_metadata: List[Dict[str, Any]] = []
+        self._last_skill_plan_signature: Optional[str] = None
+        self._skill_plan_exhausted = False
         host = str(self._config.get("remote_host", _DEFAULT_HOST))
         port = int(self._config.get("remote_port", _DEFAULT_PORT))
 
@@ -111,6 +140,10 @@ class RemoteMineDojoAdapter:
         obs, info = resp["result"]
         self._last_obs = obs
         self._last_info = info if isinstance(info, dict) else {}
+        self._skill_plan_queue = []
+        self._skill_plan_metadata = []
+        self._last_skill_plan_signature = None
+        self._skill_plan_exhausted = False
         return obs, self._last_info
 
     def step(self, action: Any) -> Tuple[Any, float, bool, Dict]:
@@ -152,22 +185,78 @@ class RemoteMineDojoAdapter:
     def get_available_policies(self) -> List[Dict[str, Any]]:
         return deepcopy(self._policies)
 
-    def estimate_resource_level(self, **kwargs: Any) -> float:
-        info = kwargs.get("info") or self._last_info
-        if not isinstance(info, dict):
-            return 0.5
-        inv = info.get("inventory")
-        if inv is None:
-            return 0.5
-        try:
-            total = sum(
-                int(slot.get("quantity", 0))
-                for slot in (inv if isinstance(inv, list) else [])
-                if slot.get("type", "air") != "air"
+    def get_task_goals(self) -> List[Dict[str, Any]]:
+        return [deepcopy(self._task_goal)]
+
+    def get_drive_channels(self) -> List[Any]:
+        return drive_channels_for_task(self._task_id)
+
+    def get_skill_plan(
+        self,
+        goals: Any = None,
+        context: Optional[Mapping[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        _ = context
+        signature = self._skill_plan_signature(goals)
+        should_refresh = False
+        if signature != self._last_skill_plan_signature:
+            should_refresh = True
+        elif self._last_skill_plan_signature is None:
+            should_refresh = True
+        elif not self._skill_plan_queue and not self._skill_plan_exhausted:
+            should_refresh = True
+
+        if should_refresh:
+            queue, metadata = build_skill_plan_queue(
+                task_id=self._task_id,
+                policies=self._policies,
             )
-            return min(1.0, total / 64.0)
-        except Exception:
-            return 0.5
+            self._skill_plan_queue = list(queue)
+            self._skill_plan_metadata = list(metadata)
+            self._last_skill_plan_signature = signature
+            self._skill_plan_exhausted = not bool(self._skill_plan_queue)
+
+        return {
+            "task_id": self._task_id,
+            "head_policy_id": self._skill_plan_queue[0] if self._skill_plan_queue else None,
+            "queue": list(self._skill_plan_queue),
+            "remaining_policy_ids": list(self._skill_plan_queue),
+            "remaining_count": len(self._skill_plan_queue),
+            "metadata": deepcopy(self._skill_plan_metadata),
+        }
+
+    def notify_policy_selected(
+        self,
+        policy_id: Any,
+        context: Optional[Mapping[str, Any]] = None,
+    ) -> None:
+        _ = context
+        selected = str(policy_id or "").strip()
+        if not selected or not self._skill_plan_queue:
+            return
+        if selected != self._skill_plan_queue[0]:
+            return
+        self._skill_plan_queue.pop(0)
+        if not self._skill_plan_queue:
+            self._skill_plan_exhausted = True
+
+    def estimate_resource_level(self, **kwargs: Any) -> float:
+        hunger = kwargs.get("hunger", 0.0)
+        hunger_score = self._clip01(hunger)
+        inventory_state = kwargs.get("inventory_state")
+        if not isinstance(inventory_state, Mapping):
+            info = kwargs.get("info") or self._last_info
+            if isinstance(info, Mapping):
+                inventory_state = {"inventory": info.get("inventory")}
+        if not isinstance(inventory_state, Mapping):
+            return hunger_score
+        inventory_score = estimate_inventory_score(
+            inventory_state,
+            max_slots=self._max_inventory_slots,
+        )
+        if inventory_score is None:
+            return hunger_score
+        return self._clip01(0.6 * float(inventory_score) + 0.4 * hunger_score)
 
     def estimate_threat_proximity(self, **kwargs: Any) -> float:
         info = kwargs.get("info") or self._last_info
@@ -262,13 +351,80 @@ class RemoteMineDojoAdapter:
                 "_action_vector": action_vec,
             })
 
+        self._apply_task_policy_overrides(policies)
         return policies
+
+    def _apply_task_policy_overrides(self, policies: List[Dict[str, Any]]) -> None:
+        if self._task_id != "harvest_milk":
+            return
+
+        interaction_policy_found = False
+        for policy in policies:
+            policy_id = str(policy.get("policy_id") or "").strip().lower()
+            tags = {
+                str(tag).strip().lower()
+                for tag in policy.get("tags", [])
+                if isinstance(tag, str) and tag.strip()
+            }
+            drive_tags = {
+                str(tag).strip().lower()
+                for tag in policy.get("drive_tags", [])
+                if isinstance(tag, str) and tag.strip()
+            }
+
+            if policy_id.endswith(":attack"):
+                drive_tags.discard("resource_level")
+
+            if "use" in tags or "interact" in tags:
+                drive_tags.add("resource_level")
+                interaction_policy_found = True
+
+            policy["drive_tags"] = sorted(drive_tags)
+
+        if interaction_policy_found:
+            return
+
+        for policy in policies:
+            policy_id = str(policy.get("policy_id") or "").strip().lower()
+            if policy_id.endswith(":use"):
+                drive_tags = {
+                    str(tag).strip().lower()
+                    for tag in policy.get("drive_tags", [])
+                    if isinstance(tag, str) and tag.strip()
+                }
+                drive_tags.add("resource_level")
+                policy["drive_tags"] = sorted(drive_tags)
+                break
 
     def get_action_for_policy(self, policy_id: str) -> Optional[List[int]]:
         for p in self._policies:
             if p["policy_id"] == policy_id:
                 return list(p["_action_vector"])
         return None
+
+    @staticmethod
+    def _clip01(value: Any) -> float:
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError):
+            numeric = 0.0
+        return max(0.0, min(1.0, numeric))
+
+    def _skill_plan_signature(self, goals: Any) -> str:
+        goal_tokens: List[str] = []
+        if isinstance(goals, list):
+            for goal in goals:
+                if isinstance(goal, Mapping):
+                    raw = goal.get("goal_id") or goal.get("description") or goal.get("goal")
+                else:
+                    raw = goal
+                token = str(raw or "").strip().lower()
+                if token:
+                    goal_tokens.append(token)
+        elif goals is not None:
+            goal_tokens.append(str(goals).strip().lower())
+        deduped = list(dict.fromkeys(sorted(goal_tokens)))
+        return f"{self._task_id}|{'|'.join(deduped)}"
 
 
 # ---------------------------------------------------------------------------

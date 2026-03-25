@@ -3,11 +3,13 @@ from __future__ import annotations
 from typing import Any, Dict, List, Mapping, Optional
 
 from core.layers.interoceptive import (
+    DriveChannel,
     DriveSignal,
     PrioritisedDriveSignals,
     VitalStateMonitor,
 )
 from core.memory import MemoryManager
+from core.models.signals import ActionProposal
 from core.models.state import AgentState
 from core.runtime.loop import AgentLoop
 
@@ -318,3 +320,146 @@ def test_reward_to_outcome_score_handles_sparse_non_negative_rewards() -> None:
     assert AgentLoop._reward_to_outcome_score(0.0) == 0.0  # noqa: SLF001
     assert AgentLoop._reward_to_outcome_score(0.25) == 0.25  # noqa: SLF001
     assert AgentLoop._reward_to_outcome_score(2.0) == 1.0  # noqa: SLF001
+
+
+def test_adapter_task_goals_are_merged_into_policy_input() -> None:
+    class _TaskGoalAdapter(_DriveAwareDummyAdapter):
+        def get_task_goals(self) -> List[Dict[str, Any]]:
+            return [
+                {
+                    "goal_id": "task:harvest_milk",
+                    "description": "Harvest milk from a cow.",
+                    "priority": 1.0,
+                    "task_id": "harvest_milk",
+                }
+            ]
+
+    class _CapturePolicyGenerator:
+        def __init__(self) -> None:
+            self.last_goals: List[Any] = []
+
+        def propose_action(self, goals: Any, context: Mapping[str, Any]) -> ActionProposal:
+            _ = context
+            self.last_goals = list(goals) if isinstance(goals, list) else [goals]
+            return ActionProposal(action_id="dummy:policy_noop", action="noop")
+
+    loop = AgentLoop(
+        adapter=_TaskGoalAdapter(),
+        observation_mapper=_CountingMapper(),
+        memory_manager=MemoryManager(),
+        adapter_folder="dummy",
+        policy_config={},
+    )
+    capture = _CapturePolicyGenerator()
+    loop.policy_generator = capture
+
+    loop.run_step(0)
+
+    assert any(
+        isinstance(goal, Mapping) and goal.get("goal_id") == "task:harvest_milk"
+        for goal in capture.last_goals
+    )
+
+
+def test_adapter_drive_channels_override_policy_config_channels() -> None:
+    class _AdapterDriveChannels(_DriveAwareDummyAdapter):
+        def get_drive_channels(self) -> List[DriveChannel]:
+            return [
+                DriveChannel(
+                    id="health",
+                    setpoint=0.11,
+                    critical_threshold=0.07,
+                    irreversible=True,
+                    recovery_cost_ticks=5,
+                    suggested_action_tag="heal",
+                )
+            ]
+
+    loop = AgentLoop(
+        adapter=_AdapterDriveChannels(),
+        observation_mapper=_CountingMapper(),
+        memory_manager=MemoryManager(),
+        adapter_folder="dummy",
+        policy_config={
+            "allostatic_controller": {
+                "channels": [
+                    {
+                        "id": "health",
+                        "setpoint": 0.95,
+                        "critical_threshold": 0.2,
+                        "irreversible": True,
+                        "recovery_cost_ticks": 50,
+                        "suggested_action_tag": "retreat",
+                    }
+                ]
+            }
+        },
+    )
+
+    assert len(loop._drive_channels) == 1  # noqa: SLF001
+    assert loop._drive_channels[0].setpoint == 0.11  # noqa: SLF001
+
+
+def test_drive_channels_fallback_to_policy_config_when_adapter_method_missing() -> None:
+    loop = AgentLoop(
+        adapter=_DriveAwareDummyAdapter(),
+        observation_mapper=_CountingMapper(),
+        memory_manager=MemoryManager(),
+        adapter_folder="dummy",
+        policy_config={
+            "allostatic_controller": {
+                "channels": [
+                    {
+                        "id": "health",
+                        "setpoint": 0.42,
+                        "critical_threshold": 0.1,
+                        "irreversible": True,
+                        "recovery_cost_ticks": 7,
+                        "suggested_action_tag": "heal",
+                    }
+                ]
+            }
+        },
+    )
+
+    assert len(loop._drive_channels) == 1  # noqa: SLF001
+    assert loop._drive_channels[0].id == "health"  # noqa: SLF001
+    assert loop._drive_channels[0].setpoint == 0.42  # noqa: SLF001
+
+
+def test_skill_plan_is_injected_and_notified_after_selection() -> None:
+    class _SkillPlanAdapter(_DriveAwareDummyAdapter):
+        def __init__(self) -> None:
+            super().__init__()
+            self.notified: List[str] = []
+
+        def get_skill_plan(self, goals: Any = None, context: Any = None) -> Dict[str, Any]:
+            _ = goals
+            _ = context
+            return {
+                "head_policy_id": "dummy:policy_noop",
+                "remaining_policy_ids": ["dummy:policy_noop"],
+                "remaining_count": 1,
+            }
+
+        def notify_policy_selected(
+            self,
+            policy_id: Any = None,
+            context: Any = None,
+        ) -> None:
+            _ = context
+            self.notified.append(str(policy_id))
+
+    adapter = _SkillPlanAdapter()
+    loop = AgentLoop(
+        adapter=adapter,
+        observation_mapper=_CountingMapper(),
+        memory_manager=MemoryManager(),
+        adapter_folder="dummy",
+        policy_config={},
+    )
+
+    loop.run_step(0)
+
+    assert adapter.notified
+    assert adapter.notified[-1] == "dummy:policy_noop"

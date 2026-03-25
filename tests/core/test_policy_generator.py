@@ -266,3 +266,118 @@ def test_llm_parse_failure_falls_back_to_urgency(tmp_path: Path) -> None:
     assert isinstance(proposal, ActionProposal)
     assert proposal.action_id == "dummy:policy_seek_food"
     assert proposal.action == "food_action"
+
+
+def test_skill_plan_bias_prefers_queue_head_when_not_in_emergency(tmp_path: Path) -> None:
+    memory_manager = _memory_manager(tmp_path)
+    generator = PolicyGenerator(
+        adapter=_DriveAwareAdapter(),
+        adapter_folder="dummy",
+        memory_manager=memory_manager,
+        goal_checker=_NeutralGoalChecker(),
+        prediction_error_calculator=_NeutralPredictionErrorCalculator(),
+        config={"skill_plan_bias": 0.25},
+    )
+
+    proposal = generator.propose_action(
+        goals=[{"goal_id": "task:harvest_milk", "description": "Harvest milk", "priority": 1.0}],
+        context={
+            "step": 6,
+            "skill_plan": {
+                "head_policy_id": "dummy:policy_explore",
+                "remaining_policy_ids": ["dummy:policy_explore", "dummy:policy_seek_food"],
+                "remaining_count": 2,
+            },
+            "allostatic_assessment": {
+                "needs": [
+                    {"need_id": "stabilize_hunger", "urgency": 0.6, "irreversible": False},
+                ]
+            },
+            "drive_signals": {
+                "signals": [
+                    {"channel_id": "hunger", "urgency": 0.60},
+                    {"channel_id": "resource_level", "urgency": 0.55},
+                ],
+            },
+        },
+    )
+
+    assert isinstance(proposal, ActionProposal)
+    assert proposal.action_id == "dummy:policy_explore"
+
+
+def test_skill_plan_bias_is_disabled_by_irreversible_emergency(tmp_path: Path) -> None:
+    memory_manager = _memory_manager(tmp_path)
+    generator = PolicyGenerator(
+        adapter=_DriveAwareAdapter(),
+        adapter_folder="dummy",
+        memory_manager=memory_manager,
+        goal_checker=_NeutralGoalChecker(),
+        prediction_error_calculator=_NeutralPredictionErrorCalculator(),
+        config={
+            "skill_plan_bias": 0.25,
+            "skill_plan_emergency_urgency_threshold": 0.85,
+        },
+    )
+
+    proposal = generator.propose_action(
+        goals=[{"goal_id": "task:harvest_milk", "description": "Harvest milk", "priority": 1.0}],
+        context={
+            "step": 7,
+            "skill_plan": {
+                "head_policy_id": "dummy:policy_explore",
+                "remaining_policy_ids": ["dummy:policy_explore", "dummy:policy_seek_food"],
+                "remaining_count": 2,
+            },
+            "allostatic_assessment": {
+                "needs": [
+                    {"need_id": "stabilize_health", "urgency": 0.9, "irreversible": True},
+                ]
+            },
+            "drive_signals": {
+                "signals": [
+                    {"channel_id": "hunger", "urgency": 0.60},
+                    {"channel_id": "resource_level", "urgency": 0.55},
+                ],
+            },
+        },
+    )
+
+    assert isinstance(proposal, ActionProposal)
+    assert proposal.action_id == "dummy:policy_seek_food"
+
+
+def test_llm_prompt_includes_skill_plan_context(tmp_path: Path) -> None:
+    memory_manager = _memory_manager(tmp_path)
+    llm_client = _StaticLLMClient(
+        text='{"selected_index": 0, "rationale": "follow skill plan", "drive_conflict_detected": false, "confidence": 0.9}'
+    )
+    generator = PolicyGenerator(
+        adapter=_DriveAwareAdapter(),
+        adapter_folder="dummy",
+        memory_manager=memory_manager,
+        goal_checker=_NeutralGoalChecker(),
+        prediction_error_calculator=_NeutralPredictionErrorCalculator(),
+        config={},
+        llm_client=llm_client,
+    )
+
+    proposal = generator.propose_action(
+        goals=[{"goal_id": "task:harvest_milk", "description": "Harvest milk", "priority": 1.0}],
+        context={
+            "step": 8,
+            "skill_plan": {
+                "head_policy_id": "dummy:policy_explore",
+                "remaining_policy_ids": ["dummy:policy_explore", "dummy:policy_seek_food"],
+                "remaining_count": 2,
+                "metadata": [{"phase_index": 0, "intent_tokens": ["milk", "use"]}],
+            },
+            "drive_signals": {"signals": [{"channel_id": "hunger", "urgency": 0.4}]},
+            "allostatic_assessment": {"needs": []},
+        },
+    )
+
+    assert isinstance(proposal, ActionProposal)
+    assert len(llm_client.requests) == 1
+    prompt = llm_client.requests[0].messages[1].content
+    assert "skill_plan.head_policy_id: dummy:policy_explore" in prompt
