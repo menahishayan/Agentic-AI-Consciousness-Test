@@ -182,6 +182,13 @@ JAVA_HOME=... PYTHONPATH=src ./.venv/bin/python -m core.main
     "max_expected_error": 1.0,
     "prediction_error_window": 20,
 
+    // Selective LLM arbitration gate
+    "llm_conflict_threshold": 0.8,
+    "skill_gap_urgency_threshold": 0.8,
+    "pe_high_threshold": 0.7,
+    "pe_streak_threshold": 5,
+    "llm_reeval_interval": 10,
+
     // Allostatic / homeostatic controller
     "allostatic_controller": {
       "planning_horizon": 50,
@@ -209,13 +216,15 @@ JAVA_HOME=... PYTHONPATH=src ./.venv/bin/python -m core.main
       ]
     },
 
-    // Perceptual prediction error (per-feature EMA)
+    // Perceptual prediction error (action-conditional world model + variance normalization)
     "perceptual_prediction_error": {
       "alpha": 0.1,
       "epsilon": 0.01,
       "sigma_clip": 3.0,
       "default_precision": 0.5,
-      "min_precision": 0.3
+      "min_precision": 0.3,
+      "world_model_alpha": 0.1,
+      "action_confidence_threshold": 20
     },
 
     // Working-memory and FAISS retrieval settings

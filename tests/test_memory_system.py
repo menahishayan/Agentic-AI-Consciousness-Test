@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 from types import SimpleNamespace
+from typing import Any, List, Mapping, Optional, Tuple
 
 import numpy as np
 import pytest
@@ -22,6 +24,14 @@ class _PredictionError:
     magnitude: float
     source: str
     tick: int
+
+
+class _CaptureMemoryLogger:
+    def __init__(self) -> None:
+        self.events: List[Tuple[Mapping[str, Any], Optional[int]]] = []
+
+    def memory_event(self, payload: Mapping[str, Any], step: Optional[int] = None) -> None:
+        self.events.append((dict(payload), step))
 
 
 def _state(
@@ -242,3 +252,52 @@ def test_memory_manager_delegates_and_lifecycle_clears_expected_scopes() -> None
     assert manager.get_area_familiarity("zone_a") == pytest.approx(0.0, abs=1e-9)
     assert manager.get_depletion_rate(state, "hunger") is None
     assert manager.get_conflict_resolution_score("hunger", "oxygen", context) == pytest.approx(0.0, abs=1e-9)
+
+
+def test_memory_manager_emits_memory_events_for_core_writes(tmp_path: Path) -> None:
+    logger = _CaptureMemoryLogger()
+    manager = MemoryManager(
+        MemoryConfig(
+            working_memory_capacity=3,
+            pe_min_observations=2,
+            pe_ema_alpha=0.5,
+            faiss_k_default=3,
+            episode_length=200,
+        ),
+        long_term_memory_config={"path": str(tmp_path / "ltm")},
+        logger=logger,
+    )
+
+    manager.set_active_policy_for_pe("dummy:policy_test")
+    manager.record_pe("zone_a", _PredictionError(magnitude=0.7, source="visual", tick=1))
+    manager.record_state(
+        state=_state(tick=1),
+        channel_deltas={"hunger": -0.1},
+        context_tags=["area:zone_a"],
+        arousal=0.6,
+    )
+    manager.snapshot_self_state({"step": 1, "phase": "pre_action", "value": 1})
+    manager.record_policy_trace(
+        {"policy_id": "dummy:policy_test", "step": 1, "status": "selected"}
+    )
+    manager.record_policy_selection(
+        policy_id="dummy:policy_test",
+        score=0.75,
+        components={"coherence": 0.8},
+        step=1,
+    )
+    manager.record_policy_outcome(
+        policy_id="dummy:policy_test",
+        reward=1.0,
+        done=False,
+        step=1,
+    )
+
+    operations = [event["operation"] for event, _ in logger.events]
+    assert "set_active_policy_for_pe" in operations
+    assert "record_pe" in operations
+    assert "record_state" in operations
+    assert "snapshot_self_state" in operations
+    assert "record_policy_trace" in operations
+    assert "record_policy_selection" in operations
+    assert "record_policy_outcome" in operations

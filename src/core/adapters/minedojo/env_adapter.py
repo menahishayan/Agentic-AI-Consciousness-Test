@@ -8,6 +8,14 @@ import re
 from types import MethodType
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
+from core.adapters.minedojo.task_profiles import (
+    build_skill_plan_queue,
+    drive_channels_for_task,
+    estimate_inventory_score,
+    normalize_task_id,
+    task_goal_payload,
+)
+
 _ADAPTER_DIR = Path(__file__).resolve().parent
 _PROJECT_ROOT = Path(__file__).resolve().parents[4]
 
@@ -56,13 +64,30 @@ class MineDojoAdapter:
         "health": {"heal", "retreat", "defend", "protect", "shield", "escape"},
         "hunger": {"eat", "collect", "cook", "food", "harvest", "fish", "drink"},
         "oxygen": {"surface", "ascend", "air", "breath"},
-        "resource_level": {"gather", "mine", "craft", "smelt", "chop", "dig"},
+        "resource_level": {
+            "gather",
+            "mine",
+            "craft",
+            "smelt",
+            "chop",
+            "dig",
+            "harvest",
+            "interact",
+            "bucket",
+            "milk",
+        },
         "safety": {"retreat", "avoid", "shelter", "defend", "escape"},
     }
 
     def __init__(self, env: Any, config: Optional[Mapping[str, Any]] = None) -> None:
         self.env = env
         self._config = dict(config or {})
+        self._task_id = normalize_task_id(self._config.get("task_id", "harvest_milk"))
+        self._task_goal = task_goal_payload(self._task_id)
+        self._max_inventory_slots = max(
+            1,
+            self._as_int(self._config.get("max_inventory_slots"), 36),
+        )
         self._last_obs: Any = None
         self._last_info: Dict[str, Any] = {}
         self._last_area_signature: Optional[str] = None
@@ -72,9 +97,14 @@ class MineDojoAdapter:
 
         self._policies: List[Dict[str, Any]] = []
         self._voyager_skills: Dict[str, Dict[str, Any]] = {}
+        self._skill_plan_queue: List[str] = []
+        self._skill_plan_metadata: List[Dict[str, Any]] = []
+        self._last_skill_plan_signature: Optional[str] = None
+        self._skill_plan_exhausted = False
         self._policy_method_names = set(dir(self))
         self._register_action_space_policies()
         self._register_voyager_skill_policies()
+        self._apply_task_policy_overrides()
 
     def reset(self) -> Tuple[Any, Any]:
         result = self.env.reset()
@@ -84,6 +114,10 @@ class MineDojoAdapter:
             obs, info = result, {}
         self._last_obs = obs
         self._last_info = info if isinstance(info, dict) else {}
+        self._skill_plan_queue = []
+        self._skill_plan_metadata = []
+        self._last_skill_plan_signature = None
+        self._skill_plan_exhausted = False
         return obs, self._last_info
 
     def step(self, action: Any) -> Tuple[Any, Any, Any, Any]:
@@ -119,6 +153,62 @@ class MineDojoAdapter:
     def get_available_policies(self) -> List[Dict[str, Any]]:
         return deepcopy(self._policies)
 
+    def get_task_goals(self) -> List[Dict[str, Any]]:
+        return [deepcopy(self._task_goal)]
+
+    def get_drive_channels(self) -> List[Any]:
+        return drive_channels_for_task(self._task_id)
+
+    def get_skill_plan(
+        self,
+        goals: Any = None,
+        context: Optional[Mapping[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        world_facts = self._world_facts_from_context(context)
+        signature = self._skill_plan_signature(goals, world_facts=world_facts)
+        should_refresh = False
+        if signature != self._last_skill_plan_signature:
+            should_refresh = True
+        elif self._last_skill_plan_signature is None:
+            should_refresh = True
+        elif not self._skill_plan_queue and not self._skill_plan_exhausted:
+            should_refresh = True
+
+        if should_refresh:
+            queue, metadata = build_skill_plan_queue(
+                task_id=self._task_id,
+                policies=self._policies,
+                world_facts=world_facts,
+            )
+            self._skill_plan_queue = list(queue)
+            self._skill_plan_metadata = list(metadata)
+            self._last_skill_plan_signature = signature
+            self._skill_plan_exhausted = not bool(self._skill_plan_queue)
+
+        return {
+            "task_id": self._task_id,
+            "head_policy_id": self._skill_plan_queue[0] if self._skill_plan_queue else None,
+            "queue": list(self._skill_plan_queue),
+            "remaining_policy_ids": list(self._skill_plan_queue),
+            "remaining_count": len(self._skill_plan_queue),
+            "metadata": deepcopy(self._skill_plan_metadata),
+        }
+
+    def notify_policy_selected(
+        self,
+        policy_id: Any,
+        context: Optional[Mapping[str, Any]] = None,
+    ) -> None:
+        _ = context
+        selected = str(policy_id or "").strip()
+        if not selected or not self._skill_plan_queue:
+            return
+        if selected != self._skill_plan_queue[0]:
+            return
+        self._skill_plan_queue.pop(0)
+        if not self._skill_plan_queue:
+            self._skill_plan_exhausted = True
+
     def estimate_resource_level(
         self,
         *,
@@ -133,16 +223,16 @@ class MineDojoAdapter:
         _ = state
         _ = info
         _ = obs
-        signals: List[float] = [self._clip01(hunger)]
-        if nearby.get("nearby_crafting_table") is True or nearby.get("nearby_furnace") is True:
-            signals.append(0.75)
-        if lighting.get("can_see_sky") is False:
-            signals.append(0.70)
-        if inventory_state.get("current_item_index") is not None:
-            signals.append(0.65)
-        if len(signals) == 1:
-            signals.append(0.50)
-        return self._clip01(sum(signals) / float(len(signals)))
+        _ = lighting
+        _ = nearby
+        hunger_score = self._clip01(hunger)
+        inventory_score = estimate_inventory_score(
+            inventory_state,
+            max_slots=self._max_inventory_slots,
+        )
+        if inventory_score is None:
+            return hunger_score
+        return self._clip01(0.6 * float(inventory_score) + 0.4 * hunger_score)
 
     def estimate_threat_proximity(
         self,
@@ -446,6 +536,44 @@ class MineDojoAdapter:
                     "skill_name": skill_name,
                 },
             )
+
+    def _apply_task_policy_overrides(self) -> None:
+        if self._task_id != "harvest_milk":
+            return
+
+        interaction_policy_found = False
+        for descriptor in self._policies:
+            if not isinstance(descriptor, dict):
+                continue
+            policy_id = str(descriptor.get("policy_id") or "").strip().lower()
+            tags = self._normalize_tags(descriptor.get("tags"))
+            drive_tags = self._normalize_tags(descriptor.get("drive_tags"))
+            drive_tag_set = set(drive_tags)
+
+            if policy_id.endswith(":attack"):
+                drive_tag_set.discard("resource_level")
+
+            if "use" in tags or "interact" in tags:
+                drive_tag_set.add("resource_level")
+                interaction_policy_found = True
+            elif {"milk", "cow", "bucket", "harvest"}.intersection(tags):
+                drive_tag_set.add("resource_level")
+                interaction_policy_found = True
+
+            descriptor["drive_tags"] = sorted(drive_tag_set)
+
+        if interaction_policy_found:
+            return
+
+        for descriptor in self._policies:
+            if not isinstance(descriptor, dict):
+                continue
+            policy_id = str(descriptor.get("policy_id") or "").strip().lower()
+            if policy_id.endswith(":use"):
+                drive_tags = set(self._normalize_tags(descriptor.get("drive_tags")))
+                drive_tags.add("resource_level")
+                descriptor["drive_tags"] = sorted(drive_tags)
+                break
 
     def _execute_voyager_skill(self, skill_id: str, context: Optional[Mapping[str, Any]] = None) -> List[int]:
         _ = context
@@ -841,6 +969,47 @@ class MineDojoAdapter:
     @staticmethod
     def _clip01(value: float) -> float:
         return max(0.0, min(1.0, float(value)))
+
+    def _skill_plan_signature(
+        self,
+        goals: Any,
+        world_facts: Optional[Mapping[str, Any]] = None,
+    ) -> str:
+        goal_tokens: List[str] = []
+        if isinstance(goals, list):
+            for goal in goals:
+                if isinstance(goal, Mapping):
+                    raw = goal.get("goal_id") or goal.get("description") or goal.get("goal")
+                else:
+                    raw = goal
+                token = str(raw or "").strip().lower()
+                if token:
+                    goal_tokens.append(token)
+        elif goals is not None:
+            goal_tokens.append(str(goals).strip().lower())
+        facts = world_facts if isinstance(world_facts, Mapping) else {}
+        world_signature = [
+            f"has_bucket:{int(self._as_bool(facts.get('has_bucket'), False))}",
+            f"nearby_cow:{int(self._as_bool(facts.get('nearby_cow'), False))}",
+            f"nearby_crafting_table:{int(self._as_bool(facts.get('nearby_crafting_table'), False))}",
+        ]
+        deduped = list(dict.fromkeys(sorted(goal_tokens)))
+        return f"{self._task_id}|{'|'.join(deduped)}|{'|'.join(world_signature)}"
+
+    def _world_facts_from_context(
+        self,
+        context: Optional[Mapping[str, Any]],
+    ) -> Dict[str, bool]:
+        if not isinstance(context, Mapping):
+            return {}
+        facts = context.get("world_facts")
+        if not isinstance(facts, Mapping):
+            return {}
+        return {
+            "has_bucket": self._as_bool(facts.get("has_bucket"), False),
+            "nearby_cow": self._as_bool(facts.get("nearby_cow"), False),
+            "nearby_crafting_table": self._as_bool(facts.get("nearby_crafting_table"), False),
+        }
 
 
 def create_adapter(config: Optional[Mapping[str, Any]] = None) -> Any:

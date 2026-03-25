@@ -77,6 +77,17 @@ class MemoryManager:
     # WorkingMemoryBuffer delegation
     def record_working(self, entry: WorkingMemoryEntry) -> None:
         self._working_memory.record(entry)
+        step: Optional[int] = entry.tick if isinstance(entry.tick, int) else None
+        self._emit_memory_event(
+            operation="record_working",
+            payload={
+                "tick": entry.tick,
+                "entry_type": entry.entry_type,
+                "priority": entry.priority,
+                "payload": entry.payload,
+            },
+            step=step,
+        )
 
     def get_recent(self, n: int, entry_type: Optional[str] = None) -> List[WorkingMemoryEntry]:
         return self._working_memory.get_recent(n=n, entry_type=entry_type)
@@ -88,6 +99,10 @@ class MemoryManager:
     def set_active_policy_for_pe(self, policy_id: Optional[str]) -> None:
         normalized = self._normalize_policy_id(policy_id)
         self._active_pe_policy_id = normalized if normalized is not None else "bootstrap"
+        self._emit_memory_event(
+            operation="set_active_policy_for_pe",
+            payload={"policy_id": self._active_pe_policy_id},
+        )
 
     def record_pe(self, area_id: str, error: Any, policy_id: Optional[str] = None) -> None:
         resolved_policy_id = self._normalize_policy_id(policy_id)
@@ -95,6 +110,13 @@ class MemoryManager:
             resolved_policy_id = self._active_pe_policy_id
         payload = self._coerce_pe_payload(area_id=area_id, error=error, policy_id=resolved_policy_id)
         self._prediction_error_history.record(area_id=area_id, error=payload)
+        tick = payload.get("tick")
+        step: Optional[int] = int(tick) if isinstance(tick, int) else None
+        self._emit_memory_event(
+            operation="record_pe",
+            payload={"area_id": area_id, "error": payload},
+            step=step,
+        )
 
     def record_prediction_error(self, error: Any, area_id: str = "unknown") -> None:
         self.record_pe(area_id=area_id, error=error)
@@ -137,6 +159,18 @@ class MemoryManager:
             context_tags=context_tags,
             arousal=arousal,
         )
+        state_tick = getattr(state, "tick", None)
+        step: Optional[int] = int(state_tick) if isinstance(state_tick, int) else None
+        self._emit_memory_event(
+            operation="record_state",
+            payload={
+                "state_tick": state_tick,
+                "channel_deltas": dict(channel_deltas),
+                "context_tags": list(context_tags),
+                "arousal": float(arousal),
+            },
+            step=step,
+        )
 
     def get_depletion_rate(self, state: Any, channel_id: str) -> Optional[float]:
         return self._self_state_tracking.get_depletion_rate(
@@ -171,6 +205,19 @@ class MemoryManager:
             context_vector=context_vector,
             outcome_score=outcome_score,
             tick=tick,
+        )
+        self._emit_memory_event(
+            operation="record_trace",
+            payload={
+                "channel_a_id": channel_a_id,
+                "channel_b_id": channel_b_id,
+                "winner_channel_id": winner_channel_id,
+                "action_tag": action_tag,
+                "context_vector": context_vector,
+                "outcome_score": float(outcome_score),
+                "tick": int(tick),
+            },
+            step=int(tick),
         )
 
     def get_conflict_resolution_score(
@@ -207,10 +254,21 @@ class MemoryManager:
         self._self_state_snapshots.append(payload)
         if len(self._self_state_snapshots) > self._max_self_state_snapshots:
             del self._self_state_snapshots[:-self._max_self_state_snapshots]
+        step_raw = payload.get("step")
+        step: Optional[int] = int(step_raw) if isinstance(step_raw, int) else None
+        self._emit_memory_event(
+            operation="snapshot_self_state",
+            payload=payload,
+            step=step,
+        )
 
     def register_policies(self, policies: Any) -> None:
         if isinstance(policies, list):
             self._long_term_memory.upsert_policies(policies)
+            self._emit_memory_event(
+                operation="register_policies",
+                payload={"count": len(policies)},
+            )
 
     def record_policy_selection(
         self,
@@ -224,6 +282,15 @@ class MemoryManager:
             score=float(score),
             components=components,
             step=step,
+        )
+        self._emit_memory_event(
+            operation="record_policy_selection",
+            payload={
+                "policy_id": str(policy_id),
+                "score": float(score),
+                "components": components,
+            },
+            step=step if isinstance(step, int) else None,
         )
 
     def record_policy_outcome(
@@ -239,6 +306,15 @@ class MemoryManager:
             done=bool(done),
             step=step,
         )
+        self._emit_memory_event(
+            operation="record_policy_outcome",
+            payload={
+                "policy_id": str(policy_id),
+                "reward": reward,
+                "done": bool(done),
+            },
+            step=step if isinstance(step, int) else None,
+        )
 
     def get_policies(self, adapter_folder: Optional[str] = None) -> List[Dict[str, Any]]:
         return self._long_term_memory.get_policies(adapter_folder=adapter_folder)
@@ -252,6 +328,13 @@ class MemoryManager:
         self._policy_trace_events.append(payload)
         if len(self._policy_trace_events) > self._max_policy_trace_events:
             del self._policy_trace_events[:-self._max_policy_trace_events]
+        step_raw = payload.get("step")
+        step: Optional[int] = int(step_raw) if isinstance(step_raw, int) else None
+        self._emit_memory_event(
+            operation="record_policy_trace",
+            payload=payload,
+            step=step,
+        )
 
     def query(self, query: Any) -> Any:
         if not isinstance(query, Mapping):
@@ -314,6 +397,10 @@ class MemoryManager:
         self._self_state_snapshots.clear()
         self._policy_trace_events.clear()
         self._active_pe_policy_id = "bootstrap"
+        self._emit_memory_event(
+            operation="clear_episode",
+            payload={"active_pe_policy_id": self._active_pe_policy_id},
+        )
 
     def clear_all(self) -> None:
         self._working_memory.clear()
@@ -323,6 +410,10 @@ class MemoryManager:
         self._self_state_snapshots.clear()
         self._policy_trace_events.clear()
         self._active_pe_policy_id = "bootstrap"
+        self._emit_memory_event(
+            operation="clear_all",
+            payload={"active_pe_policy_id": self._active_pe_policy_id},
+        )
 
     # Compatibility/read-only accessors
     @property
@@ -369,3 +460,23 @@ class MemoryManager:
         payload["area_id"] = str(area_id)
         payload["policy_id"] = str(policy_id)
         return payload
+
+    def _emit_memory_event(
+        self,
+        *,
+        operation: str,
+        payload: Mapping[str, Any],
+        step: Optional[int] = None,
+    ) -> None:
+        logger = self.logger
+        if logger is None:
+            return
+        emitter = getattr(logger, "memory_event", None)
+        if not callable(emitter):
+            return
+        event_payload = {"operation": str(operation), **dict(payload)}
+        try:
+            emitter(event_payload, step=step)
+        except Exception:
+            # Memory logging should never interrupt runtime behavior.
+            return
