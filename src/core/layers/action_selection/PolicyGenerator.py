@@ -273,7 +273,7 @@ class PolicyGenerator:
             return None
 
         if self.llm_client is None or len(policies) == 1:
-            selected = self._urgency_fallback(policies, context)
+            selected = self._urgency_fallback(policies, context, goals=goals)
             self._write_arbitration_fallback_trace(
                 selected_policy=selected,
                 rationale="urgency_fallback",
@@ -298,7 +298,7 @@ class PolicyGenerator:
             )
 
         if not bool(gate.get("should_call")):
-            selected = self._urgency_fallback(policies, context)
+            selected = self._urgency_fallback(policies, context, goals=goals)
             self._write_arbitration_fallback_trace(
                 selected_policy=selected,
                 rationale="reactive_gate:no_trigger",
@@ -310,7 +310,7 @@ class PolicyGenerator:
         if not bool(gate.get("urgent")):
             selected = self._pending_llm_policy(policies)
             if selected is None:
-                selected = self._urgency_fallback(policies, context)
+                selected = self._urgency_fallback(policies, context, goals=goals)
             self._write_arbitration_fallback_trace(
                 selected_policy=selected,
                 rationale=f"reactive_gate:{','.join(reasons)}",
@@ -349,7 +349,7 @@ class PolicyGenerator:
         record_trace: bool = True,
     ) -> Optional[Dict[str, Any]]:
         if self.llm_client is None:
-            return self._urgency_fallback(policies, context)
+            return self._urgency_fallback(policies, context, goals=goals)
 
         system_prompt, user_prompt = self._build_arbitration_prompt(
             policies=policies,
@@ -396,7 +396,7 @@ class PolicyGenerator:
             )
             response_text = str(getattr(response, "text", "") or "")
         except Exception as exc:
-            selected = self._urgency_fallback(policies, context)
+            selected = self._urgency_fallback(policies, context, goals=goals)
             if record_trace:
                 self._write_arbitration_fallback_trace(
                     selected_policy=selected,
@@ -426,7 +426,7 @@ class PolicyGenerator:
 
         selected = self._parse_arbitration_response(response_text, policies)
         if selected is None:
-            fallback = self._urgency_fallback(policies, context)
+            fallback = self._urgency_fallback(policies, context, goals=goals)
             if record_trace:
                 self._write_arbitration_fallback_trace(
                     selected_policy=fallback,
@@ -590,6 +590,8 @@ class PolicyGenerator:
 
         goals_fingerprint = self._goals_fingerprint(goals)
         goal_changed = goals_fingerprint != self._last_goals_fingerprint
+        with self._llm_state_lock:
+            pending_llm_result_available = self._pending_llm_result is not None
 
         urgent_reasons: List[str] = []
         non_urgent_reasons: List[str] = []
@@ -602,7 +604,10 @@ class PolicyGenerator:
         if periodic:
             non_urgent_reasons.append("periodic_reeval")
         if goal_changed:
-            non_urgent_reasons.append("goal_changed")
+            if pending_llm_result_available:
+                non_urgent_reasons.append("goal_changed")
+            else:
+                urgent_reasons.append("goal_changed")
 
         reasons = urgent_reasons + non_urgent_reasons
         return {
@@ -615,6 +620,7 @@ class PolicyGenerator:
             "skill_gap": skill_gap,
             "periodic": periodic,
             "goal_changed": goal_changed,
+            "pending_llm_result_available": pending_llm_result_available,
         }
 
     def _drive_conflict_detected(self, drive_signals: List[Dict[str, Any]]) -> bool:
@@ -934,6 +940,7 @@ class PolicyGenerator:
         self,
         policies: List[Dict[str, Any]],
         context: Mapping[str, Any],
+        goals: Any = None,
     ) -> Optional[Dict[str, Any]]:
         if not policies:
             return None
@@ -954,7 +961,7 @@ class PolicyGenerator:
                 planned = self._find_policy_by_id(policies, planned_policy_id)
                 if planned is not None:
                     return planned
-            return policies[0]
+            return self._goal_directed_fallback(policies, goals)
 
         urgency_by_channel: Dict[str, float] = {}
         for signal in drive_signals:
@@ -975,7 +982,7 @@ class PolicyGenerator:
                 planned = self._find_policy_by_id(policies, planned_policy_id)
                 if planned is not None:
                     return planned
-            return policies[0]
+            return self._goal_directed_fallback(policies, goals)
 
         best_index = 0
         best_score = -1.0
@@ -990,7 +997,82 @@ class PolicyGenerator:
             if score > best_score:
                 best_score = score
                 best_index = index
+        if best_score <= 0.0:
+            return self._goal_directed_fallback(policies, goals)
         return policies[best_index]
+
+    def _goal_directed_fallback(
+        self,
+        policies: List[Dict[str, Any]],
+        goals: Any,
+    ) -> Optional[Dict[str, Any]]:
+        if not policies:
+            return None
+
+        goal_tokens = self._goal_tokens(goals)
+        best_policy: Optional[Dict[str, Any]] = None
+        best_score = -1
+        first_non_noop: Optional[Dict[str, Any]] = None
+
+        for policy in policies:
+            if self._is_noop_policy(policy):
+                continue
+            if first_non_noop is None:
+                first_non_noop = policy
+            if not goal_tokens:
+                continue
+            policy_tokens = self._policy_tokens(policy)
+            overlap_score = len(goal_tokens.intersection(policy_tokens))
+            if overlap_score > best_score:
+                best_score = overlap_score
+                best_policy = policy
+
+        if best_policy is not None and best_score > 0:
+            return best_policy
+        if first_non_noop is not None:
+            return first_non_noop
+        return policies[0]
+
+    def _goal_tokens(self, goals: Any) -> set[str]:
+        sources: List[str] = []
+        if isinstance(goals, list):
+            for goal in goals:
+                if isinstance(goal, Mapping):
+                    for key in ("goal_id", "description", "goal", "task_id"):
+                        value = goal.get(key)
+                        if value is not None:
+                            sources.append(str(value))
+                else:
+                    sources.append(str(goal))
+        elif isinstance(goals, Mapping):
+            for key in ("goal_id", "description", "goal", "task_id"):
+                value = goals.get(key)
+                if value is not None:
+                    sources.append(str(value))
+        elif goals is not None:
+            sources.append(str(goals))
+
+        tokens: set[str] = set()
+        for source in sources:
+            tokens.update(self._name_tokens(source))
+        return tokens
+
+    def _is_noop_policy(self, policy: Mapping[str, Any]) -> bool:
+        policy_id = str(policy.get("policy_id") or "").strip().lower()
+        callable_name = str(policy.get("callable_name") or "").strip().lower()
+        tags = set(self._normalize_tags(policy.get("tags")))
+        drive_tags = set(self._normalize_tags(policy.get("drive_tags")))
+        markers = {"noop", "no_op", "idle", "wait", "do_nothing"}
+
+        if any(marker in policy_id for marker in markers):
+            return True
+        if any(marker in callable_name for marker in markers):
+            return True
+        if tags.intersection(markers):
+            return True
+        if drive_tags.intersection(markers):
+            return True
+        return False
 
     def _write_arbitration_trace(
         self,

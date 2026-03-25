@@ -76,6 +76,32 @@ class _InvalidPolicyAdapter(_DriveAwareAdapter):
         ]
 
 
+class _NoopFirstAdapter(_DriveAwareAdapter):
+    def get_available_policies(self) -> List[Dict[str, Any]]:
+        return [
+            {
+                "policy_id": "dummy:policy_noop",
+                "callable_name": "policy_noop",
+                "description": "Do nothing.",
+                "tags": ["noop", "idle"],
+                "drive_tags": ["noop"],
+            },
+            {
+                "policy_id": "dummy:policy_collect_milk",
+                "callable_name": "policy_collect_milk",
+                "description": "Collect milk from nearby animals.",
+                "tags": ["collect", "milk", "gather"],
+                "drive_tags": ["resource_level"],
+            },
+        ]
+
+    def policy_noop(self) -> str:
+        return "noop_action"
+
+    def policy_collect_milk(self) -> str:
+        return "collect_milk_action"
+
+
 class _NoPolicyContractAdapter:
     def reset(self) -> Any:
         return None
@@ -428,7 +454,28 @@ def test_selective_gate_skips_llm_when_no_trigger_conditions(tmp_path: Path) -> 
     assert len(llm_client.requests) == 0
 
 
-def test_goal_change_runs_async_llm_and_returns_reactive_now(tmp_path: Path) -> None:
+def test_goal_directed_fallback_skips_noop_when_urgency_scores_are_flat(tmp_path: Path) -> None:
+    memory_manager = _memory_manager(tmp_path)
+    generator = PolicyGenerator(
+        adapter=_NoopFirstAdapter(),
+        adapter_folder="dummy",
+        memory_manager=memory_manager,
+        goal_checker=_NeutralGoalChecker(),
+        prediction_error_calculator=_NeutralPredictionErrorCalculator(),
+        config={},
+        llm_client=None,
+    )
+
+    proposal = generator.propose_action(
+        goals=[{"goal_id": "task:collect_milk", "description": "Collect milk"}],
+        context={"step": 1, "drive_signals": {"signals": []}},
+    )
+
+    assert isinstance(proposal, ActionProposal)
+    assert proposal.action_id == "dummy:policy_collect_milk"
+
+
+def test_goal_change_without_pending_result_triggers_sync_llm(tmp_path: Path) -> None:
     memory_manager = _memory_manager(tmp_path)
     llm_client = _StaticLLMClient(
         text='{"selected_index": 1, "rationale": "async result", "drive_conflict_detected": false, "confidence": 0.88}'
@@ -452,22 +499,39 @@ def test_goal_change_runs_async_llm_and_returns_reactive_now(tmp_path: Path) -> 
         },
     )
 
-    # First step returns immediately with reactive fallback.
     assert isinstance(proposal, ActionProposal)
-    assert proposal.action_id == "dummy:policy_seek_food"
-    assert _wait_for(lambda: len(llm_client.requests) == 1)
+    assert proposal.action_id == "dummy:policy_explore"
+    assert len(llm_client.requests) == 1
 
-    # On a non-urgent periodic step, cached async result is used.
+
+def test_goal_change_with_pending_result_runs_async_and_uses_cached_policy(tmp_path: Path) -> None:
+    memory_manager = _memory_manager(tmp_path)
+    llm_client = _StaticLLMClient(
+        text='{"selected_index": 0, "rationale": "refresh", "drive_conflict_detected": false, "confidence": 0.7}'
+    )
+    generator = PolicyGenerator(
+        adapter=_DriveAwareAdapter(),
+        adapter_folder="dummy",
+        memory_manager=memory_manager,
+        goal_checker=_NeutralGoalChecker(),
+        prediction_error_calculator=_NeutralPredictionErrorCalculator(),
+        config={"llm_reeval_interval": 10},
+        llm_client=llm_client,
+    )
+    generator._pending_llm_result = {"policy_id": "dummy:policy_explore"}  # noqa: SLF001
+
     follow_up = generator.propose_action(
         goals=[{"goal_id": "new_goal"}],
         context={
-            "step": 10,
+            "step": 1,
             "drive_signals": {"signals": [{"channel_id": "hunger", "urgency": 0.4}]},
             "perceptual_prediction_error": {"aggregate_magnitude": 0.1},
         },
     )
+
     assert isinstance(follow_up, ActionProposal)
     assert follow_up.action_id == "dummy:policy_explore"
+    assert _wait_for(lambda: len(llm_client.requests) == 1)
 
 
 def test_sustained_prediction_error_triggers_sync_llm_call(tmp_path: Path) -> None:
