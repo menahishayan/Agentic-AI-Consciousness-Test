@@ -1,14 +1,16 @@
-# animalai>=3.1.3  # Optional: only needed for the "animalai" adapter_folder.
-#                  # Requires Python 3.9.x or a compatible micro-version.
-#                  # Default adapter_folder is "headless" (pure Python, no Unity needed).
+animalai==5.0.1  # Requires Python >=3.10.0,<3.10.13. Use Python 3.10.12 via pyenv.
+                 # Default adapter_folder is "headless" (pure Python, no Unity needed).
+                 # Set adapter_folder="animalai" in config.json when Unity is running.
+grpcio==1.47.5   # Pinned: animalai needs <=1.48.2; 1.47.5 is the latest binary wheel in range.
 faiss-cpu>=1.7.4
 anthropic>=0.25.0
 openai>=1.30.0
-google-generativeai>=0.5.0
-numpy>=1.24.0,<2.0.0
+# google-generativeai>=0.5.0  # Removed: conflicts with animalai's grpcio<=1.48.2 constraint.
+                               # Gemini provider is a stub (NotImplementedError) — not needed at runtime.
+numpy>=1.23.5,<1.24.0  # mlagents-envs==1.1.0 (animalai dep) requires numpy<1.24.0
 Pillow>=10.0.0
 python-dotenv>=1.0.0
 jsonlines>=4.0.0
 pytest>=8.0.0
 pytest-asyncio>=0.23.0
-coloredlogs>=15.0.2
+coloredlogs>=15.0

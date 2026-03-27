@@ -1,5 +1,5 @@
 {
-  "adapter_folder": "headless",
+  "adapter_folder": "animalai",
   "adapter_config": {
     "homeostatic": {
       "health_depletion_rate": 0.001,
@@ -17,14 +17,11 @@
       "hazard_margin": 2.0,
       "n_food": 5,
       "seed": null
-    }
-  },
-  "_adapter_animalai": {
-    "_comment": "Set adapter_folder to 'animalai' and copy this block to adapter_config when Animal AI Unity is installed",
+    },
     "arena_config": "animalai_configs/basic_food.yaml",
     "worker_id": 1,
     "base_port": 5005,
-    "resolve_filename": true
+    "file_name": "./animal-ai-unity/AnimalAI.app"
   },
   "llm": {
     "enabled": true,

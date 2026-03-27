@@ -95,6 +95,12 @@ class AnimalAIAdapter(AbstractEnvironmentAdapter):
         self._worker_id = int(config.get("worker_id", 1))
         self._base_port = int(config.get("base_port", 5005))
 
+        # Optional: path to the Unity binary. None = connect to already-running instance.
+        file_name = config.get("file_name")
+        if file_name and config.get("resolve_filename", True):
+            file_name = str(Path(file_name).resolve())
+        self._file_name: Optional[str] = file_name
+
     # ------------------------------------------------------------------
     # AbstractEnvironmentAdapter interface
     # ------------------------------------------------------------------
@@ -211,12 +217,15 @@ class AnimalAIAdapter(AbstractEnvironmentAdapter):
             from animalai.environment import AnimalAIEnvironment  # type: ignore
         except ImportError as exc:
             raise ImportError(
-                "animalai package not installed. Run: pip install animalai>=3.1.3"
+                "animalai package not installed. Run: pip install animalai==5.0.1 (requires Python 3.10.12)"
             ) from exc
 
-        log.info("Launching Animal AI environment (arena: %s)", self._arena_config_path)
+        if self._file_name:
+            log.info("Launching Animal AI binary: %s (arena: %s)", self._file_name, self._arena_config_path)
+        else:
+            log.info("Connecting to running Animal AI instance (arena: %s)", self._arena_config_path)
         env = AnimalAIEnvironment(
-            file_name=None,  # Use already-running Unity instance if available
+            file_name=self._file_name,
             arenas_configurations=self._arena_config_path,
             worker_id=self._worker_id,
             base_port=self._base_port,

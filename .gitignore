@@ -11,3 +11,4 @@ build/
 src/logs/
 data/long_term_memory/
 *.faiss
+animal-ai-unity
