@@ -1,0 +1,864 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Agent Run Dashboard</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.3/dist/chart.umd.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/chartjs-plugin-annotation@3.0.1/dist/chartjs-plugin-annotation.min.js"></script>
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  :root {
+    --bg: #0f1117;
+    --surface: #1a1d27;
+    --surface2: #22263a;
+    --border: #2d3250;
+    --accent: #7c8cf8;
+    --accent2: #50fa7b;
+    --text: #e2e8f0;
+    --muted: #6b7280;
+    --live: #22c55e;
+    --complete: #64748b;
+    --danger: #f87171;
+    --warn: #fbbf24;
+  }
+
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: 'Inter', 'Segoe UI', system-ui, sans-serif;
+    font-size: 13px;
+    display: flex;
+    height: 100vh;
+    overflow: hidden;
+  }
+
+  /* ── Sidebar ─────────────────────────────────────────── */
+  #sidebar {
+    width: 240px;
+    min-width: 240px;
+    background: var(--surface);
+    border-right: 1px solid var(--border);
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
+
+  #sidebar-header {
+    padding: 14px 12px 10px;
+    border-bottom: 1px solid var(--border);
+    font-weight: 700;
+    font-size: 14px;
+    color: var(--accent);
+    letter-spacing: 0.04em;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+
+  #sidebar-header .dot {
+    width: 8px; height: 8px;
+    border-radius: 50%;
+    background: var(--live);
+    animation: pulse 2s infinite;
+  }
+
+  @keyframes pulse {
+    0%,100% { opacity:1; }
+    50% { opacity:0.4; }
+  }
+
+  #run-list {
+    flex: 1;
+    overflow-y: auto;
+    padding: 6px 0;
+  }
+
+  .run-card {
+    padding: 9px 12px;
+    cursor: pointer;
+    border-left: 3px solid transparent;
+    transition: background 0.12s;
+  }
+
+  .run-card:hover { background: var(--surface2); }
+
+  .run-card.active {
+    background: var(--surface2);
+    border-left-color: var(--accent);
+  }
+
+  .run-card .run-id {
+    font-family: monospace;
+    font-size: 11px;
+    color: var(--muted);
+    margin-bottom: 2px;
+  }
+
+  .run-card .run-time {
+    font-size: 12px;
+    font-weight: 600;
+    margin-bottom: 3px;
+  }
+
+  .run-card .run-meta {
+    font-size: 11px;
+    color: var(--muted);
+    display: flex;
+    gap: 6px;
+    flex-wrap: wrap;
+  }
+
+  .run-card .badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 3px;
+    font-size: 10px;
+    font-weight: 600;
+    padding: 1px 6px;
+    border-radius: 20px;
+    margin-top: 4px;
+  }
+
+  .badge.live {
+    background: rgba(34,197,94,0.15);
+    color: var(--live);
+  }
+
+  .badge.complete {
+    background: rgba(100,116,139,0.15);
+    color: var(--complete);
+  }
+
+  .badge.live::before {
+    content: '';
+    display: inline-block;
+    width: 5px; height: 5px;
+    border-radius: 50%;
+    background: var(--live);
+    animation: pulse 1.5s infinite;
+  }
+
+  /* ── Main ─────────────────────────────────────────────── */
+  #main {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
+
+  #topbar {
+    padding: 10px 16px;
+    border-bottom: 1px solid var(--border);
+    background: var(--surface);
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    flex-shrink: 0;
+  }
+
+  #run-title {
+    font-size: 14px;
+    font-weight: 700;
+    color: var(--text);
+    font-family: monospace;
+  }
+
+  #meta-pills {
+    display: flex;
+    gap: 8px;
+    flex-wrap: wrap;
+    flex: 1;
+  }
+
+  .pill {
+    background: var(--surface2);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 2px 8px;
+    font-size: 11px;
+    color: var(--muted);
+  }
+
+  .pill span { color: var(--text); font-weight: 600; }
+
+  #step-counter {
+    font-size: 12px;
+    color: var(--muted);
+    margin-left: auto;
+  }
+
+  #step-counter em { color: var(--accent); font-style: normal; font-weight: 700; }
+
+  /* ── Content area ─────────────────────────────────────── */
+  #content {
+    flex: 1;
+    overflow-y: auto;
+    padding: 12px 16px;
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    grid-template-rows: auto;
+    gap: 12px;
+    align-content: start;
+  }
+
+  .chart-card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 12px 14px;
+    display: flex;
+    flex-direction: column;
+    min-height: 200px;
+  }
+
+  .chart-card.wide {
+    grid-column: span 2;
+  }
+
+  .chart-title {
+    font-size: 11px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.07em;
+    color: var(--muted);
+    margin-bottom: 8px;
+  }
+
+  .chart-wrap {
+    flex: 1;
+    position: relative;
+    min-height: 150px;
+  }
+
+  /* ── Events log ───────────────────────────────────────── */
+  #events-card {
+    grid-column: span 2;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 12px 14px;
+  }
+
+  #events-title {
+    font-size: 11px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.07em;
+    color: var(--muted);
+    margin-bottom: 8px;
+  }
+
+  #events-log {
+    max-height: 140px;
+    overflow-y: auto;
+    font-family: monospace;
+    font-size: 12px;
+  }
+
+  .event-row {
+    padding: 3px 0;
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    gap: 10px;
+  }
+
+  .event-row .ev-step { color: var(--accent); min-width: 60px; }
+  .event-row .ev-type { color: var(--warn); min-width: 120px; }
+  .event-row .ev-detail { color: var(--muted); }
+
+  /* ── Placeholder ──────────────────────────────────────── */
+  #placeholder {
+    grid-column: span 2;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    height: 300px;
+    color: var(--muted);
+    font-size: 15px;
+    flex-direction: column;
+    gap: 8px;
+  }
+
+  #placeholder svg { opacity: 0.3; }
+
+  /* ── Scrollbar ─────────────────────────────────────────── */
+  ::-webkit-scrollbar { width: 5px; height: 5px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+  ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+</style>
+</head>
+<body>
+
+<!-- Sidebar -->
+<nav id="sidebar">
+  <div id="sidebar-header">
+    <div class="dot"></div>
+    Agent Runs
+  </div>
+  <div id="run-list">
+    <div style="padding:12px;color:var(--muted);font-size:12px;">Connecting...</div>
+  </div>
+</nav>
+
+<!-- Main panel -->
+<div id="main">
+  <div id="topbar">
+    <div id="run-title">Select a run</div>
+    <div id="meta-pills"></div>
+    <div id="step-counter"></div>
+  </div>
+  <div id="content">
+    <div id="placeholder">
+      <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+        <path d="M3 3h7v7H3zM14 3h7v7h-7zM14 14h7v7h-7zM3 14h7v7H3z"/>
+      </svg>
+      <span>Select a run from the sidebar</span>
+    </div>
+  </div>
+</div>
+
+<script>
+// ═══════════════════════════════════════════════════════════════════
+// State
+// ═══════════════════════════════════════════════════════════════════
+const state = {
+  activeRunId: null,
+  runStream: null,      // EventSource for active run
+  newRunStream: null,   // EventSource for new run discovery
+  charts: {},
+  lastStep: 0,
+  policyColors: {},
+  pendingChartUpdate: false,
+  runs: {},             // run_id -> summary
+};
+
+const POLICY_PALETTE = [
+  '#7c8cf8','#50fa7b','#f1fa8c','#ff79c6','#8be9fd',
+  '#ffb86c','#bd93f9','#ff5555','#6be5a0','#f8d68a',
+];
+
+function policyColor(id) {
+  if (!state.policyColors[id]) {
+    const idx = Object.keys(state.policyColors).length % POLICY_PALETTE.length;
+    state.policyColors[id] = POLICY_PALETTE[idx];
+  }
+  return state.policyColors[id];
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// Chart.js helpers
+// ═══════════════════════════════════════════════════════════════════
+const CHART_DEFAULTS = {
+  responsive: true,
+  maintainAspectRatio: false,
+  animation: false,
+  interaction: { mode: 'index', intersect: false },
+  plugins: {
+    legend: {
+      labels: { color: '#6b7280', boxWidth: 10, font: { size: 11 } },
+    },
+    tooltip: {
+      backgroundColor: '#1a1d27',
+      borderColor: '#2d3250',
+      borderWidth: 1,
+      titleColor: '#e2e8f0',
+      bodyColor: '#9ca3af',
+    },
+  },
+  scales: {
+    x: {
+      ticks: { color: '#4b5563', maxTicksLimit: 10, font: { size: 10 } },
+      grid: { color: 'rgba(45,50,80,0.5)' },
+      title: { display: true, text: 'Step', color: '#4b5563', font: { size: 10 } },
+    },
+    y: {
+      ticks: { color: '#4b5563', font: { size: 10 } },
+      grid: { color: 'rgba(45,50,80,0.5)' },
+    },
+  },
+};
+
+function mergeDeep(target, source) {
+  for (const key of Object.keys(source)) {
+    if (source[key] && typeof source[key] === 'object' && !Array.isArray(source[key])) {
+      if (!target[key]) target[key] = {};
+      mergeDeep(target[key], source[key]);
+    } else {
+      target[key] = source[key];
+    }
+  }
+  return target;
+}
+
+function makeLineChart(canvasId, datasets, yOverride = {}) {
+  const canvas = document.getElementById(canvasId);
+  if (!canvas) return null;
+  const opts = mergeDeep(JSON.parse(JSON.stringify(CHART_DEFAULTS)), {
+    scales: { y: yOverride },
+  });
+  return new Chart(canvas, { type: 'line', data: { labels: [], datasets }, options: opts });
+}
+
+function makeBarChart(canvasId, label, color) {
+  const canvas = document.getElementById(canvasId);
+  if (!canvas) return null;
+  const opts = mergeDeep(JSON.parse(JSON.stringify(CHART_DEFAULTS)), {});
+  opts.plugins.legend.display = false;
+  return new Chart(canvas, {
+    type: 'bar',
+    data: { labels: [], datasets: [{ label, data: [], backgroundColor: color, borderRadius: 2 }] },
+    options: opts,
+  });
+}
+
+function makeScatterChart(canvasId, label, color) {
+  const canvas = document.getElementById(canvasId);
+  if (!canvas) return null;
+  const base = JSON.parse(JSON.stringify(CHART_DEFAULTS));
+  delete base.scales.x.title;
+  base.scales.x.title = { display: true, text: 'X', color: '#4b5563', font: { size: 10 } };
+  base.scales.y.title = { display: true, text: 'Z', color: '#4b5563', font: { size: 10 } };
+  base.plugins.legend.display = false;
+  return new Chart(canvas, {
+    type: 'scatter',
+    data: { datasets: [{ label, data: [], backgroundColor: color, pointRadius: 3 }] },
+    options: base,
+  });
+}
+
+function ds(label, color, fill = false) {
+  return {
+    label,
+    data: [],
+    borderColor: color,
+    backgroundColor: fill ? color + '22' : 'transparent',
+    borderWidth: 1.5,
+    pointRadius: 0,
+    tension: 0.3,
+    fill,
+  };
+}
+
+function scheduleUpdate() {
+  if (state.pendingChartUpdate) return;
+  state.pendingChartUpdate = true;
+  requestAnimationFrame(() => {
+    state.pendingChartUpdate = false;
+    for (const chart of Object.values(state.charts)) {
+      if (chart && chart.data) {
+        chart.update('none');
+      }
+    }
+    updateStepCounter();
+  });
+}
+
+function updateStepCounter() {
+  const el = document.getElementById('step-counter');
+  if (!el) return;
+  el.innerHTML = `Step <em>${state.lastStep}</em>`;
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// DOM builders
+// ═══════════════════════════════════════════════════════════════════
+function buildChartGrid() {
+  const content = document.getElementById('content');
+  content.innerHTML = `
+    <!-- Row 1 -->
+    <div class="chart-card">
+      <div class="chart-title">Homeostasis</div>
+      <div class="chart-wrap"><canvas id="ch-homeostasis"></canvas></div>
+    </div>
+    <div class="chart-card">
+      <div class="chart-title">Arousal / Valence</div>
+      <div class="chart-wrap"><canvas id="ch-arousal"></canvas></div>
+    </div>
+
+    <!-- Row 2 -->
+    <div class="chart-card">
+      <div class="chart-title">Drive Urgency</div>
+      <div class="chart-wrap"><canvas id="ch-urgency"></canvas></div>
+    </div>
+    <div class="chart-card">
+      <div class="chart-title">Prediction Error</div>
+      <div class="chart-wrap"><canvas id="ch-pe"></canvas></div>
+    </div>
+
+    <!-- Row 3 -->
+    <div class="chart-card">
+      <div class="chart-title">Outcome Score</div>
+      <div class="chart-wrap"><canvas id="ch-outcome"></canvas></div>
+    </div>
+    <div class="chart-card">
+      <div class="chart-title">Step Timing (ms) — spikes = LLM calls</div>
+      <div class="chart-wrap"><canvas id="ch-timing"></canvas></div>
+    </div>
+
+    <!-- Row 4 - wide -->
+    <div class="chart-card wide">
+      <div class="chart-title">Policy Timeline</div>
+      <div class="chart-wrap"><canvas id="ch-policy"></canvas></div>
+    </div>
+
+    <!-- Row 5 - wide -->
+    <div class="chart-card wide">
+      <div class="chart-title">Position Trajectory (X / Z)</div>
+      <div class="chart-wrap"><canvas id="ch-position"></canvas></div>
+    </div>
+
+    <!-- Events -->
+    <div id="events-card">
+      <div id="events-title">Episode Events</div>
+      <div id="events-log"><div style="color:var(--muted);font-size:12px;">No events yet.</div></div>
+    </div>
+  `;
+}
+
+function initCharts() {
+  destroyCharts();
+
+  state.charts.homeostasis = makeLineChart('ch-homeostasis', [
+    ds('Health', '#50fa7b'),
+    ds('Saturation', '#7c8cf8'),
+    ds('Energy', '#fbbf24'),
+  ], { min: 0, max: 1 });
+
+  state.charts.arousal = makeLineChart('ch-arousal', [
+    ds('Arousal', '#ff79c6'),
+    ds('Valence', '#8be9fd'),
+  ], { min: -1, max: 1 });
+
+  state.charts.urgency = makeLineChart('ch-urgency', [
+    ds('Drive Urgency', '#ffb86c'),
+  ]);
+
+  state.charts.pe = makeLineChart('ch-pe', [
+    ds('Prediction Error', '#f87171'),
+  ], { min: 0 });
+
+  state.charts.outcome = makeLineChart('ch-outcome', [
+    ds('Outcome Score', '#6be5a0', true),
+  ], { min: 0, max: 1 });
+
+  state.charts.timing = makeBarChart('ch-timing', 'Step ms', '#bd93f9');
+
+  // Policy timeline — scatter with categorical Y
+  const policyCanvas = document.getElementById('ch-policy');
+  if (policyCanvas) {
+    const opts = mergeDeep(JSON.parse(JSON.stringify(CHART_DEFAULTS)), {});
+    opts.animation = false;
+    opts.plugins.legend.display = false;
+    opts.scales.y = {
+      type: 'category',
+      labels: [],
+      ticks: { color: '#6b7280', font: { size: 10 } },
+      grid: { color: 'rgba(45,50,80,0.5)' },
+    };
+    state.charts.policy = new Chart(policyCanvas, {
+      type: 'scatter',
+      data: { datasets: [] },
+      options: opts,
+    });
+  }
+
+  // Position scatter
+  state.charts.position = makeScatterChart('ch-position', 'Path', '#7c8cf8');
+}
+
+function destroyCharts() {
+  for (const key of Object.keys(state.charts)) {
+    if (state.charts[key]) {
+      state.charts[key].destroy();
+      state.charts[key] = null;
+    }
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// Data ingestion
+// ═══════════════════════════════════════════════════════════════════
+function ingestMetric(row) {
+  const step = row.step;
+  if (step > state.lastStep) state.lastStep = step;
+
+  // helpers
+  function push(chart, ...vals) {
+    if (!chart) return;
+    chart.data.labels.push(step);
+    chart.data.datasets.forEach((ds, i) => ds.data.push(vals[i] ?? null));
+  }
+
+  push(state.charts.homeostasis, row.health, row.saturation, row.energy);
+  push(state.charts.arousal, row.arousal, row.valence);
+  push(state.charts.urgency, row.drive_urgency);
+  push(state.charts.pe, row.pe_mean);
+  push(state.charts.outcome, row.outcome_score);
+
+  // timing bar
+  if (state.charts.timing) {
+    state.charts.timing.data.labels.push(step);
+    state.charts.timing.data.datasets[0].data.push(row.step_ms);
+  }
+
+  // policy scatter
+  ingestPolicy(step, row.policy_id);
+
+  scheduleUpdate();
+}
+
+function ingestPolicy(step, policyId) {
+  if (!policyId || !state.charts.policy) return;
+  const chart = state.charts.policy;
+  const color = policyColor(policyId);
+
+  // Ensure category exists on Y axis
+  if (!chart.options.scales.y.labels.includes(policyId)) {
+    chart.options.scales.y.labels.push(policyId);
+  }
+
+  // Find or create dataset for this policy
+  let ds = chart.data.datasets.find(d => d.label === policyId);
+  if (!ds) {
+    ds = {
+      label: policyId,
+      data: [],
+      backgroundColor: color,
+      pointRadius: 4,
+      pointHoverRadius: 6,
+    };
+    chart.data.datasets.push(ds);
+  }
+  ds.data.push({ x: step, y: policyId });
+}
+
+function ingestPosition(row) {
+  if (!state.charts.position) return;
+  if (row.x == null || row.z == null) return;
+  const t = row.step / Math.max(state.lastStep, 1);
+  const r = Math.floor(124 + t * 131);
+  const g = Math.floor(141 - t * 91);
+  const b = Math.floor(248 - t * 120);
+  const color = `rgb(${r},${g},${b})`;
+  state.charts.position.data.datasets[0].data.push({ x: row.x, y: row.z });
+  // Update point colors — rebuild backgroundColor array
+  const d = state.charts.position.data.datasets[0];
+  if (!Array.isArray(d.backgroundColor)) d.backgroundColor = [];
+  d.backgroundColor.push(color);
+  scheduleUpdate();
+}
+
+function ingestEvent(row) {
+  const log = document.getElementById('events-log');
+  if (!log) return;
+  const placeholder = log.querySelector('div');
+  if (placeholder && placeholder.style.color) placeholder.remove();
+
+  const ev = row.event || 'unknown';
+  const step = row.step ?? '?';
+  const payload = row.payload || {};
+  const detail = Object.entries(payload).map(([k,v]) =>
+    `${k}: ${typeof v === 'number' ? v.toFixed(3) : v}`
+  ).join('  ');
+
+  const el = document.createElement('div');
+  el.className = 'event-row';
+  el.innerHTML = `
+    <span class="ev-step">step ${step}</span>
+    <span class="ev-type">${ev}</span>
+    <span class="ev-detail">${detail}</span>
+  `;
+  log.insertBefore(el, log.firstChild);
+}
+
+function ingestRunComplete(payload) {
+  ingestEvent({ event: 'episode_complete', step: payload.steps_run, payload });
+  // Update sidebar badge
+  const card = document.querySelector(`.run-card[data-id="${state.activeRunId}"]`);
+  if (card) {
+    const badge = card.querySelector('.badge');
+    if (badge) {
+      badge.className = 'badge complete';
+      badge.textContent = 'Complete';
+    }
+  }
+}
+
+function loadBulkData(data) {
+  for (const row of data.metrics || []) ingestMetric(row);
+  for (const row of data.events || []) {
+    if (row.event !== 'step') ingestEvent(row);
+  }
+  for (const row of data.positions || []) ingestPosition(row);
+  // Force update all charts
+  for (const chart of Object.values(state.charts)) {
+    if (chart) chart.update('none');
+  }
+  updateStepCounter();
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// Run selection
+// ═══════════════════════════════════════════════════════════════════
+async function selectRun(runId) {
+  if (state.activeRunId === runId) return;
+
+  // Clean up previous stream
+  if (state.runStream) {
+    state.runStream.close();
+    state.runStream = null;
+  }
+
+  state.activeRunId = runId;
+  state.lastStep = 0;
+  state.policyColors = {};
+
+  // Update sidebar active state
+  document.querySelectorAll('.run-card').forEach(el => {
+    el.classList.toggle('active', el.dataset.id === runId);
+  });
+
+  // Update topbar
+  const run = state.runs[runId];
+  document.getElementById('run-title').textContent = runId;
+  const pills = document.getElementById('meta-pills');
+  if (run) {
+    pills.innerHTML = `
+      <div class="pill">Adapter: <span>${run.adapter}</span></div>
+      <div class="pill">Provider: <span>${run.llm_provider}</span></div>
+      <div class="pill">Model: <span>${run.llm_model}</span></div>
+      <div class="pill">Started: <span>${run.start_time_str || ''}</span></div>
+    `;
+  }
+
+  // Build chart grid & init
+  buildChartGrid();
+  initCharts();
+
+  // Fetch bulk historical data
+  try {
+    const resp = await fetch(`/api/v1/runs/${runId}/bulk`);
+    if (resp.ok) {
+      const data = await resp.json();
+      loadBulkData(data);
+    }
+  } catch (e) {
+    console.warn('Bulk fetch failed:', e);
+  }
+
+  // Open SSE stream for live runs
+  if (!run || !run.is_complete) {
+    openRunStream(runId);
+  }
+}
+
+function openRunStream(runId) {
+  const url = `/api/v1/runs/${runId}/stream?after_step=${state.lastStep}`;
+  const src = new EventSource(url);
+  state.runStream = src;
+
+  src.addEventListener('metric', e => {
+    ingestMetric(JSON.parse(e.data));
+  });
+
+  src.addEventListener('agent_event', e => {
+    const row = JSON.parse(e.data);
+    if (row.event !== 'step') ingestEvent(row);
+  });
+
+  src.addEventListener('position', e => {
+    ingestPosition(JSON.parse(e.data));
+  });
+
+  src.addEventListener('run_complete', e => {
+    ingestRunComplete(JSON.parse(e.data));
+    src.close();
+  });
+
+  src.addEventListener('heartbeat', () => {});
+
+  src.onerror = () => {
+    // Auto-reconnect handled by EventSource, but we update last step for resume
+    if (state.runStream === src) {
+      src.close();
+      if (state.activeRunId === runId) {
+        setTimeout(() => openRunStream(runId), 3000);
+      }
+    }
+  };
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// Sidebar management
+// ═══════════════════════════════════════════════════════════════════
+function renderRunCard(run, prepend = false) {
+  state.runs[run.run_id] = run;
+
+  const existing = document.querySelector(`.run-card[data-id="${run.run_id}"]`);
+
+  const card = existing || document.createElement('div');
+  card.className = 'run-card' + (state.activeRunId === run.run_id ? ' active' : '');
+  card.dataset.id = run.run_id;
+  card.innerHTML = `
+    <div class="run-time">${run.start_time_str || run.run_id.slice(0,15)}</div>
+    <div class="run-id">${run.run_id}</div>
+    <div class="run-meta">
+      <span>${run.adapter}</span>
+      <span>${run.llm_model}</span>
+      <span>${run.step_count} steps</span>
+    </div>
+    <span class="badge ${run.is_complete ? 'complete' : 'live'}">
+      ${run.is_complete ? 'Complete' : 'Live'}
+    </span>
+  `;
+  card.onclick = () => selectRun(run.run_id);
+
+  const list = document.getElementById('run-list');
+
+  if (!existing) {
+    if (prepend) {
+      list.insertBefore(card, list.firstChild);
+    } else {
+      list.appendChild(card);
+    }
+  }
+}
+
+function clearSidebarPlaceholder() {
+  const list = document.getElementById('run-list');
+  const placeholder = list.querySelector('div:not(.run-card)');
+  if (placeholder) placeholder.remove();
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// New-run SSE stream
+// ═══════════════════════════════════════════════════════════════════
+function connectNewRunStream() {
+  const src = new EventSource('/api/v1/runs/stream/new');
+  state.newRunStream = src;
+
+  src.addEventListener('existing_run', e => {
+    clearSidebarPlaceholder();
+    renderRunCard(JSON.parse(e.data), false);
+  });
+
+  src.addEventListener('new_run', e => {
+    clearSidebarPlaceholder();
+    renderRunCard(JSON.parse(e.data), true);
+  });
+
+  src.onerror = () => {
+    setTimeout(connectNewRunStream, 5000);
+    src.close();
+  };
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// Boot
+// ═══════════════════════════════════════════════════════════════════
+connectNewRunStream();
+</script>
+</body>
+</html>
