@@ -42,6 +42,7 @@ class WorldModelGenerator:
         "health", "saturation", "energy", "oxygen",
         "resource_level", "threat_proximity",
         "terrain_novelty", "entity_density",
+        "motor_efficiency",
     ]
 
     def __init__(self, config: Dict[str, Any]) -> None:
@@ -154,6 +155,10 @@ class WorldModelGenerator:
         h = state.homeostasis
         r = state.resources
         p = state.perception
+        pos = state.position
+        vx = pos.velocity_x or 0.0
+        vz = pos.velocity_z or 0.0
+        motor_efficiency = float(min((vx * vx + vz * vz) ** 0.5, 1.0))
         return {
             "health":            h.health or 0.0,
             "saturation":        h.saturation or 0.0,
@@ -163,4 +168,5 @@ class WorldModelGenerator:
             "threat_proximity":  r.threat_proximity or 0.0,
             "terrain_novelty":   p.terrain_novelty or 0.0,
             "entity_density":    p.entity_density or 0.0,
+            "motor_efficiency":  motor_efficiency,
         }

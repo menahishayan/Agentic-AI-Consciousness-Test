@@ -20,12 +20,18 @@ import numpy as np
 
 from core.adapters.animalai.action_mapper import get_policy_descriptors, policy_id_to_action
 from core.adapters.animalai.homeostatic_wrapper import HomeostaticWrapper
-from core.adapters.animalai.observation_mapper import _PositionTracker, map_obs
+from core.adapters.animalai.observation_mapper import _PositionTracker, _extract_local_speed, map_obs
 from core.adapters.base import AbstractEnvironmentAdapter
 from core.models.signals import DriveChannel
 from core.models.state import AgentState
 
 log = logging.getLogger(__name__)
+
+# Actions that command translational movement — used for stuck detection
+_MOVEMENT_ACTIONS = {"move_forward", "move_back"}
+
+# Local forward speed below which the agent is considered not moving
+_SPEED_STUCK_THRESHOLD = 0.05
 
 _DRIVE_CHANNELS = [
     DriveChannel(
@@ -94,12 +100,23 @@ class AnimalAIAdapter(AbstractEnvironmentAdapter):
 
         self._worker_id = int(config.get("worker_id", 1))
         self._base_port = int(config.get("base_port", 5005))
+        self._additional_args: List[str] = list(config.get("additional_args", []))
 
         # Optional: path to the Unity binary. None = connect to already-running instance.
         file_name = config.get("file_name")
         if file_name and config.get("resolve_filename", True):
             file_name = str(Path(file_name).resolve())
         self._file_name: Optional[str] = file_name
+
+        # Velocity scaling: Unity physics units/s → arena units/decision-step
+        # decision_period = frames per decision step (default 5 at 30Hz ≈ 0.167s/step)
+        physics_fps = float(config.get("physics_fps", 30.0))
+        decision_period = float(config.get("decision_period", 5.0))
+        self._velocity_dt: float = decision_period / physics_fps
+
+        # Proprioceptive stuck detection
+        self._stuck_adapter_count: int = 0
+        self._stuck_adapter_threshold: int = int(config.get("stuck_threshold", 5))
 
     # ------------------------------------------------------------------
     # AbstractEnvironmentAdapter interface
@@ -109,6 +126,7 @@ class AnimalAIAdapter(AbstractEnvironmentAdapter):
         self._step_count = 0
         self._homeostatic.reset()
         self._position_tracker.reset()
+        self._stuck_adapter_count = 0
 
         env = self._get_or_create_env()
         env.reset()
@@ -131,6 +149,19 @@ class AnimalAIAdapter(AbstractEnvironmentAdapter):
         obs, info = self._get_obs()
         raw_reward = float(info.get("raw_reward", 0.0))
         env_done = bool(info.get("env_done", False))
+
+        # Scale Unity physics velocity (units/s) to displacement per decision step
+        info["local_speed_forward"] = info.get("local_speed_forward", 0.0) * self._velocity_dt
+        info["local_speed_right"] = info.get("local_speed_right", 0.0) * self._velocity_dt
+
+        # Stuck detection: movement commanded but local forward speed is near zero
+        local_fwd = info.get("local_speed_forward", 0.0)
+        if action_id in _MOVEMENT_ACTIONS and abs(local_fwd) < _SPEED_STUCK_THRESHOLD:
+            self._stuck_adapter_count += 1
+        else:
+            self._stuck_adapter_count = 0
+        motor_stuck = self._stuck_adapter_count >= self._stuck_adapter_threshold
+        info["motor_stuck"] = motor_stuck
 
         self._homeostatic.step(raw_reward, env_done)
 
@@ -229,6 +260,7 @@ class AnimalAIAdapter(AbstractEnvironmentAdapter):
             arenas_configurations=self._arena_config_path,
             worker_id=self._worker_id,
             base_port=self._base_port,
+            additional_args=self._additional_args or None,
         )
         # Discover behavior name
         specs = env.behavior_specs
@@ -256,10 +288,13 @@ class AnimalAIAdapter(AbstractEnvironmentAdapter):
             obs_list = terminal_steps[agent_id].obs
             raw_reward = float(terminal_steps[agent_id].reward)
             visual_obs = self._extract_visual(obs_list)
+            fwd, right, up = _extract_local_speed(obs_list)
             return visual_obs, {
                 "raw_reward": raw_reward,
                 "env_done": True,
-                "x": 0.0, "y": 0.0, "z": 0.0,
+                "local_speed_forward": fwd,
+                "local_speed_right": right,
+                "local_speed_up": up,
             }
 
         if len(decision_steps) == 0:
@@ -269,10 +304,13 @@ class AnimalAIAdapter(AbstractEnvironmentAdapter):
         obs_list = decision_steps[agent_id].obs
         raw_reward = float(decision_steps[agent_id].reward)
         visual_obs = self._extract_visual(obs_list)
+        fwd, right, up = _extract_local_speed(obs_list)
         return visual_obs, {
             "raw_reward": raw_reward,
             "env_done": False,
-            "x": 0.0, "y": 0.0, "z": 0.0,
+            "local_speed_forward": fwd,
+            "local_speed_right": right,
+            "local_speed_up": up,
         }
 
     def _extract_visual(self, obs_list: List[Any]) -> Optional[np.ndarray]:

@@ -84,9 +84,25 @@ class PolicyGenerator:
         # Long-term memory callback (injected by AgentLoop)
         self._get_policy_history: Optional[Callable[[str], float]] = None
 
+        # LLM logging callback (injected by AgentLoop)
+        # Signature: (prompt: str, response: Any, trigger_reason: str, step: int) -> None
+        self._llm_log_cb: Optional[Callable] = None
+
+        # Arousal-driven diversity threshold:
+        # When arousal exceeds this value the fallback excludes the last-taken
+        # action from candidates, reducing precision on the failing policy
+        # rather than committing to a hard-coded escape sequence.
+        self._arousal_diversity_threshold: float = float(
+            cfg.get("arousal_diversity_threshold", 0.6)
+        )
+
     def set_policy_history_callback(self, fn: Callable[[str], float]) -> None:
         """Injected by AgentLoop — provides LTM success rates per policy."""
         self._get_policy_history = fn
+
+    def set_llm_log_callback(self, fn: Callable) -> None:
+        """Injected by AgentLoop — logs prompt + full CoT response to llm.jsonl."""
+        self._llm_log_cb = fn
 
     def propose_action(
         self,
@@ -126,7 +142,7 @@ class PolicyGenerator:
 
         if trigger == "urgent":
             # Block synchronously — conflict or critical PE streak
-            selected_id = self._call_llm_sync(policies, goals, context, step)
+            selected_id = self._call_llm_sync(policies, goals, context, step, reason)
             rationale = f"llm_sync:{reason}"
             self._pe_streak = 0
             self._last_goals_fingerprint = self._fingerprint(goals)
@@ -134,8 +150,13 @@ class PolicyGenerator:
 
         elif trigger == "async":
             # Fire LLM in background; use last result or fallback this step
-            self._fire_async_llm(policies, goals, context, step)
+            self._fire_async_llm(policies, goals, context, step, reason)
             selected_id = self._pending_llm_result
+            # Reject a stale "idle" when the agent is blocked or arousal is high
+            arousal = context.get("arousal", 0.0)
+            motor_blocked = context.get("motor_stuck", False) or arousal > self._arousal_diversity_threshold
+            if motor_blocked and selected_id == "idle":
+                selected_id = None
             if selected_id is None or selected_id not in {p["policy_id"] for p in policies}:
                 selected_id = self._urgency_fallback(policies, context)
                 rationale = f"async_pending:{reason}"
@@ -229,6 +250,7 @@ class PolicyGenerator:
         goals: List[Goal],
         context: Dict,
         step: int,
+        trigger_reason: str = "urgent",
     ) -> Optional[str]:
         """Blocking LLM call for urgent decisions."""
         try:
@@ -239,9 +261,16 @@ class PolicyGenerator:
                 max_tokens=200,
                 temperature=0.0,
             )
+            t0 = time.monotonic()
             response = self._llm.complete(request)
+            latency_ms = (time.monotonic() - t0) * 1000.0
             selected = self._parse_llm_response(response.content, policies)
             self._pending_llm_result = selected
+            if self._llm_log_cb is not None:
+                try:
+                    self._llm_log_cb(prompt, response, trigger_reason, step)
+                except Exception as log_exc:
+                    log.debug("LLM log callback failed: %s", log_exc)
             return selected
         except Exception as exc:
             log.warning("LLM sync call failed: %s", exc)
@@ -253,15 +282,19 @@ class PolicyGenerator:
         goals: List[Goal],
         context: Dict,
         step: int,
+        trigger_reason: str = "async",
     ) -> None:
         """Non-blocking LLM call — result available next step."""
         if self._llm_thread is not None and self._llm_thread.is_alive():
             return  # Already running
 
+        # Capture prompt on the main thread so context is not mutated by the time
+        # the thread reads it (context dict is recreated each step).
+        prompt = self._build_prompt(policies, goals, context, step)
+
         def _run() -> None:
             try:
                 from core.llm.types import LLMMessage, LLMRequest
-                prompt = self._build_prompt(policies, goals, context, step)
                 request = LLMRequest(
                     messages=[LLMMessage(role="user", content=prompt)],
                     max_tokens=200,
@@ -271,6 +304,11 @@ class PolicyGenerator:
                 self._pending_llm_result = self._parse_llm_response(response.content, policies)
                 self._last_llm_step = step
                 self._last_goals_fingerprint = self._fingerprint(goals)
+                if self._llm_log_cb is not None:
+                    try:
+                        self._llm_log_cb(prompt, response, trigger_reason, step)
+                    except Exception as log_exc:
+                        log.debug("LLM log callback failed: %s", log_exc)
             except Exception as exc:
                 log.warning("LLM async call failed: %s", exc)
                 self._pending_llm_result = None
@@ -285,42 +323,95 @@ class PolicyGenerator:
         context: Dict,
         step: int,
     ) -> str:
+        """
+        Structured chain-of-thought prompt following the Seth/Friston hierarchy:
+          Step 1: Interoceptive state (Layer 1 — allostatic drives)
+          Step 2: Exteroceptive state (Layer 2 — world model / motor)
+          Step 3: Predicted free energy per action (FreeEnergyMinimizer scores)
+          Step 4: Free-energy minimization commitment
+
+        CoT belongs ONLY in this deliberative path. Reflexes (stuck escape,
+        urgency fallback) are fast and never call this method.
+        """
         drive_batch: Optional[DriveSignalBatch] = context.get("drive_batch")
         pe_batch: Optional[PredictionErrorBatch] = context.get("pe_batch")
         av: Optional[ArousalValence] = context.get("arousal_valence")
+        fe_scores: Dict[str, float] = context.get("free_energy_scores", {})
+        coherence_scores: Dict[str, float] = context.get("coherence_scores", {})
 
         goal_text = "; ".join(g.description for g in goals) if goals else "no active goal"
-        drive_text = ""
+
+        # --- Step 1: interoceptive drives ---
         if drive_batch:
-            signals = sorted(drive_batch.signals, key=lambda s: s.urgency, reverse=True)[:3]
-            drive_text = "\n".join(
-                f"  - {s.channel_id}: value={s.current_value:.2f}, urgency={s.urgency:.2f}"
+            signals = sorted(drive_batch.signals, key=lambda s: s.urgency, reverse=True)
+            drive_lines = "\n".join(
+                f"  {s.channel_id}: value={s.current_value:.2f}  urgency={s.urgency:.2f}"
                 for s in signals
             )
-        pe_text = f"mean={pe_batch.mean_magnitude:.3f}" if pe_batch else "unknown"
-        arousal_text = f"arousal={av.arousal:.2f}, valence={av.valence:.2f}" if av else "unknown"
+        else:
+            drive_lines = "  (no drive data)"
+        arousal = av.arousal if av else 0.0
+        valence = av.valence if av else 0.0
 
-        policy_list = "\n".join(
-            f"  - {p['policy_id']}: {p.get('description', '')} [drive_tags: {p.get('drive_tags', [])}]"
-            for p in policies
+        # --- Step 2: exteroceptive / motor state ---
+        motor_pe_entry = next(
+            (e for e in pe_batch.errors if e.channel == "motor_efficiency"), None
+        ) if pe_batch else None
+        motor_eff = (
+            motor_pe_entry.observed if motor_pe_entry is not None
+            else context.get("motor_efficiency", 1.0)
         )
+        motor_stuck = context.get("motor_stuck", False)
+        heading_deg = (context.get("heading", 0.0) * 180.0 / 3.14159) % 360.0
+        pe_mean = pe_batch.mean_magnitude if pe_batch else 0.0
+        pe_streak = self._pe_streak
+
+        # --- Step 3: predicted free energy per action ---
+        fe_lines = []
+        for p in policies:
+            pid = p["policy_id"]
+            fe = fe_scores.get(pid, 0.0)
+            coh = coherence_scores.get(pid, 0.5)
+            fe_lines.append(f"  {pid:<16} FE={fe:.3f}  coherence={coh:.2f}")
+        fe_text = "\n".join(fe_lines) if fe_lines else "  (no scores)"
+
+        # --- Affect interpretation for Step 4 ---
+        if arousal > self._arousal_diversity_threshold and valence < -0.1:
+            affect_note = (
+                f"\n  ⚠ Affect: arousal={arousal:.2f} HIGH + valence={valence:.2f} NEGATIVE"
+                "\n    The generative model predicts high expected free energy under the current"
+                "\n    policy. This strategy is failing — prioritise an action different from"
+                "\n    the last one taken."
+            )
+        elif arousal > self._arousal_diversity_threshold:
+            affect_note = (
+                f"\n  Note: arousal={arousal:.2f} elevated — prediction errors accumulating."
+                "\n    Consider a novel action to reduce uncertainty."
+            )
+        else:
+            affect_note = ""
 
         return f"""You are the deliberative reasoning system for a survival agent (step {step}).
+Reason through each step, then respond with the chosen policy_id on the ACTION line.
 
-TASK GOAL: {goal_text}
+══ STEP 1 — INTEROCEPTIVE STATE (allostatic drives) ══
+{drive_lines}
+  Arousal: {arousal:.2f}  |  Valence: {valence:.2f}
 
-CURRENT BODY STATE:
-{drive_text if drive_text else "  (no drive data)"}
+══ STEP 2 — EXTEROCEPTIVE STATE (world model + motor) ══
+  Heading:   {heading_deg:.0f}°
+  Motor:     efficiency={motor_eff:.2f}  stuck={'YES' if motor_stuck else 'no'}
+  PE streak: {pe_streak} steps  |  Mean PE: {pe_mean:.4f}
 
-COGNITIVE STATE: {arousal_text}
-PREDICTION ERROR: {pe_text}
+══ STEP 3 — PREDICTED FREE ENERGY PER ACTION ══
+{fe_text}
+  (Higher FE score = action better minimises drive error + prediction error)
 
-AVAILABLE ACTIONS:
-{policy_list}
+══ STEP 4 — FREE ENERGY MINIMISATION ══
+  Goal: {goal_text}
+  Which action best reduces interoceptive error (drives) and prediction error?{affect_note}
 
-Select the single best action to take RIGHT NOW to survive and achieve the goal.
-Respond with ONLY the policy_id, nothing else.
-Example: move_forward"""
+ACTION: """
 
     def _parse_llm_response(
         self,
@@ -350,8 +441,24 @@ Example: move_forward"""
     ) -> str:
         """
         Fast reactive selection — no LLM, purely drive-tag matching.
-        Scores each policy by urgency of matching drive channels.
+
+        Arousal-sensitive diversity:
+          When arousal exceeds the threshold (motor PE high = agent is blocked,
+          or drives are critically low), the last-taken action is excluded from
+          the candidate set. This reduces the precision weight on the failing
+          policy, allowing other actions to compete — Seth-consistent affect
+          modulation without a hard-coded escape sequence.
         """
+        arousal: float = context.get("arousal", 0.0)
+        active_policies = list(policies)
+
+        if arousal > self._arousal_diversity_threshold:
+            last_action = context.get("last_action")
+            if last_action is not None:
+                eligible = [p for p in active_policies if p["policy_id"] != last_action]
+                if eligible:
+                    active_policies = eligible
+
         drive_batch: Optional[DriveSignalBatch] = context.get("drive_batch")
         urgency_by_tag: Dict[str, float] = {}
 
@@ -363,12 +470,11 @@ Example: move_forward"""
         best_id = None
         best_score = -1.0
 
-        for policy in policies:
+        for policy in active_policies:
             score = 0.0
             for tag in policy.get("drive_tags", []) + policy.get("tags", []):
                 score = max(score, urgency_by_tag.get(tag, 0.0))
 
-            # Add LTM success rate bonus
             if self._get_policy_history is not None:
                 ltm_rate = self._get_policy_history(policy["policy_id"])
                 score += ltm_rate * 0.1
@@ -377,7 +483,7 @@ Example: move_forward"""
                 best_score = score
                 best_id = policy["policy_id"]
 
-        return best_id or policies[0]["policy_id"]
+        return best_id or active_policies[0]["policy_id"]
 
     # ------------------------------------------------------------------
     # Helpers

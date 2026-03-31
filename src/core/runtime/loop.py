@@ -96,6 +96,20 @@ class AgentLoop:
         # Layer 3: Action selection
         self._policy_gen = PolicyGenerator(llm_client=llm_client, config=config)
         self._policy_gen.set_policy_history_callback(memory.get_ltm_success_rate)
+
+        def _llm_log_cb(prompt: str, resp: Any, reason: str, step: int) -> None:
+            logger.llm(
+                prompt=prompt,
+                response=resp.content,
+                model=resp.model or "",
+                latency_ms=resp.latency_ms or 0.0,
+                input_tokens=resp.input_tokens or 0,
+                output_tokens=resp.output_tokens or 0,
+                trigger_reason=reason,
+                step=step,
+            )
+
+        self._policy_gen.set_llm_log_callback(_llm_log_cb)
         self._free_energy = FreeEnergyMinimizer(config=config)
 
         # Action dispatcher closure — MotorControlInterface has NO adapter import
@@ -221,6 +235,17 @@ class AgentLoop:
         # --- Layer 4: Metacognitive ---
         context = self._metacognitive.update(self._workspace, self._goals, step)
         context["policies"] = self._policies
+        # Proprioceptive motor flag: set by adapter, consumed by PolicyGenerator reflex
+        context["motor_stuck"] = state.raw_metadata.get("motor_stuck", False)
+        context["heading"] = state.position.heading or 0.0
+        vx = state.position.velocity_x or 0.0
+        vz = state.position.velocity_z or 0.0
+        context["motor_efficiency"] = float(min((vx * vx + vz * vz) ** 0.5, 1.0))
+        # Affect state — used by PolicyGenerator arousal-diversity fallback
+        context["arousal"] = av.arousal
+        context["valence"] = av.valence
+        # Last action — excluded from candidates when arousal is high
+        context["last_action"] = self._last_policy_id
 
         # --- Layer 3: Goal coherence + free energy scoring ---
         coherence_scores = self._goal_checker.score_all(self._policies, self._goals)

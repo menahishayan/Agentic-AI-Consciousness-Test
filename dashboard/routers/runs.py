@@ -61,6 +61,7 @@ async def get_bulk(run_id: str, request: Request):
     metrics = JsonlTailer(info.run_dir / "metrics.jsonl").read_all()
     events = JsonlTailer(info.run_dir / "events.jsonl").read_all()
     raw_states = JsonlTailer(info.run_dir / "state.jsonl").read_all()
+    raw_llm = JsonlTailer(info.run_dir / "llm.jsonl").read_all()
 
     positions = []
     for row in raw_states:
@@ -75,8 +76,24 @@ async def get_bulk(run_id: str, request: Request):
                 "heading": pos.get("heading"),
             })
 
+    llm_calls = [
+        {
+            "step": row.get("step"),
+            "t": row.get("t"),
+            "model": row.get("model"),
+            "trigger_reason": row.get("trigger_reason", ""),
+            "latency_ms": row.get("latency_ms"),
+            "input_tokens": row.get("input_tokens"),
+            "output_tokens": row.get("output_tokens"),
+            "response": row.get("response", ""),
+            "prompt": row.get("prompt", ""),
+        }
+        for row in raw_llm
+    ]
+
     return {
         "metrics": metrics,
         "events": events,
         "positions": positions,
+        "llm_calls": llm_calls,
     }

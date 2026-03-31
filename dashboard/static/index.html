@@ -268,6 +268,121 @@
   .event-row .ev-type { color: var(--warn); min-width: 120px; }
   .event-row .ev-detail { color: var(--muted); }
 
+  /* ── LLM Reasoning panel ─────────────────────────────────────── */
+  #llm-card {
+    grid-column: span 2;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 12px 14px;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+  }
+
+  #llm-title {
+    font-size: 11px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.07em;
+    color: var(--muted);
+  }
+
+  #llm-body {
+    display: flex;
+    gap: 12px;
+    min-height: 260px;
+  }
+
+  #llm-call-list {
+    width: 220px;
+    min-width: 220px;
+    overflow-y: auto;
+    border-right: 1px solid var(--border);
+    padding-right: 10px;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+  }
+
+  .llm-call-item {
+    padding: 7px 8px;
+    border-radius: 6px;
+    cursor: pointer;
+    border: 1px solid transparent;
+    transition: background 0.1s;
+  }
+
+  .llm-call-item:hover { background: var(--surface2); }
+
+  .llm-call-item.active {
+    background: var(--surface2);
+    border-color: var(--accent);
+  }
+
+  .llm-call-item .lci-step {
+    font-family: monospace;
+    font-size: 12px;
+    color: var(--accent);
+    font-weight: 700;
+  }
+
+  .llm-call-item .lci-trigger {
+    font-size: 11px;
+    color: var(--warn);
+    margin-top: 1px;
+  }
+
+  .llm-call-item .lci-meta {
+    font-size: 10px;
+    color: var(--muted);
+    margin-top: 2px;
+  }
+
+  #llm-response {
+    flex: 1;
+    overflow-y: auto;
+    padding-left: 12px;
+    font-size: 12.5px;
+    line-height: 1.6;
+    color: var(--text);
+  }
+
+  #llm-response .cot-section {
+    margin-bottom: 14px;
+  }
+
+  #llm-response .cot-header {
+    font-size: 10px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--accent);
+    margin-bottom: 4px;
+    padding-bottom: 3px;
+    border-bottom: 1px solid var(--border);
+  }
+
+  #llm-response .cot-body {
+    color: #c9d1e0;
+    white-space: pre-wrap;
+    font-family: monospace;
+    font-size: 12px;
+  }
+
+  #llm-response .cot-action {
+    display: inline-block;
+    margin-top: 6px;
+    padding: 3px 10px;
+    background: rgba(124,140,248,0.15);
+    border: 1px solid var(--accent);
+    border-radius: 5px;
+    font-family: monospace;
+    font-size: 12px;
+    font-weight: 700;
+    color: var(--accent);
+  }
+
   /* ── Placeholder ──────────────────────────────────────── */
   #placeholder {
     grid-column: span 2;
@@ -298,7 +413,7 @@
     Agent Runs
   </div>
   <div id="run-list">
-    <div style="padding:12px;color:var(--muted);font-size:12px;">Connecting...</div>
+    <div id="sidebar-placeholder" style="padding:12px;color:var(--muted);font-size:12px;">Connecting...</div>
   </div>
 </nav>
 
@@ -320,6 +435,27 @@
 </div>
 
 <script>
+// ═══════════════════════════════════════════════════════════════════
+// Time formatting
+// ═══════════════════════════════════════════════════════════════════
+function formatRunTime(run) {
+  const ts = run.start_time;   // unix seconds (float), may be null
+  if (!ts) return run.start_time_str || run.run_id.slice(0, 15);
+  const ms = ts * 1000;
+  const diffSec = (Date.now() - ms) / 1000;
+  if (diffSec < 3600) {
+    // relative
+    if (diffSec < 60)  return 'just now';
+    const m = Math.floor(diffSec / 60);
+    return `${m} minute${m !== 1 ? 's' : ''} ago`;
+  }
+  // localized short date + time
+  return new Date(ms).toLocaleString(undefined, {
+    month: 'short', day: 'numeric', year: 'numeric',
+    hour: 'numeric', minute: '2-digit',
+  });
+}
+
 // ═══════════════════════════════════════════════════════════════════
 // State
 // ═══════════════════════════════════════════════════════════════════
@@ -509,6 +645,15 @@ function buildChartGrid() {
       <div class="chart-wrap"><canvas id="ch-position"></canvas></div>
     </div>
 
+    <!-- LLM Reasoning -->
+    <div id="llm-card">
+      <div id="llm-title">LLM Chain-of-Thought Reasoning</div>
+      <div id="llm-body">
+        <div id="llm-call-list"><div style="color:var(--muted);font-size:12px;">No LLM calls yet.</div></div>
+        <div id="llm-response"><div style="color:var(--muted);font-size:12px;">Select a call on the left to view its reasoning.</div></div>
+      </div>
+    </div>
+
     <!-- Events -->
     <div id="events-card">
       <div id="events-title">Episode Events</div>
@@ -686,15 +831,111 @@ function ingestRunComplete(payload) {
   }
 }
 
+// ─── LLM reasoning ───────────────────────────────────────────────
+
+function ingestLlmCall(row, autoSelect = false) {
+  state.llmCalls.push(row);
+  const idx = state.llmCalls.length - 1;
+  renderLlmCallItem(row, idx);
+  if (autoSelect || state.selectedLlmIdx === null) {
+    selectLlmCall(idx);
+  }
+}
+
+function renderLlmCallItem(row, idx) {
+  const list = document.getElementById('llm-call-list');
+  if (!list) return;
+  // Remove placeholder
+  const ph = list.querySelector('div:not(.llm-call-item)');
+  if (ph) ph.remove();
+
+  const trigger = row.trigger_reason || 'initial';
+  const latency = row.latency_ms != null ? `${Math.round(row.latency_ms)}ms` : '';
+  const tokens = (row.input_tokens != null && row.output_tokens != null)
+    ? `↑${row.input_tokens} ↓${row.output_tokens} tok`
+    : '';
+
+  const item = document.createElement('div');
+  item.className = 'llm-call-item';
+  item.dataset.idx = idx;
+  item.innerHTML = `
+    <div class="lci-step">Step ${row.step ?? '?'}</div>
+    <div class="lci-trigger">${trigger}</div>
+    <div class="lci-meta">${latency}${latency && tokens ? '  ' : ''}${tokens}</div>
+  `;
+  item.onclick = () => selectLlmCall(idx);
+  list.appendChild(item);
+}
+
+function selectLlmCall(idx) {
+  state.selectedLlmIdx = idx;
+
+  // Update active state in list
+  document.querySelectorAll('.llm-call-item').forEach(el => {
+    el.classList.toggle('active', Number(el.dataset.idx) === idx);
+  });
+
+  const row = state.llmCalls[idx];
+  const el = document.getElementById('llm-response');
+  if (!el || !row) return;
+
+  el.innerHTML = formatCoT(row.response || '');
+}
+
+function formatCoT(text) {
+  if (!text.trim()) return '<div style="color:var(--muted);font-size:12px;">No response text.</div>';
+
+  // Split on ### section headers
+  const parts = text.split(/(?=###\s)/);
+  let html = '';
+
+  for (const part of parts) {
+    const headerMatch = part.match(/^###\s+(.+?)\n([\s\S]*)/);
+    if (headerMatch) {
+      const header = headerMatch[1].trim();
+      const body = headerMatch[2].trim();
+      // Extract ACTION line if present
+      const actionMatch = body.match(/ACTION\s*:\s*(\S+)/i);
+      const bodyDisplay = actionMatch
+        ? body.replace(/ACTION\s*:\s*\S+/i, '').trim()
+        : body;
+      html += `<div class="cot-section">
+        <div class="cot-header">${escHtml(header)}</div>
+        <div class="cot-body">${escHtml(bodyDisplay)}</div>
+        ${actionMatch ? `<span class="cot-action">ACTION: ${escHtml(actionMatch[1])}</span>` : ''}
+      </div>`;
+    } else {
+      // Top-level text (## header or preamble) — skip decorative headers
+      const cleaned = part.replace(/^##\s+.+\n?/, '').trim();
+      if (cleaned) {
+        html += `<div class="cot-section"><div class="cot-body">${escHtml(cleaned)}</div></div>`;
+      }
+    }
+  }
+
+  return html || `<div class="cot-section"><div class="cot-body">${escHtml(text)}</div></div>`;
+}
+
+function escHtml(s) {
+  return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+
+// ─────────────────────────────────────────────────────────────────
+
 function loadBulkData(data) {
   for (const row of data.metrics || []) ingestMetric(row);
   for (const row of data.events || []) {
     if (row.event !== 'step') ingestEvent(row);
   }
   for (const row of data.positions || []) ingestPosition(row);
+  for (const row of data.llm_calls || []) ingestLlmCall(row, false);
   // Force update all charts
   for (const chart of Object.values(state.charts)) {
     if (chart) chart.update('none');
+  }
+  // Auto-select latest LLM call after bulk load
+  if (state.llmCalls.length > 0) {
+    selectLlmCall(state.llmCalls.length - 1);
   }
   updateStepCounter();
 }
@@ -714,6 +955,8 @@ async function selectRun(runId) {
   state.activeRunId = runId;
   state.lastStep = 0;
   state.policyColors = {};
+  state.llmCalls = [];
+  state.selectedLlmIdx = null;
 
   // Update sidebar active state
   document.querySelectorAll('.run-card').forEach(el => {
@@ -729,7 +972,7 @@ async function selectRun(runId) {
       <div class="pill">Adapter: <span>${run.adapter}</span></div>
       <div class="pill">Provider: <span>${run.llm_provider}</span></div>
       <div class="pill">Model: <span>${run.llm_model}</span></div>
-      <div class="pill">Started: <span>${run.start_time_str || ''}</span></div>
+      <div class="pill">Started: <span>${formatRunTime(run)}</span></div>
     `;
   }
 
@@ -777,6 +1020,10 @@ function openRunStream(runId) {
     src.close();
   });
 
+  src.addEventListener('llm_call', e => {
+    ingestLlmCall(JSON.parse(e.data), true);
+  });
+
   src.addEventListener('heartbeat', () => {});
 
   src.onerror = () => {
@@ -802,7 +1049,7 @@ function renderRunCard(run, prepend = false) {
   card.className = 'run-card' + (state.activeRunId === run.run_id ? ' active' : '');
   card.dataset.id = run.run_id;
   card.innerHTML = `
-    <div class="run-time">${run.start_time_str || run.run_id.slice(0,15)}</div>
+    <div class="run-time">${formatRunTime(run)}</div>
     <div class="run-id">${run.run_id}</div>
     <div class="run-meta">
       <span>${run.adapter}</span>
@@ -827,9 +1074,8 @@ function renderRunCard(run, prepend = false) {
 }
 
 function clearSidebarPlaceholder() {
-  const list = document.getElementById('run-list');
-  const placeholder = list.querySelector('div:not(.run-card)');
-  if (placeholder) placeholder.remove();
+  const el = document.getElementById('sidebar-placeholder');
+  if (el) el.remove();
 }
 
 // ═══════════════════════════════════════════════════════════════════

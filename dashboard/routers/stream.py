@@ -38,6 +38,7 @@ async def _run_stream(
     metrics_tailer = JsonlTailer(info.run_dir / "metrics.jsonl")
     events_tailer = JsonlTailer(info.run_dir / "events.jsonl")
     state_tailer = JsonlTailer(info.run_dir / "state.jsonl")
+    llm_tailer = JsonlTailer(info.run_dir / "llm.jsonl")
 
     # Fast-forward tailers past already-seen steps by advancing offsets
     # via read_all (we skip emission since bulk endpoint covered history)
@@ -48,12 +49,15 @@ async def _run_stream(
             pass
         for row in state_tailer.read_all():
             pass
+        for row in llm_tailer.read_all():
+            pass
         # Now reset to tail from current position
         metrics_tailer._offset = 0
         events_tailer._offset = 0
         state_tailer._offset = 0
+        llm_tailer._offset = 0
         # Re-advance by seeking to end
-        for tailer in (metrics_tailer, events_tailer, state_tailer):
+        for tailer in (metrics_tailer, events_tailer, state_tailer, llm_tailer):
             if tailer._path.exists():
                 size = tailer._path.stat().st_size
                 tailer._offset = size
@@ -108,6 +112,24 @@ async def _run_stream(
                     })
                     had_data = True
 
+            # --- llm calls ---
+            for row in llm_tailer.poll():
+                step = row.get("step", -1)
+                if step <= after_step:
+                    continue
+                yield _sse("llm_call", {
+                    "step": step,
+                    "t": row.get("t"),
+                    "model": row.get("model"),
+                    "trigger_reason": row.get("trigger_reason", ""),
+                    "latency_ms": row.get("latency_ms"),
+                    "input_tokens": row.get("input_tokens"),
+                    "output_tokens": row.get("output_tokens"),
+                    "response": row.get("response", ""),
+                    "prompt": row.get("prompt", ""),
+                })
+                had_data = True
+
             if had_data:
                 last_activity = time.monotonic()
                 empty_cycles = 0
@@ -129,6 +151,7 @@ async def _run_stream(
         metrics_tailer.close()
         events_tailer.close()
         state_tailer.close()
+        llm_tailer.close()
 
 
 async def _new_runs_stream(registry) -> AsyncIterator[str]:

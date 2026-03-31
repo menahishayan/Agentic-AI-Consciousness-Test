@@ -25,14 +25,15 @@ from core.models.state import AgentState
 
 
 _CHANNEL_SOURCES = {
-    "health":           "proprioceptive",
-    "saturation":       "proprioceptive",
-    "energy":           "proprioceptive",
-    "oxygen":           "proprioceptive",
-    "resource_level":   "visual",
-    "threat_proximity": "threat",
-    "terrain_novelty":  "visual",
-    "entity_density":   "visual",
+    "health":            "proprioceptive",
+    "saturation":        "proprioceptive",
+    "energy":            "proprioceptive",
+    "oxygen":            "proprioceptive",
+    "motor_efficiency":  "proprioceptive",
+    "resource_level":    "visual",
+    "threat_proximity":  "threat",
+    "terrain_novelty":   "visual",
+    "entity_density":    "visual",
 }
 
 
@@ -149,13 +150,18 @@ class PredictionErrorCalculator:
         h = state.homeostasis
         r = state.resources
         p = state.perception
+        pos = state.position
+        vx = pos.velocity_x or 0.0
+        vz = pos.velocity_z or 0.0
+        motor_efficiency = float(min((vx * vx + vz * vz) ** 0.5, 1.0))
         return {
-            "health":           h.health or 0.0,
-            "saturation":       h.saturation or 0.0,
-            "energy":           h.energy or 0.0,
-            "oxygen":           h.oxygen or 1.0,
-            "resource_level":   r.resource_level or 0.5,
-            "threat_proximity": r.threat_proximity or 0.0,
-            "terrain_novelty":  p.terrain_novelty or 0.0,
-            "entity_density":   p.entity_density or 0.0,
+            "health":            h.health or 0.0,
+            "saturation":        h.saturation or 0.0,
+            "energy":            h.energy or 0.0,
+            "oxygen":            h.oxygen or 1.0,
+            "motor_efficiency":  motor_efficiency,
+            "resource_level":    r.resource_level or 0.5,
+            "threat_proximity":  r.threat_proximity or 0.0,
+            "terrain_novelty":   p.terrain_novelty or 0.0,
+            "entity_density":    p.entity_density or 0.0,
         }

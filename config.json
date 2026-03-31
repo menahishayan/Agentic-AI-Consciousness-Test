@@ -21,7 +21,16 @@
     "arena_config": "animalai_configs/basic_food.yaml",
     "worker_id": 1,
     "base_port": 5005,
-    "file_name": "./animal-ai-unity/AnimalAI.app"
+    "physics_fps": 30.0,
+    "decision_period": 5.0,
+    "file_name": "./animal-ai-unity/AnimalAI.app",
+    "additional_args": [
+      "-screen-width",
+      "256",
+      "-screen-height",
+      "256",
+      "-popupwindow"
+    ]
   },
   "llm": {
     "enabled": true,
@@ -34,10 +43,11 @@
   "policy_generator": {
     "llm_conflict_threshold": 0.8,
     "pe_streak_threshold": 5,
-    "pe_high_threshold": 0.7,
+    "pe_high_threshold": 0.35,
     "llm_reeval_interval": 10,
     "skill_gap_urgency_threshold": 0.8,
     "plan_window": 20,
+    "arousal_diversity_threshold": 0.6,
     "max_plan_phases": 5,
     "weights": {
       "goal_coherence": 0.6,
@@ -78,10 +88,12 @@
     "w_saturation": 0.25,
     "w_threat": 0.30,
     "w_pred_err": 0.10,
+    "w_motor": 0.20,
     "v_health": 0.30,
     "v_saturation": 0.25,
     "v_resource": 0.20,
-    "v_safety": 0.25
+    "v_safety": 0.25,
+    "v_motor_pe": 0.15
   },
   "memory": {
     "working_memory_capacity": 100,
@@ -95,6 +107,9 @@
     "max_outcome_history": 200
   },
   "observability": {
-    "log_root": "src/logs/runs"
+    "log_root": "src/logs/runs",
+    "log_prompts": true,
+    "log_state": true,
+    "log_memory": true
   }
 }

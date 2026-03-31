@@ -99,6 +99,7 @@ def map_obs(
         raw_metadata={
             "raw_reward": info.get("raw_reward", 0.0),
             "env_done": info.get("env_done", False),
+            "motor_stuck": info.get("motor_stuck", False),
         },
     )
 
@@ -146,6 +147,21 @@ def _extract_visual_features(obs: Optional[np.ndarray]) -> List[float]:
     hist_features = [float(v) / max(float(hist.max()), 1e-6) for v in hist]
 
     return channel_features + [edge_density] + hist_features
+
+
+def _extract_local_speed(obs_list: List[Any]) -> Tuple[float, float, float]:
+    """
+    Extract (forward, right, up) local speeds from Animal AI's vector observation.
+
+    Animal AI places a 1-D float array alongside the camera obs. The first three
+    elements are the agent's local-frame velocity components. Returns (0, 0, 0) if
+    no 1-D array with ≥3 elements is found (e.g. visual-only arena configs).
+    """
+    for obs in obs_list:
+        arr = np.asarray(obs)
+        if arr.ndim == 1 and len(arr) >= 3:
+            return float(arr[0]), float(arr[1]), float(arr[2])
+    return 0.0, 0.0, 0.0
 
 
 def _build_area_id(x: float, z: float) -> str:
@@ -213,8 +229,10 @@ class _PositionTracker:
         y = info.get("y", 0.0)
         z = info.get("z", self._z)
         heading = info.get("heading", 0.0)
-        vx = info.get("velocity_x", 0.0)
-        vz = info.get("velocity_z", 0.0)
+        # Prefer real local speeds from Animal AI's vector obs; fall back to
+        # the velocity_x/z keys set by the adapter as a proxy.
+        vx = info.get("local_speed_forward", info.get("velocity_x", 0.0))
+        vz = info.get("local_speed_right", info.get("velocity_z", 0.0))
 
         self._x = float(x + vx)
         self._z = float(z + vz)
