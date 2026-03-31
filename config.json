@@ -44,7 +44,7 @@
     "llm_conflict_threshold": 0.8,
     "pe_streak_threshold": 5,
     "pe_high_threshold": 0.35,
-    "llm_reeval_interval": 10,
+    "llm_reeval_interval": 3,
     "skill_gap_urgency_threshold": 0.8,
     "plan_window": 20,
     "arousal_diversity_threshold": 0.6,
@@ -53,7 +53,8 @@
       "goal_coherence": 0.6,
       "prediction_error": 0.4,
       "allostatic_survival_fit": 0.2,
-      "allostatic_urgency_alignment": 0.2
+      "allostatic_urgency_alignment": 0.2,
+      "turn_novelty": 0.15
     },
     "fallback_scores": {
       "goal_coherence": 0.5,

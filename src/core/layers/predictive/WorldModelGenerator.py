@@ -155,10 +155,7 @@ class WorldModelGenerator:
         h = state.homeostasis
         r = state.resources
         p = state.perception
-        pos = state.position
-        vx = pos.velocity_x or 0.0
-        vz = pos.velocity_z or 0.0
-        motor_efficiency = float(min((vx * vx + vz * vz) ** 0.5, 1.0))
+        motor_efficiency = float(state.raw_metadata.get("motor_efficiency", 1.0))
         return {
             "health":            h.health or 0.0,
             "saturation":        h.saturation or 0.0,

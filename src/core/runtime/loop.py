@@ -97,7 +97,7 @@ class AgentLoop:
         self._policy_gen = PolicyGenerator(llm_client=llm_client, config=config)
         self._policy_gen.set_policy_history_callback(memory.get_ltm_success_rate)
 
-        def _llm_log_cb(prompt: str, resp: Any, reason: str, step: int) -> None:
+        def _llm_log_cb(prompt: str, resp: Any, reason: str, step: int, selected: Optional[str] = None) -> None:
             logger.llm(
                 prompt=prompt,
                 response=resp.content,
@@ -106,6 +106,7 @@ class AgentLoop:
                 input_tokens=resp.input_tokens or 0,
                 output_tokens=resp.output_tokens or 0,
                 trigger_reason=reason,
+                selected=selected,
                 step=step,
             )
 
@@ -126,6 +127,8 @@ class AgentLoop:
         self._current_state: Optional[AgentState] = None
         self._last_policy_id: Optional[str] = None
         self._step: int = 0
+        # Rolling action history for LLM context (last 10 actions)
+        self._recent_actions: List[str] = []
 
     # ------------------------------------------------------------------
     # Public API
@@ -238,14 +241,14 @@ class AgentLoop:
         # Proprioceptive motor flag: set by adapter, consumed by PolicyGenerator reflex
         context["motor_stuck"] = state.raw_metadata.get("motor_stuck", False)
         context["heading"] = state.position.heading or 0.0
-        vx = state.position.velocity_x or 0.0
-        vz = state.position.velocity_z or 0.0
-        context["motor_efficiency"] = float(min((vx * vx + vz * vz) ** 0.5, 1.0))
+        context["motor_efficiency"] = float(state.raw_metadata.get("motor_efficiency", 1.0))
         # Affect state — used by PolicyGenerator arousal-diversity fallback
         context["arousal"] = av.arousal
         context["valence"] = av.valence
         # Last action — excluded from candidates when arousal is high
         context["last_action"] = self._last_policy_id
+        # Rolling history for LLM prompt — lets the model detect repetition
+        context["recent_actions"] = list(self._recent_actions)
 
         # --- Layer 3: Goal coherence + free energy scoring ---
         coherence_scores = self._goal_checker.score_all(self._policies, self._goals)
@@ -254,6 +257,7 @@ class AgentLoop:
             drive_batch=drive_batch,
             pe_batch=pe_batch,
             goal_coherence_scores=coherence_scores,
+            area_familiarity=familiarity,
         )
         context["free_energy_scores"] = fe_scores
         context["coherence_scores"] = coherence_scores
@@ -275,6 +279,10 @@ class AgentLoop:
         next_state, done = self._motor.execute(selected_id)
         self._last_policy_id = selected_id
         self._current_state = next_state
+        # Maintain rolling action history (last 10 steps)
+        self._recent_actions.append(selected_id)
+        if len(self._recent_actions) > 10:
+            self._recent_actions.pop(0)
 
         # --- Layer 2: World model learning ---
         self._world_model.update(

@@ -114,6 +114,16 @@ class AnimalAIAdapter(AbstractEnvironmentAdapter):
         decision_period = float(config.get("decision_period", 5.0))
         self._velocity_dt: float = decision_period / physics_fps
 
+        # Expected full-throttle forward speed in Unity physics units/sec.
+        # = arena step_size (metres/step) / dt (seconds/step)
+        # e.g. step_size=1.0, dt=0.167 → expected_speed=6.0 Unity units/sec
+        # motor_efficiency = raw_fwd / expected_speed:
+        #   free movement at ~16 u/s → clamped to 1.0
+        #   wall-blocked at ~0 u/s   → near 0.0
+        sim_cfg = config.get("simulation", {})
+        step_size = float(sim_cfg.get("step_size", 1.0))
+        self._expected_speed: float = step_size / max(self._velocity_dt, 1e-6)
+
         # Proprioceptive stuck detection
         self._stuck_adapter_count: int = 0
         self._stuck_adapter_threshold: int = int(config.get("stuck_threshold", 5))
@@ -150,8 +160,15 @@ class AnimalAIAdapter(AbstractEnvironmentAdapter):
         raw_reward = float(info.get("raw_reward", 0.0))
         env_done = bool(info.get("env_done", False))
 
+        # Compute motor_efficiency BEFORE dt-scaling, using raw Unity units/sec.
+        # Normalised by expected full-throttle speed so the signal is [0, 1]:
+        #   free movement → 1.0,  wall-blocked → ~0.0
+        raw_fwd = float(info.get("local_speed_forward", 0.0))
+        motor_efficiency = float(min(max(raw_fwd / self._expected_speed, 0.0), 1.0))
+        info["motor_efficiency"] = motor_efficiency
+
         # Scale Unity physics velocity (units/s) to displacement per decision step
-        info["local_speed_forward"] = info.get("local_speed_forward", 0.0) * self._velocity_dt
+        info["local_speed_forward"] = raw_fwd * self._velocity_dt
         info["local_speed_right"] = info.get("local_speed_right", 0.0) * self._velocity_dt
 
         # Stuck detection: movement commanded but local forward speed is near zero

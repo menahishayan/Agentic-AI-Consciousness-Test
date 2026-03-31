@@ -108,6 +108,7 @@ class RunLogger:
         input_tokens: int = 0,
         output_tokens: int = 0,
         trigger_reason: str = "",
+        selected: Optional[str] = None,
         step: int = 0,
     ) -> None:
         if self._llm_f:
@@ -116,6 +117,7 @@ class RunLogger:
                 "step": step,
                 "model": model,
                 "trigger_reason": trigger_reason,
+                "selected": selected,
                 "latency_ms": round(latency_ms, 1),
                 "input_tokens": input_tokens,
                 "output_tokens": output_tokens,

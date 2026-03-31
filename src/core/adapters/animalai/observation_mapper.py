@@ -100,6 +100,7 @@ def map_obs(
             "raw_reward": info.get("raw_reward", 0.0),
             "env_done": info.get("env_done", False),
             "motor_stuck": info.get("motor_stuck", False),
+            "motor_efficiency": info.get("motor_efficiency", 1.0),
         },
     )
 

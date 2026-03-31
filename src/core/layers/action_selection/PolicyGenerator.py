@@ -268,7 +268,7 @@ class PolicyGenerator:
             self._pending_llm_result = selected
             if self._llm_log_cb is not None:
                 try:
-                    self._llm_log_cb(prompt, response, trigger_reason, step)
+                    self._llm_log_cb(prompt, response, trigger_reason, step, selected)
                 except Exception as log_exc:
                     log.debug("LLM log callback failed: %s", log_exc)
             return selected
@@ -301,12 +301,13 @@ class PolicyGenerator:
                     temperature=0.1,
                 )
                 response = self._llm.complete(request)
-                self._pending_llm_result = self._parse_llm_response(response.content, policies)
+                selected = self._parse_llm_response(response.content, policies)
+                self._pending_llm_result = selected
                 self._last_llm_step = step
                 self._last_goals_fingerprint = self._fingerprint(goals)
                 if self._llm_log_cb is not None:
                     try:
-                        self._llm_log_cb(prompt, response, trigger_reason, step)
+                        self._llm_log_cb(prompt, response, trigger_reason, step, selected)
                     except Exception as log_exc:
                         log.debug("LLM log callback failed: %s", log_exc)
             except Exception as exc:
@@ -353,6 +354,23 @@ class PolicyGenerator:
         arousal = av.arousal if av else 0.0
         valence = av.valence if av else 0.0
 
+        # --- Step 2: recent action history ---
+        recent = context.get("recent_actions", [])
+        if recent:
+            # Compress runs: ["move_forward","move_forward","turn_left"] → "move_forward×2, turn_left"
+            compressed = []
+            i = 0
+            while i < len(recent):
+                action = recent[i]
+                count = 1
+                while i + count < len(recent) and recent[i + count] == action:
+                    count += 1
+                compressed.append(f"{action}×{count}" if count > 1 else action)
+                i += count
+            recent_text = ", ".join(compressed)
+        else:
+            recent_text = "(none yet)"
+
         # --- Step 2: exteroceptive / motor state ---
         motor_pe_entry = next(
             (e for e in pe_batch.errors if e.channel == "motor_efficiency"), None
@@ -391,17 +409,23 @@ class PolicyGenerator:
         else:
             affect_note = ""
 
+        valid_ids = ", ".join(p["policy_id"] for p in policies)
         return f"""You are the deliberative reasoning system for a survival agent (step {step}).
-Reason through each step, then respond with the chosen policy_id on the ACTION line.
+Reason through each numbered step below. Then output EXACTLY these two lines — no other text:
+REASON: <one sentence explaining your choice>
+ACTION: <policy_id>
+
+Valid policy_ids: {valid_ids}
 
 ══ STEP 1 — INTEROCEPTIVE STATE (allostatic drives) ══
 {drive_lines}
   Arousal: {arousal:.2f}  |  Valence: {valence:.2f}
 
 ══ STEP 2 — EXTEROCEPTIVE STATE (world model + motor) ══
-  Heading:   {heading_deg:.0f}°
-  Motor:     efficiency={motor_eff:.2f}  stuck={'YES' if motor_stuck else 'no'}
-  PE streak: {pe_streak} steps  |  Mean PE: {pe_mean:.4f}
+  Heading:        {heading_deg:.0f}°
+  Motor:          efficiency={motor_eff:.2f}  stuck={'YES' if motor_stuck else 'no'}
+  PE streak:      {pe_streak} steps  |  Mean PE: {pe_mean:.4f}
+  Recent actions: {recent_text}
 
 ══ STEP 3 — PREDICTED FREE ENERGY PER ACTION ══
 {fe_text}
@@ -418,16 +442,28 @@ ACTION: """
         response: str,
         policies: List[Dict],
     ) -> Optional[str]:
-        """Extract policy_id from LLM response text."""
+        """Extract policy_id from LLM response text.
+
+        Primary: look for the explicit ACTION: line from the structured prompt.
+        Fallback: scan full response text for any valid policy_id substring.
+        """
         policy_ids = {p["policy_id"] for p in policies}
-        # Try exact match first
-        stripped = response.strip().lower().split()[0] if response.strip() else ""
-        if stripped in policy_ids:
-            return stripped
-        # Scan for any policy_id in the response
+
+        for line in response.splitlines():
+            stripped = line.strip()
+            if stripped.upper().startswith("ACTION:"):
+                candidate = stripped.split(":", 1)[1].strip().lower()
+                # Handle trailing punctuation or parenthetical notes
+                first_word = candidate.split()[0].rstrip(".,;") if candidate else ""
+                if first_word in policy_ids:
+                    return first_word
+
+        # Fallback: find first policy_id substring in response
+        lower = response.lower()
         for pid in policy_ids:
-            if pid in response.lower():
+            if pid in lower:
                 return pid
+
         return None
 
     # ------------------------------------------------------------------

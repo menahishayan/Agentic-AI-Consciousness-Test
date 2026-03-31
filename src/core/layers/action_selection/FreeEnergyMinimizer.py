@@ -28,12 +28,19 @@ class FreeEnergyMinimizer:
     epistemic_value: How much does this action reduce prediction errors?
     """
 
+    # Actions that provide angular information gain (scan new directions)
+    _EPISTEMIC_ACTIONS = {"turn_left", "turn_right"}
+
     def __init__(self, config: Dict[str, Any]) -> None:
         pg = config.get("policy_generator", {})
         weights = pg.get("weights", {})
         self._w_pragmatic = float(weights.get("allostatic_survival_fit", 0.2))
         self._w_epistemic = float(weights.get("prediction_error", 0.4))
         self._w_coherence = float(weights.get("goal_coherence", 0.6))
+        # Epistemic bonus weight for turning in novel/unvisited areas.
+        # Corresponds to the information-gain (curiosity) term in Friston's
+        # expected free energy: G = pragmatic + epistemic.
+        self._w_turn_novelty = float(weights.get("turn_novelty", 0.15))
 
     def score(
         self,
@@ -41,6 +48,7 @@ class FreeEnergyMinimizer:
         drive_batch: Optional[DriveSignalBatch],
         pe_batch: Optional[PredictionErrorBatch],
         goal_coherence_scores: Optional[Dict[str, float]] = None,
+        area_familiarity: float = 0.5,
     ) -> Dict[str, float]:
         """
         Score each policy and return {policy_id: score}.
@@ -50,10 +58,13 @@ class FreeEnergyMinimizer:
             drive_batch: Current drive urgency signals
             pe_batch: Current prediction error batch
             goal_coherence_scores: Optional pre-computed coherence scores
+            area_familiarity: [0,1] from memory — 0=novel, 1=well-visited
 
         Returns:
             Dict mapping policy_id → combined score [0, 1]
         """
+        # area_novelty is the epistemic complement of familiarity
+        area_novelty = 1.0 - float(area_familiarity)
         scores: Dict[str, float] = {}
 
         # Build urgency index: tag → max urgency
@@ -90,10 +101,20 @@ class FreeEnergyMinimizer:
                 if goal_coherence_scores else 0.5
             )
 
+            # Epistemic bonus (Friston's G information-gain term):
+            # Turning in a novel/unvisited area reduces uncertainty about what
+            # lies in unseen directions — directly citable as curiosity-driven
+            # active inference (Seth & Bayne 2022; Friston et al. 2017).
+            turn_novelty_bonus = (
+                area_novelty * self._w_turn_novelty
+                if pid in self._EPISTEMIC_ACTIONS else 0.0
+            )
+
             combined = (
                 pragmatic * self._w_pragmatic
                 + epistemic * self._w_epistemic
                 + coherence * self._w_coherence
+                + turn_novelty_bonus
             )
 
             scores[pid] = float(min(1.0, combined))
