@@ -105,6 +105,21 @@ class AllostaticController:
 
         return batch
 
+    def peek_max_urgency(self, vitals: Dict[str, Optional[float]]) -> float:
+        """
+        Compute max urgency for given vitals using the current model state.
+        No side effects — does not update history or publish to workspace.
+        Used to score the post-action state for outcome_score computation.
+        """
+        max_urgency = 0.0
+        for ch_id, channel in self._channels.items():
+            current = vitals.get(ch_id)
+            if current is None:
+                continue
+            urgency = self._compute_urgency(channel, current, ch_id)
+            max_urgency = max(max_urgency, urgency)
+        return float(max_urgency)
+
     def inject_memory_depletion_rate(self, channel_id: str, rate: float) -> None:
         """Called by AgentLoop to inject memory-corrected depletion rates."""
         self._memory_depletion_rates[channel_id] = rate

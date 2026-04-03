@@ -2,8 +2,8 @@
   "adapter_folder": "animalai",
   "adapter_config": {
     "homeostatic": {
-      "health_depletion_rate": 0.001,
-      "saturation_depletion_rate": 0.002,
+      "health_depletion_rate": 0.003,
+      "saturation_depletion_rate": 0.004,
       "food_health_restore": 0.3,
       "food_saturation_restore": 0.5,
       "hazard_health_penalty": 0.2,
@@ -11,11 +11,11 @@
     },
     "simulation": {
       "arena_size": 30.0,
-      "step_size": 1.0,
-      "turn_angle_deg": 15.0,
-      "interaction_radius": 2.0,
+      "step_size": 3.0,
+      "turn_angle_deg": 45.0,
+      "interaction_radius": 4.0,
       "hazard_margin": 2.0,
-      "n_food": 5,
+      "n_food": 8,
       "seed": null
     },
     "arena_config": "animalai_configs/basic_food.yaml",
@@ -26,9 +26,9 @@
     "file_name": "./animal-ai-unity/AnimalAI.app",
     "additional_args": [
       "-screen-width",
-      "256",
+      "300",
       "-screen-height",
-      "256",
+      "300",
       "-popupwindow"
     ]
   },
@@ -50,17 +50,9 @@
     "arousal_diversity_threshold": 0.6,
     "max_plan_phases": 5,
     "weights": {
-      "goal_coherence": 0.6,
-      "prediction_error": 0.4,
-      "allostatic_survival_fit": 0.2,
-      "allostatic_urgency_alignment": 0.2,
-      "turn_novelty": 0.15
-    },
-    "fallback_scores": {
-      "goal_coherence": 0.5,
-      "prediction_error": 0.5,
-      "allostatic_survival_fit": 0.5,
-      "allostatic_urgency_alignment": 0.5
+      "allostatic_urgency": 0.50,
+      "epistemic_gain": 0.35,
+      "motor_cost": 0.15
     }
   },
   "allostatic_controller": {
@@ -89,7 +81,7 @@
     "w_saturation": 0.25,
     "w_threat": 0.30,
     "w_pred_err": 0.10,
-    "w_motor": 0.20,
+    "lc_ne_gain": 0.40,
     "v_health": 0.30,
     "v_saturation": 0.25,
     "v_resource": 0.20,

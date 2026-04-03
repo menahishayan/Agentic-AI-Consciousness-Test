@@ -229,12 +229,7 @@ class PolicyGenerator:
                 if not matching:
                     return "urgent", "skill_gap"
 
-        # 4. Goal changed (ASYNC)
-        current_fp = self._fingerprint(goals)
-        if current_fp != self._last_goals_fingerprint:
-            return "async", "goal_changed"
-
-        # 5. Periodic re-evaluation (ASYNC)
+        # 4. Periodic re-evaluation (ASYNC)
         if step - self._last_llm_step >= self._reeval_interval:
             return "async", "periodic"
 
@@ -325,39 +320,39 @@ class PolicyGenerator:
         step: int,
     ) -> str:
         """
-        Structured chain-of-thought prompt following the Seth/Friston hierarchy:
-          Step 1: Interoceptive state (Layer 1 — allostatic drives)
-          Step 2: Exteroceptive state (Layer 2 — world model / motor)
-          Step 3: Predicted free energy per action (FreeEnergyMinimizer scores)
-          Step 4: Free-energy minimization commitment
+        Drive-arbitration prompt: LLM reasons as a planner-as-inference over
+        expected free energy across the drive space (Seth/Friston hierarchy).
 
-        CoT belongs ONLY in this deliberative path. Reflexes (stuck escape,
-        urgency fallback) are fast and never call this method.
+        No task-goal framing — the agent has no declared objective.
+        It acts solely to reduce allostatic error and prediction error.
+
+          Step 1: Interoceptive state — which drives are urgent and trending?
+          Step 2: Exteroceptive / motor state — what is the agent doing?
+          Step 3: EFE scores per action — what does the generative model predict?
+          Step 4: Allostatic resolution — commit to the action that most relieves
+                  the highest-urgency drive while minimising surprise.
         """
         drive_batch: Optional[DriveSignalBatch] = context.get("drive_batch")
         pe_batch: Optional[PredictionErrorBatch] = context.get("pe_batch")
         av: Optional[ArousalValence] = context.get("arousal_valence")
         fe_scores: Dict[str, float] = context.get("free_energy_scores", {})
-        coherence_scores: Dict[str, float] = context.get("coherence_scores", {})
-
-        goal_text = "; ".join(g.description for g in goals) if goals else "no active goal"
 
         # --- Step 1: interoceptive drives ---
+        arousal = av.arousal if av else 0.0
+        valence = av.valence if av else 0.0
         if drive_batch:
             signals = sorted(drive_batch.signals, key=lambda s: s.urgency, reverse=True)
             drive_lines = "\n".join(
-                f"  {s.channel_id}: value={s.current_value:.2f}  urgency={s.urgency:.2f}"
+                f"  {s.channel_id:<14} value={s.current_value:.2f}  urgency={s.urgency:.2f}"
+                f"  ticks_to_crit={s.ticks_to_critical if s.ticks_to_critical is not None else '∞'}"
                 for s in signals
             )
         else:
             drive_lines = "  (no drive data)"
-        arousal = av.arousal if av else 0.0
-        valence = av.valence if av else 0.0
 
         # --- Step 2: recent action history ---
         recent = context.get("recent_actions", [])
         if recent:
-            # Compress runs: ["move_forward","move_forward","turn_left"] → "move_forward×2, turn_left"
             compressed = []
             i = 0
             while i < len(recent):
@@ -368,6 +363,10 @@ class PolicyGenerator:
                 compressed.append(f"{action}×{count}" if count > 1 else action)
                 i += count
             recent_text = ", ".join(compressed)
+            # Degenerate sequence note — surfaces stuck loops to the model
+            if len(recent) >= 4 and len(set(recent[-4:])) == 1:
+                reps = recent[-4:].count(recent[-1])
+                recent_text += f"\n  [NOTE: '{recent[-1]}' repeated {reps}× — consider alternatives]"
         else:
             recent_text = "(none yet)"
 
@@ -379,63 +378,83 @@ class PolicyGenerator:
             motor_pe_entry.observed if motor_pe_entry is not None
             else context.get("motor_efficiency", 1.0)
         )
-        motor_stuck = context.get("motor_stuck", False)
         heading_deg = (context.get("heading", 0.0) * 180.0 / 3.14159) % 360.0
         pe_mean = pe_batch.mean_magnitude if pe_batch else 0.0
         pe_streak = self._pe_streak
 
-        # --- Step 3: predicted free energy per action ---
+        # --- Step 2b: raycast directional perception ---
+        raycast_hits = context.get("raycast_hits")
+        if raycast_hits:
+            raycast_lines = []
+            for r in raycast_hits:
+                label = r.get("angle_label", f"ray_{r.get('angle_idx', '?')}")
+                tag = r.get("hit_tag")
+                dist = r.get("distance", 1.0)
+                if tag == "GoodGoal":
+                    raycast_lines.append(f"  {label:<12}  food at {dist:.2f} (→ approach)")
+                elif tag == "BadGoal":
+                    raycast_lines.append(f"  {label:<12}  hazard at {dist:.2f} (→ avoid)")
+                elif tag == "wall":
+                    raycast_lines.append(f"  {label:<12}  wall at {dist:.2f}")
+                else:
+                    raycast_lines.append(f"  {label:<12}  clear")
+            raycast_text = "\n".join(raycast_lines)
+        else:
+            raycast_text = "  (no raycast sensor — use visual heuristics only)"
+
+        # --- Step 3: EFE per action — show drive_tags so LLM sees the connection ---
         fe_lines = []
         for p in policies:
             pid = p["policy_id"]
             fe = fe_scores.get(pid, 0.0)
-            coh = coherence_scores.get(pid, 0.5)
-            fe_lines.append(f"  {pid:<16} FE={fe:.3f}  coherence={coh:.2f}")
+            tags = ", ".join(p.get("drive_tags", [])) or "—"
+            fe_lines.append(f"  {pid:<16} EFE={fe:.3f}  drives=[{tags}]")
         fe_text = "\n".join(fe_lines) if fe_lines else "  (no scores)"
 
         # --- Affect interpretation for Step 4 ---
         if arousal > self._arousal_diversity_threshold and valence < -0.1:
             affect_note = (
-                f"\n  ⚠ Affect: arousal={arousal:.2f} HIGH + valence={valence:.2f} NEGATIVE"
-                "\n    The generative model predicts high expected free energy under the current"
-                "\n    policy. This strategy is failing — prioritise an action different from"
-                "\n    the last one taken."
+                f"\n  ⚠ arousal={arousal:.2f} HIGH + valence={valence:.2f} NEGATIVE"
+                "\n    Current strategy predicts high free energy — diversify away from the last action."
             )
         elif arousal > self._arousal_diversity_threshold:
             affect_note = (
-                f"\n  Note: arousal={arousal:.2f} elevated — prediction errors accumulating."
-                "\n    Consider a novel action to reduce uncertainty."
+                f"\n  Note: arousal={arousal:.2f} elevated — consider a novel action to reduce uncertainty."
             )
         else:
             affect_note = ""
 
         valid_ids = ", ".join(p["policy_id"] for p in policies)
-        return f"""You are the deliberative reasoning system for a survival agent (step {step}).
-Reason through each numbered step below. Then output EXACTLY these two lines — no other text:
-REASON: <one sentence explaining your choice>
+        return f"""You are the deliberative system for a survival agent (step {step}).
+You have NO declared task. You act only to reduce allostatic drive deficits and minimise surprise.
+Reason through each step, then output EXACTLY:
+REASON: <one sentence>
 ACTION: <policy_id>
 
 Valid policy_ids: {valid_ids}
 
-══ STEP 1 — INTEROCEPTIVE STATE (allostatic drives) ══
+══ STEP 1 — INTEROCEPTIVE STATE ══
 {drive_lines}
   Arousal: {arousal:.2f}  |  Valence: {valence:.2f}
 
-══ STEP 2 — EXTEROCEPTIVE STATE (world model + motor) ══
+══ STEP 2 — EXTEROCEPTIVE / MOTOR STATE ══
   Heading:        {heading_deg:.0f}°
-  Motor:          efficiency={motor_eff:.2f}  stuck={'YES' if motor_stuck else 'no'}
+  Motor:          efficiency={motor_eff:.2f}
   PE streak:      {pe_streak} steps  |  Mean PE: {pe_mean:.4f}
   Recent actions: {recent_text}
 
-══ STEP 3 — PREDICTED FREE ENERGY PER ACTION ══
+══ STEP 2b — DIRECTIONAL PERCEPTION (raycasts) ══
+{raycast_text}
+
+══ STEP 3 — EXPECTED FREE ENERGY PER ACTION ══
 {fe_text}
-  (Higher FE score = action better minimises drive error + prediction error)
+  (Higher EFE = action better reduces drive deficit + prediction error)
 
-══ STEP 4 — FREE ENERGY MINIMISATION ══
-  Goal: {goal_text}
-  Which action best reduces interoceptive error (drives) and prediction error?{affect_note}
+══ STEP 4 — ALLOSTATIC RESOLUTION ══
+  Which action most reduces the highest-urgency drive deficit and minimises surprise?{affect_note}
+  If food is visible in raycasts, prioritise turning toward it then moving forward.
 
-ACTION: """
+REASON: """
 
     def _parse_llm_response(
         self,
@@ -449,11 +468,11 @@ ACTION: """
         """
         policy_ids = {p["policy_id"] for p in policies}
 
+        # The prompt primes "REASON: ...\nACTION: ..." — scan all lines
         for line in response.splitlines():
             stripped = line.strip()
             if stripped.upper().startswith("ACTION:"):
                 candidate = stripped.split(":", 1)[1].strip().lower()
-                # Handle trailing punctuation or parenthetical notes
                 first_word = candidate.split()[0].rstrip(".,;") if candidate else ""
                 if first_word in policy_ids:
                     return first_word
@@ -519,7 +538,8 @@ ACTION: """
                 best_score = score
                 best_id = policy["policy_id"]
 
-        return best_id or active_policies[0]["policy_id"]
+        # Default to idle — a satisfied, unsurprised agent does nothing
+        return best_id or "idle"
 
     # ------------------------------------------------------------------
     # Helpers

@@ -39,8 +39,9 @@ class ArousalValenceSystem:
         self._w_saturation: float = float(av.get("w_saturation", 0.25))
         self._w_threat: float = float(av.get("w_threat", 0.30))
         self._w_pred_err: float = float(av.get("w_pred_err", 0.10))
-        # Motor PE: high when the agent is blocked / unable to translate intent to movement
-        self._w_motor: float = float(av.get("w_motor", 0.20))
+        # LC-NE pathway gain: sustained motor PE increases arousal organically.
+        # Citable: Aston-Jones & Cohen (2005) adaptive gain theory of LC-NE.
+        self._lc_ne_gain: float = float(av.get("lc_ne_gain", 0.4))
 
         # Valence weights
         self._v_health: float = float(av.get("v_health", 0.30))
@@ -68,11 +69,12 @@ class ArousalValenceSystem:
             workspace: GlobalWorkspace for publishing
             step: Current episode step
         """
-        # Extract motor PE once — used by both arousal and valence
+        # Extract motor PE from the dedicated "motor" efference copy channel.
+        # This is the LC-NE input: movement commanded but position didn't change.
         motor_pe = 0.0
         if pe_batch:
             for err in pe_batch.errors:
-                if err.channel == "motor_efficiency":
+                if err.channel == "motor":
                     motor_pe = float(err.magnitude)
                     break
 
@@ -104,12 +106,19 @@ class ArousalValenceSystem:
         motor_pe: float = 0.0,
     ) -> float:
         """
-        Arousal = weighted combination of:
-          - Health deficit (low health → high arousal)
+        Arousal = base interoceptive activation + LC-NE motor PE contribution.
+
+        Base components:
+          - Health deficit    (low health → high arousal)
           - Saturation deficit (hungry → high arousal)
-          - Threat proximity (danger → high arousal)
-          - Prediction error (surprise → high arousal)
-          - Motor PE (blocked movement → high arousal, organic stuck detection)
+          - Threat proximity  (danger → high arousal)
+          - Prediction error  (surprise → high arousal)
+          - Drive urgency boost
+
+        LC-NE pathway (Aston-Jones & Cohen 2005):
+          Sustained motor prediction error (movement commanded but body didn't move)
+          activates the locus coeruleus, broadening attention and increasing arousal.
+          This is the organic "stuck detection" — arousal rises when effort fails.
         """
         health = vitals.get("health") or 0.5
         saturation = vitals.get("saturation") or 0.5
@@ -125,15 +134,16 @@ class ArousalValenceSystem:
         if pe_batch and pe_batch.mean_magnitude > 0.0:
             pe_comp = min(pe_batch.mean_magnitude, 1.0) * self._w_pred_err
 
-        # Motor PE: persistent wall-blocking drives arousal up organically
-        motor_comp = min(motor_pe, 1.0) * self._w_motor
-
         # Also factor in max drive urgency
         max_urgency = drive_batch.max_urgency if drive_batch else 0.0
         urgency_boost = max_urgency * 0.15
 
-        raw = health_comp + saturation_comp + threat_comp + pe_comp + motor_comp + urgency_boost
-        return float(min(1.0, raw))
+        base_arousal = health_comp + saturation_comp + threat_comp + pe_comp + urgency_boost
+
+        # LC-NE pathway: motor PE independently boosts arousal
+        lc_ne_contribution = min(motor_pe, 1.0) * self._lc_ne_gain
+
+        return float(min(1.0, base_arousal + lc_ne_contribution))
 
     def _compute_valence(
         self,

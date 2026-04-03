@@ -1,13 +1,24 @@
 """
 FreeEnergyMinimizer — Layer 3, Action Selection
 
-Scores action proposals on how well they minimize free energy:
-  - Reduce prediction error (epistemic value)
-  - Maintain homeostatic setpoints (pragmatic value)
+Scores action proposals on how well they minimise expected free energy.
+Structure follows Friston's EFE decomposition (Friston et al. 2017):
 
-Based on Friston's free energy principle:
-  - Agents minimize surprise about their own body states
-  - Actions that reduce both PE and homeostatic deficit are preferred
+  G(π) = pragmatic_value  *  w_pragmatic   (allostatic drive urgency relief)
+         + epistemic_value  *  w_epistemic   (information gain / uncertainty reduction)
+         - motor_cost       *  w_motor_cost  (metabolic cost of action)
+
+Idle:
+  score = 1.0 − max(max_urgency, mean_PE)
+  → rest scores highest when the agent is satisfied AND unsurprised.
+  → Seth's beast machine at allostatic equilibrium.
+
+Turn actions (epistemic):
+  epistemic = area_novelty  (scanning novel directions reduces directional uncertainty)
+  Cite: Friston et al. (2017) active inference; Seth & Bayne (2022) curiosity.
+
+Movement actions:
+  epistemic = mean_PE  (moving through space resolves spatial prediction errors)
 
 No game-specific logic. No adapter imports.
 """
@@ -17,106 +28,102 @@ from typing import Any, Dict, List, Optional
 
 from core.models.signals import DriveSignalBatch, PredictionErrorBatch
 
+# Actions that scan unseen directions — pure epistemic value
+_EPISTEMIC_ACTIONS = {"turn_left", "turn_right"}
+
+# Per-policy metabolic cost in [0, 1]
+_MOTOR_COST: Dict[str, float] = {
+    "idle":          0.0,
+    "turn_left":     0.1,
+    "turn_right":    0.1,
+    "move_forward":  0.2,
+    "move_backward": 0.25,
+}
+
 
 class FreeEnergyMinimizer:
     """
-    Computes free-energy-based scores for candidate action proposals.
+    Computes expected-free-energy scores for candidate action proposals.
 
-    Score = pragmatic_value * w1 + epistemic_value * w2
-
-    pragmatic_value: How well does this action address drive urgencies?
-    epistemic_value: How much does this action reduce prediction errors?
+    Score components:
+      pragmatic   0.50 — allostatic drive urgency relief
+      epistemic   0.35 — information gain (novelty × direction / PE × movement)
+      motor_cost  0.15 — metabolic cost (subtracted)
     """
-
-    # Actions that provide angular information gain (scan new directions)
-    _EPISTEMIC_ACTIONS = {"turn_left", "turn_right"}
 
     def __init__(self, config: Dict[str, Any]) -> None:
         pg = config.get("policy_generator", {})
         weights = pg.get("weights", {})
-        self._w_pragmatic = float(weights.get("allostatic_survival_fit", 0.2))
-        self._w_epistemic = float(weights.get("prediction_error", 0.4))
-        self._w_coherence = float(weights.get("goal_coherence", 0.6))
-        # Epistemic bonus weight for turning in novel/unvisited areas.
-        # Corresponds to the information-gain (curiosity) term in Friston's
-        # expected free energy: G = pragmatic + epistemic.
-        self._w_turn_novelty = float(weights.get("turn_novelty", 0.15))
+        self._w_pragmatic  = float(weights.get("allostatic_urgency", 0.50))
+        self._w_epistemic  = float(weights.get("epistemic_gain",     0.35))
+        self._w_motor_cost = float(weights.get("motor_cost",         0.15))
 
     def score(
         self,
         policies: List[Dict[str, Any]],
         drive_batch: Optional[DriveSignalBatch],
         pe_batch: Optional[PredictionErrorBatch],
-        goal_coherence_scores: Optional[Dict[str, float]] = None,
         area_familiarity: float = 0.5,
+        **_kwargs,
     ) -> Dict[str, float]:
         """
         Score each policy and return {policy_id: score}.
 
         Args:
-            policies: Available policy descriptors
-            drive_batch: Current drive urgency signals
-            pe_batch: Current prediction error batch
-            goal_coherence_scores: Optional pre-computed coherence scores
+            policies:         Available policy descriptors
+            drive_batch:      Current drive urgency signals
+            pe_batch:         Current prediction error batch
             area_familiarity: [0,1] from memory — 0=novel, 1=well-visited
 
         Returns:
-            Dict mapping policy_id → combined score [0, 1]
+            Dict mapping policy_id → EFE score [0, 1]
         """
-        # area_novelty is the epistemic complement of familiarity
         area_novelty = 1.0 - float(area_familiarity)
         scores: Dict[str, float] = {}
 
-        # Build urgency index: tag → max urgency
+        max_urgency = drive_batch.max_urgency if drive_batch else 0.0
+        pe_mean = pe_batch.mean_magnitude if pe_batch else 0.0
+
+        # tag → max urgency across all drive signals
         urgency_by_tag: Dict[str, float] = {}
         if drive_batch:
             for signal in drive_batch.signals:
                 for tag in signal.suggested_action_tags:
                     urgency_by_tag[tag] = max(urgency_by_tag.get(tag, 0.0), signal.urgency)
 
-        # Channel-level PE: which channels are most surprising?
-        pe_by_channel: Dict[str, float] = {}
-        if pe_batch:
-            for error in pe_batch.errors:
-                pe_by_channel[error.channel] = error.magnitude
-
         for policy in policies:
             pid = policy["policy_id"]
 
-            # Pragmatic value: urgency match on drive_tags
-            pragmatic = 0.0
+            if pid == "idle":
+                # Allostatic equilibrium: rest is appropriate when quiet and unsurprised.
+                # The agent rests only when it has nothing to resolve.
+                score = 1.0 - max(max_urgency, pe_mean)
+                scores[pid] = float(max(0.0, min(1.0, score)))
+                continue
+
             drive_tags = policy.get("drive_tags", [])
-            if drive_tags:
-                pragmatic = max(urgency_by_tag.get(tag, 0.0) for tag in drive_tags)
 
-            # Epistemic value: does this policy address high-PE channels?
-            epistemic = 0.0
-            if pe_by_channel and drive_tags:
-                relevant_pe = [pe_by_channel.get(tag, 0.0) for tag in drive_tags]
-                epistemic = max(relevant_pe) if relevant_pe else 0.0
-
-            # Goal coherence
-            coherence = (
-                goal_coherence_scores.get(pid, 0.5)
-                if goal_coherence_scores else 0.5
+            # Pragmatic: urgency-weighted drive tag match
+            pragmatic = max(
+                (urgency_by_tag.get(tag, 0.0) for tag in drive_tags),
+                default=0.0,
             )
 
-            # Epistemic bonus (Friston's G information-gain term):
-            # Turning in a novel/unvisited area reduces uncertainty about what
-            # lies in unseen directions — directly citable as curiosity-driven
-            # active inference (Seth & Bayne 2022; Friston et al. 2017).
-            turn_novelty_bonus = (
-                area_novelty * self._w_turn_novelty
-                if pid in self._EPISTEMIC_ACTIONS else 0.0
-            )
+            # Epistemic: information gain from this action class
+            if pid in _EPISTEMIC_ACTIONS:
+                # Turn actions scan unseen directions — pure novelty-driven IG
+                epistemic = area_novelty
+            else:
+                # Movement: resolves spatial prediction errors
+                epistemic = pe_mean
+
+            motor_cost = _MOTOR_COST.get(pid, 0.2)
 
             combined = (
                 pragmatic * self._w_pragmatic
                 + epistemic * self._w_epistemic
-                + coherence * self._w_coherence
-                + turn_novelty_bonus
+                - motor_cost * self._w_motor_cost
             )
-
-            scores[pid] = float(min(1.0, combined))
+            scores[pid] = float(max(0.0, min(1.0, combined)))
 
         return scores

@@ -20,7 +20,7 @@ import numpy as np
 
 from core.adapters.animalai.action_mapper import get_policy_descriptors, policy_id_to_action
 from core.adapters.animalai.homeostatic_wrapper import HomeostaticWrapper
-from core.adapters.animalai.observation_mapper import _PositionTracker, _extract_local_speed, map_obs
+from core.adapters.animalai.observation_mapper import _PositionTracker, _extract_local_speed, _parse_raycasts, map_obs
 from core.adapters.base import AbstractEnvironmentAdapter
 from core.models.signals import DriveChannel
 from core.models.state import AgentState
@@ -124,9 +124,16 @@ class AnimalAIAdapter(AbstractEnvironmentAdapter):
         step_size = float(sim_cfg.get("step_size", 1.0))
         self._expected_speed: float = step_size / max(self._velocity_dt, 1e-6)
 
+        # Dead-reckoning heading — integrated from turn actions each step
+        self._heading: float = 0.0
+        self._turn_angle_deg: float = float(sim_cfg.get("turn_angle_deg", 45.0))
+
         # Proprioceptive stuck detection
         self._stuck_adapter_count: int = 0
         self._stuck_adapter_threshold: int = int(config.get("stuck_threshold", 5))
+
+        # One-shot obs shape diagnostic — logged on first step to verify raycast presence
+        self._obs_shapes_logged: bool = False
 
     # ------------------------------------------------------------------
     # AbstractEnvironmentAdapter interface
@@ -134,6 +141,7 @@ class AnimalAIAdapter(AbstractEnvironmentAdapter):
 
     def reset(self) -> AgentState:
         self._step_count = 0
+        self._heading = 0.0
         self._homeostatic.reset()
         self._position_tracker.reset()
         self._stuck_adapter_count = 0
@@ -160,12 +168,22 @@ class AnimalAIAdapter(AbstractEnvironmentAdapter):
         raw_reward = float(info.get("raw_reward", 0.0))
         env_done = bool(info.get("env_done", False))
 
+        # Integrate heading from turn actions (dead-reckoning)
+        if action_id == "turn_left":
+            self._heading = (self._heading + self._turn_angle_deg) % 360.0
+        elif action_id == "turn_right":
+            self._heading = (self._heading - self._turn_angle_deg) % 360.0
+        info["heading"] = self._heading
+
         # Compute motor_efficiency BEFORE dt-scaling, using raw Unity units/sec.
         # Normalised by expected full-throttle speed so the signal is [0, 1]:
         #   free movement → 1.0,  wall-blocked → ~0.0
         raw_fwd = float(info.get("local_speed_forward", 0.0))
         motor_efficiency = float(min(max(raw_fwd / self._expected_speed, 0.0), 1.0))
         info["motor_efficiency"] = motor_efficiency
+        # position_delta_norm = fraction of expected displacement actually achieved.
+        # Used by PredictionErrorCalculator to compute motor PE (efference copy channel).
+        info["position_delta_norm"] = motor_efficiency
 
         # Scale Unity physics velocity (units/s) to displacement per decision step
         info["local_speed_forward"] = raw_fwd * self._velocity_dt
@@ -183,7 +201,13 @@ class AnimalAIAdapter(AbstractEnvironmentAdapter):
         self._homeostatic.step(raw_reward, env_done)
 
         state = map_obs(obs, info, self._homeostatic, self._step_count, self._position_tracker)
-        done = env_done or not self._homeostatic.is_alive
+        # Termination is homeostatic collapse only.
+        # env_done (task object reached) is logged as an event but does not end
+        # the episode — the agent continues to act in the environment.
+        if env_done:
+            log.info("Step %d: env_done signal received (task object reached) — episode continues",
+                     self._step_count)
+        done = not self._homeostatic.is_alive
         return state, done
 
     def close(self) -> None:
@@ -304,14 +328,17 @@ class AnimalAIAdapter(AbstractEnvironmentAdapter):
             agent_id = list(terminal_steps.agent_id)[0]
             obs_list = terminal_steps[agent_id].obs
             raw_reward = float(terminal_steps[agent_id].reward)
+            self._log_obs_shapes(obs_list)
             visual_obs = self._extract_visual(obs_list)
             fwd, right, up = _extract_local_speed(obs_list)
+            raycast_hits = _parse_raycasts(obs_list)
             return visual_obs, {
                 "raw_reward": raw_reward,
                 "env_done": True,
                 "local_speed_forward": fwd,
                 "local_speed_right": right,
                 "local_speed_up": up,
+                "raycast_hits": raycast_hits,
             }
 
         if len(decision_steps) == 0:
@@ -320,15 +347,27 @@ class AnimalAIAdapter(AbstractEnvironmentAdapter):
         agent_id = list(decision_steps.agent_id)[0]
         obs_list = decision_steps[agent_id].obs
         raw_reward = float(decision_steps[agent_id].reward)
+        self._log_obs_shapes(obs_list)
         visual_obs = self._extract_visual(obs_list)
         fwd, right, up = _extract_local_speed(obs_list)
+        raycast_hits = _parse_raycasts(obs_list)
         return visual_obs, {
             "raw_reward": raw_reward,
             "env_done": False,
             "local_speed_forward": fwd,
             "local_speed_right": right,
             "local_speed_up": up,
+            "raycast_hits": raycast_hits,
         }
+
+    def _log_obs_shapes(self, obs_list: List[Any]) -> None:
+        """Log obs_list shapes once on the first step to confirm raycast presence."""
+        if self._obs_shapes_logged:
+            return
+        self._obs_shapes_logged = True
+        shapes = [np.asarray(o).shape for o in obs_list if hasattr(o, '__len__')]
+        log.info("obs_list shapes (step 1): %s", shapes)
+        print(f"[AnimalAI] obs_list shapes: {shapes}")
 
     def _extract_visual(self, obs_list: List[Any]) -> Optional[np.ndarray]:
         """Extract the first visual observation from the observation list."""

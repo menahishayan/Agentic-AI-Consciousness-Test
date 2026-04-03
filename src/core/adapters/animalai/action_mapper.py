@@ -49,7 +49,7 @@ def get_policy_descriptors() -> List[Dict]:
             "policy_id": "move_forward",
             "callable_name": "move_forward",
             "tags": ["navigation", "exploration"],
-            "drive_tags": ["energy", "resource_level"],
+            "drive_tags": ["exploration", "navigation"],
             "description": "Move forward to explore and find food",
         },
         {

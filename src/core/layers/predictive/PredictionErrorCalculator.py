@@ -30,11 +30,15 @@ _CHANNEL_SOURCES = {
     "energy":            "proprioceptive",
     "oxygen":            "proprioceptive",
     "motor_efficiency":  "proprioceptive",
+    "motor":             "proprioceptive",
     "resource_level":    "visual",
     "threat_proximity":  "threat",
     "terrain_novelty":   "visual",
     "entity_density":    "visual",
 }
+
+# Actions that command forward/backward translation
+_MOVEMENT_ACTIONS = {"move_forward", "move_backward"}
 
 
 class PredictionErrorCalculator:
@@ -133,6 +137,24 @@ class PredictionErrorCalculator:
                 precision=float(precision),
                 source=source,
             ))
+
+        # Motor PE — proprioceptive efference copy channel.
+        # When a movement action was taken but the agent didn't move, the
+        # motor prediction was violated. This feeds the LC-NE arousal pathway.
+        # Cite: Friston (2010) predictive coding of motor commands.
+        motor_pe_magnitude = 0.0
+        if last_action in _MOVEMENT_ACTIONS:
+            actual_delta = float(observed.raw_metadata.get("position_delta_norm", 0.0))
+            motor_pe_magnitude = abs(1.0 - actual_delta)  # expected full movement
+
+        errors.append(PredictionError(
+            channel="motor",
+            expected=1.0 if last_action in _MOVEMENT_ACTIONS else 0.0,
+            observed=float(observed.raw_metadata.get("position_delta_norm", 0.0)),
+            magnitude=float(motor_pe_magnitude),
+            precision=float(self._default_precision),
+            source="proprioceptive",
+        ))
 
         batch = PredictionErrorBatch(errors=errors, step=step)
 

@@ -40,6 +40,11 @@ class PerceptionState:
     area_id: Optional[str] = None                   # Spatial hash for FAISS lookup
     terrain_novelty: Optional[float] = None         # [0,1] how novel this area is
     entity_density: Optional[float] = None          # [0,1] nearby entity density
+    # Raycast hits: list of {angle_idx, angle_label, hit_tag, distance} dicts.
+    # angle_label: "left-45°" / "left-22°" / "forward" / "right-22°" / "right-45°"
+    # hit_tag: "GoodGoal" | "BadGoal" | "wall" | None (clear)
+    # distance: [0,1] — 0.0 = right next to agent, 1.0 = max range / no hit
+    raycast_hits: Optional[List[Dict[str, Any]]] = None
 
 
 @dataclass

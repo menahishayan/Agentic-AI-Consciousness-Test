@@ -91,8 +91,9 @@ def test_workspace_is_cleared_each_step(tmp_path):
         loop._step = step
         loop._run_step()
         msgs = loop._workspace.broadcast()
-        # Goal is always re-published — workspace should have at least goal message
+        # Workspace should have core interoceptive and predictive messages each step
         kinds = {m.kind for m in msgs}
-        assert "goal" in kinds
+        assert "vital_state" in kinds
+        assert "drive_signal" in kinds
 
     logger.close()

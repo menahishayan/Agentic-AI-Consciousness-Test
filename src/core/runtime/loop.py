@@ -6,7 +6,7 @@ Wires all brain layers together and drives the cognitive cycle:
   2. Layer 1: VitalStateMonitor → drive signals → arousal/valence
   3. Layer 2: WorldModel predict → PredictionError → publish
   4. Layer 4: MetacognitiveMonitor → context assembly
-  5. Layer 3: GoalCoherence → FreeEnergy → PolicyGenerator → action
+  5. Layer 3: FreeEnergy → PolicyGenerator → action
   6. MotorControlInterface.execute → next state
   7. WorldModel.update → learn from transition
   8. Memory record → log metrics
@@ -30,13 +30,11 @@ from core.layers.action_selection.PolicyGenerator import PolicyGenerator
 from core.layers.interoceptive.AllostaticController import AllostaticController
 from core.layers.interoceptive.ArousalValenceSystem import ArousalValenceSystem
 from core.layers.interoceptive.VitalStateMonitor import VitalStateMonitor
-from core.layers.metacognitive.GoalCoherenceChecker import GoalCoherenceChecker
 from core.layers.metacognitive.MetacognitiveMonitor import MetacognitiveMonitor
 from core.layers.predictive.PredictionErrorCalculator import PredictionErrorCalculator
 from core.layers.predictive.WorldModelGenerator import WorldModelGenerator
 from core.llm.base import AbstractLLMClient
 from core.memory.manager import MemoryManager
-from core.models.signals import Goal
 from core.models.state import AgentState
 from core.observability.logger import RunLogger
 
@@ -65,18 +63,8 @@ class AgentLoop:
         self._logger = logger
         self._config = config
 
-        # Workspace — cleared at top of each step, goal republished
+        # Workspace — cleared at top of each step
         self._workspace = GlobalWorkspace()
-
-        # Task goal from adapter — published each step
-        goal_dict = adapter.get_task_goal()
-        self._task_goal = Goal(
-            goal_id=goal_dict["task_id"],
-            description=goal_dict["description"],
-            priority=float(goal_dict.get("priority", 1.0)),
-            task_id=goal_dict["task_id"],
-        )
-        self._goals: List[Goal] = [self._task_goal]
 
         # Available policies from adapter
         self._policies = adapter.get_available_policies()
@@ -121,7 +109,6 @@ class AgentLoop:
 
         # Layer 4: Metacognitive
         self._metacognitive = MetacognitiveMonitor(config=config)
-        self._goal_checker = GoalCoherenceChecker()
 
         # Runtime state
         self._current_state: Optional[AgentState] = None
@@ -194,14 +181,7 @@ class AgentLoop:
 
         t_step_start = time.monotonic()
 
-        # Clear workspace and republish persistent goal
         self._workspace.clear()
-        self._workspace.publish(AgentMessage(
-            sender="AgentLoop",
-            kind="goal",
-            payload=self._task_goal,
-            step=step,
-        ))
 
         # --- Layer 1: Interoceptive ---
         vitals = self._vital_monitor.update(state, self._workspace, step)
@@ -236,10 +216,8 @@ class AgentLoop:
         )
 
         # --- Layer 4: Metacognitive ---
-        context = self._metacognitive.update(self._workspace, self._goals, step)
+        context = self._metacognitive.update(self._workspace, [], step)
         context["policies"] = self._policies
-        # Proprioceptive motor flag: set by adapter, consumed by PolicyGenerator reflex
-        context["motor_stuck"] = state.raw_metadata.get("motor_stuck", False)
         context["heading"] = state.position.heading or 0.0
         context["motor_efficiency"] = float(state.raw_metadata.get("motor_efficiency", 1.0))
         # Affect state — used by PolicyGenerator arousal-diversity fallback
@@ -249,30 +227,29 @@ class AgentLoop:
         context["last_action"] = self._last_policy_id
         # Rolling history for LLM prompt — lets the model detect repetition
         context["recent_actions"] = list(self._recent_actions)
+        # Raycast hits from perception — directional food/threat bearing for LLM
+        context["raycast_hits"] = state.perception.raycast_hits
 
-        # --- Layer 3: Goal coherence + free energy scoring ---
-        coherence_scores = self._goal_checker.score_all(self._policies, self._goals)
+        # --- Layer 3: Free energy scoring ---
         fe_scores = self._free_energy.score(
             policies=self._policies,
             drive_batch=drive_batch,
             pe_batch=pe_batch,
-            goal_coherence_scores=coherence_scores,
             area_familiarity=familiarity,
         )
         context["free_energy_scores"] = fe_scores
-        context["coherence_scores"] = coherence_scores
 
         # --- Layer 3: Policy selection ---
         selected_id = self._policy_gen.propose_action(
             policies=self._policies,
-            goals=self._goals,
+            goals=[],
             context=context,
             workspace=self._workspace,
             step=step,
         )
 
         if selected_id is None:
-            selected_id = self._policies[0]["policy_id"] if self._policies else "idle"
+            selected_id = "idle"
 
         # --- Execute action ---
         prev_state = state
@@ -298,12 +275,9 @@ class AgentLoop:
         self._memory.update_state_outcome(next_state)
         self._memory.record_prediction_error(next_state, pe_batch, action=selected_id)
 
-        # Compute outcome score for traces (health delta + saturation delta)
-        h_prev = prev_state.homeostasis.health or 0.0
-        h_next = next_state.homeostasis.health or 0.0
-        s_prev = prev_state.homeostasis.saturation or 0.0
-        s_next = next_state.homeostasis.saturation or 0.0
-        outcome_score = float(max(0.0, min(1.0, 0.5 + (h_next - h_prev) * 5 + (s_next - s_prev) * 3)))
+        # Outcome score: allostatic error after action (lower urgency = better outcome)
+        next_vitals = self._vital_monitor.read(next_state)
+        outcome_score = float(max(0.0, min(1.0, 1.0 - self._allostatic.peek_max_urgency(next_vitals))))
 
         self._memory.record_policy_trace(
             state=prev_state,
@@ -351,5 +325,14 @@ class AgentLoop:
 
         if done:
             log.info("Step %d: episode done (health=%.3f)", step, next_state.homeostasis.health or 0.0)
+            # Structured homeostatic collapse event — queryable across runs in events.jsonl
+            if (next_state.homeostasis.health is not None
+                    and next_state.homeostasis.health <= 0.0):
+                self._logger.event("homeostatic_collapse", {
+                    "health": next_state.homeostasis.health,
+                    "saturation": next_state.homeostasis.saturation,
+                    "dominant_drive": drive_batch.dominant_channel,
+                    "steps_survived": step,
+                }, step=step)
 
         return done

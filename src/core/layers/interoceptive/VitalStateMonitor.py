@@ -55,6 +55,10 @@ class VitalStateMonitor:
 
         return vitals
 
+    def read(self, state: AgentState) -> Dict[str, Optional[float]]:
+        """Return vitals dict without publishing to workspace (no side effects)."""
+        return self._extract_vitals(state)
+
     def _extract_vitals(self, state: AgentState) -> Dict[str, Optional[float]]:
         h = state.homeostasis
         raw = {
