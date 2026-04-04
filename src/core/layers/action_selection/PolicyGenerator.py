@@ -383,24 +383,25 @@ class PolicyGenerator:
         pe_streak = self._pe_streak
 
         # --- Step 2b: raycast directional perception ---
+        # AAI4 single-ray sensor always fires straight forward — label is always "forward".
+        # raycast_hits is a list with one dict: {"hit_tag": str|None, "distance": float}
         raycast_hits = context.get("raycast_hits")
         if raycast_hits:
-            raycast_lines = []
-            for r in raycast_hits:
-                label = r.get("angle_label", f"ray_{r.get('angle_idx', '?')}")
-                tag = r.get("hit_tag")
-                dist = r.get("distance", 1.0)
-                if tag == "GoodGoal":
-                    raycast_lines.append(f"  {label:<12}  food at {dist:.2f} (→ approach)")
-                elif tag == "BadGoal":
-                    raycast_lines.append(f"  {label:<12}  hazard at {dist:.2f} (→ avoid)")
-                elif tag == "wall":
-                    raycast_lines.append(f"  {label:<12}  wall at {dist:.2f}")
-                else:
-                    raycast_lines.append(f"  {label:<12}  clear")
-            raycast_text = "\n".join(raycast_lines)
+            r = raycast_hits[0]
+            tag = r.get("hit_tag")
+            dist = r.get("distance", 1.0)
+            if tag in ("GoodGoal", "GoodGoalMulti"):
+                raycast_text = f"  forward       food at {dist:.2f} (→ move_forward)"
+            elif tag in ("BadGoal", "BadGoalMulti"):
+                raycast_text = f"  forward       hazard at {dist:.2f} (→ avoid — turn away)"
+            elif tag == "wall":
+                raycast_text = f"  forward       wall at {dist:.2f} (→ do NOT move_forward)"
+            elif tag == "ramp":
+                raycast_text = f"  forward       ramp at {dist:.2f}"
+            else:
+                raycast_text = "  forward       clear"
         else:
-            raycast_text = "  (no raycast sensor — use visual heuristics only)"
+            raycast_text = "  (no raycast data this step)"
 
         # --- Step 3: EFE per action — show drive_tags so LLM sees the connection ---
         fe_lines = []
@@ -513,6 +514,17 @@ REASON: """
                 eligible = [p for p in active_policies if p["policy_id"] != last_action]
                 if eligible:
                     active_policies = eligible
+
+        # Wall suppression: if the forward ray detects a wall, exclude move_forward
+        # entirely from the candidate set. This applies to all steps, not just LLM steps,
+        # so the 80% of steps using this fallback don't repeatedly bang into walls.
+        raycast_hits = context.get("raycast_hits")
+        if raycast_hits:
+            r = raycast_hits[0]
+            if r.get("hit_tag") == "wall":
+                no_forward = [p for p in active_policies if p["policy_id"] != "move_forward"]
+                if no_forward:
+                    active_policies = no_forward
 
         drive_batch: Optional[DriveSignalBatch] = context.get("drive_batch")
         urgency_by_tag: Dict[str, float] = {}

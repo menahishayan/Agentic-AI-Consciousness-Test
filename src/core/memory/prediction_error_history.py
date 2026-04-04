@@ -46,6 +46,17 @@ class PredictionErrorHistory:
 
         self._rebuild_index()
 
+    def clear_area(self, area_id: str) -> None:
+        """Remove all records for a specific area and rebuild the FAISS index."""
+        self._records = [r for r in self._records if r.area_id != area_id]
+        if self._records:
+            self._vectors = np.vstack([
+                self._to_vector(r).reshape(1, -1) for r in self._records
+            ])
+        else:
+            self._vectors = None
+        self._rebuild_index()
+
     def get_area_familiarity(self, area_id: str) -> float:
         """
         Return [0,1] familiarity score for the given area.

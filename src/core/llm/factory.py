@@ -8,6 +8,7 @@ Supported providers:
   "anthropic" → AnthropicClient (full implementation)
   "openai"    → OpenAIClient (full implementation)
   "gemini"    → GeminiClient (stub — raises NotImplementedError on use)
+  "ollama"    → OllamaClient (local Ollama instance, no API key required)
 """
 from __future__ import annotations
 
@@ -45,6 +46,7 @@ def build_llm_client(
     max_tokens = int(cfg.get("max_tokens", 500))
     temperature = float(cfg.get("temperature", 0.1))
     timeout = float(cfg.get("timeout_s", 15.0))
+    base_url = cfg.get("base_url")
 
     if provider == "anthropic":
         api_key = _get_key(cfg, "ANTHROPIC_API_KEY")
@@ -87,10 +89,24 @@ def build_llm_client(
         log.info("Using Gemini provider (stub — calls will raise NotImplementedError)")
         return GeminiClient(api_key=api_key)
 
+    elif provider == "ollama":
+        from core.llm.providers.ollama import OllamaClient
+        kwargs: dict = dict(
+            default_model=model,
+            default_max_tokens=max_tokens,
+            default_temperature=temperature,
+            timeout=timeout,
+            logger=logger,
+        )
+        if base_url:
+            kwargs["base_url"] = base_url
+        log.info("Using Ollama provider (model=%s)", model or "gemma3:1b")
+        return OllamaClient(**kwargs)
+
     else:
         raise ValueError(
             f"Unknown LLM provider: '{provider}'. "
-            "Supported: 'anthropic', 'openai', 'gemini'."
+            "Supported: 'anthropic', 'openai', 'gemini', 'ollama'."
         )
 
 

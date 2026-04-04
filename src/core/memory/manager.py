@@ -85,6 +85,17 @@ class MemoryManager:
     def get_area_mean_pe(self, area_id: str) -> float:
         return self._pe_history.get_mean_pe(area_id)
 
+    def reset_area_familiarity(self, area_id: str) -> None:
+        """
+        Clear PE history records for a specific area.
+
+        Called at episode start for the agent's initial area so that
+        area_familiarity = 0 on step 0 every episode, making area_novelty = 1.0
+        and allowing the epistemic value of turns to dominate — producing a
+        natural orienting scan without hardcoded behaviour.
+        """
+        self._pe_history.clear_area(area_id)
+
     # ------------------------------------------------------------------
     # SelfStateTracking
     # ------------------------------------------------------------------

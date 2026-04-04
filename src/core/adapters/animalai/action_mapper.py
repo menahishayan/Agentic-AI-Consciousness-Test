@@ -46,20 +46,6 @@ def get_policy_descriptors() -> List[Dict]:
     """
     return [
         {
-            "policy_id": "move_forward",
-            "callable_name": "move_forward",
-            "tags": ["navigation", "exploration"],
-            "drive_tags": ["exploration", "navigation"],
-            "description": "Move forward to explore and find food",
-        },
-        {
-            "policy_id": "move_backward",
-            "callable_name": "move_backward",
-            "tags": ["navigation", "avoidance"],
-            "drive_tags": ["safety"],
-            "description": "Move backward to avoid hazards",
-        },
-        {
             "policy_id": "turn_left",
             "callable_name": "turn_left",
             "tags": ["navigation", "orientation"],
@@ -74,10 +60,24 @@ def get_policy_descriptors() -> List[Dict]:
             "description": "Turn right to change direction and search for food",
         },
         {
+            "policy_id": "move_backward",
+            "callable_name": "move_backward",
+            "tags": ["navigation", "avoidance"],
+            "drive_tags": ["safety"],
+            "description": "Move backward to avoid hazards",
+        },
+        {
             "policy_id": "idle",
             "callable_name": "idle",
             "tags": ["rest"],
             "drive_tags": [],
             "description": "Stay still and observe the environment",
+        },
+        {
+            "policy_id": "move_forward",
+            "callable_name": "move_forward",
+            "tags": ["navigation", "exploration"],
+            "drive_tags": ["exploration", "navigation"],
+            "description": "Move forward to explore and find food",
         },
     ]

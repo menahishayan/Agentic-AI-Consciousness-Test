@@ -64,6 +64,7 @@ class FreeEnergyMinimizer:
         drive_batch: Optional[DriveSignalBatch],
         pe_batch: Optional[PredictionErrorBatch],
         area_familiarity: float = 0.5,
+        context: Optional[Dict[str, Any]] = None,
         **_kwargs,
     ) -> Dict[str, float]:
         """
@@ -74,6 +75,7 @@ class FreeEnergyMinimizer:
             drive_batch:      Current drive urgency signals
             pe_batch:         Current prediction error batch
             area_familiarity: [0,1] from memory — 0=novel, 1=well-visited
+            context:          Full step context — used for motor failure penalty
 
         Returns:
             Dict mapping policy_id → EFE score [0, 1]
@@ -83,6 +85,11 @@ class FreeEnergyMinimizer:
 
         max_urgency = drive_batch.max_urgency if drive_batch else 0.0
         pe_mean = pe_batch.mean_magnitude if pe_batch else 0.0
+
+        # Motor failure penalty: if the last action failed (efficiency < 0.3),
+        # scale its EFE toward 0 to discourage repeating a blocked action.
+        motor_eff = float(context.get("motor_efficiency", 1.0)) if context else 1.0
+        last_action = context.get("last_action") if context else None
 
         # tag → max urgency across all drive signals
         urgency_by_tag: Dict[str, float] = {}
@@ -124,6 +131,13 @@ class FreeEnergyMinimizer:
                 + epistemic * self._w_epistemic
                 - motor_cost * self._w_motor_cost
             )
+
+            # Motor failure penalty: if the last attempt at this specific action
+            # failed (wall-blocked), scale its score toward 0 so the agent doesn't
+            # immediately retry. motor_eff=0.0 → score=0.0; motor_eff=1.0 → no change.
+            if pid == last_action and motor_eff < 0.3:
+                combined = combined * motor_eff
+
             scores[pid] = float(max(0.0, min(1.0, combined)))
 
         return scores

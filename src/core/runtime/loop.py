@@ -133,6 +133,13 @@ class AgentLoop:
         self._current_state = self._adapter.reset()
         self._step = 0
 
+        # Reset area familiarity for the starting position so area_novelty = 1.0
+        # on step 0. This lets the epistemic value of turns dominate the urgency
+        # fallback, producing a natural orienting scan at episode start without
+        # any hardcoded behaviour.
+        start_area = (self._current_state.perception.area_id or "unknown")
+        self._memory.reset_area_familiarity(start_area)
+
         episode_stats = {
             "steps_run": 0,
             "done_reason": "max_steps",
@@ -236,6 +243,7 @@ class AgentLoop:
             drive_batch=drive_batch,
             pe_batch=pe_batch,
             area_familiarity=familiarity,
+            context=context,
         )
         context["free_energy_scores"] = fe_scores
 

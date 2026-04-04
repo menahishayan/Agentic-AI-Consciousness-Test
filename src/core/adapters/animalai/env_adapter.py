@@ -30,8 +30,9 @@ log = logging.getLogger(__name__)
 # Actions that command translational movement — used for stuck detection
 _MOVEMENT_ACTIONS = {"move_forward", "move_back"}
 
-# Local forward speed below which the agent is considered not moving
-_SPEED_STUCK_THRESHOLD = 0.05
+# Normalised raycast distance below which a forward wall hit is treated as blocking
+# (0.15 = wall within ~15% of max ray range, roughly < 1 arena unit away)
+_WALL_BLOCK_THRESHOLD = 0.15
 
 _DRIVE_CHANNELS = [
     DriveChannel(
@@ -108,21 +109,10 @@ class AnimalAIAdapter(AbstractEnvironmentAdapter):
             file_name = str(Path(file_name).resolve())
         self._file_name: Optional[str] = file_name
 
-        # Velocity scaling: Unity physics units/s → arena units/decision-step
-        # decision_period = frames per decision step (default 5 at 30Hz ≈ 0.167s/step)
-        physics_fps = float(config.get("physics_fps", 30.0))
-        decision_period = float(config.get("decision_period", 5.0))
-        self._velocity_dt: float = decision_period / physics_fps
-
-        # Expected full-throttle forward speed in Unity physics units/sec.
-        # = arena step_size (metres/step) / dt (seconds/step)
-        # e.g. step_size=1.0, dt=0.167 → expected_speed=6.0 Unity units/sec
-        # motor_efficiency = raw_fwd / expected_speed:
-        #   free movement at ~16 u/s → clamped to 1.0
-        #   wall-blocked at ~0 u/s   → near 0.0
+        # Step size in arena units — used for dead-reckoning position integration.
+        # Animal AI 4 does not expose velocity; we use step_size directly.
         sim_cfg = config.get("simulation", {})
-        step_size = float(sim_cfg.get("step_size", 1.0))
-        self._expected_speed: float = step_size / max(self._velocity_dt, 1e-6)
+        self._step_size: float = float(sim_cfg.get("step_size", 1.0))
 
         # Dead-reckoning heading — integrated from turn actions each step
         self._heading: float = 0.0
@@ -175,28 +165,42 @@ class AnimalAIAdapter(AbstractEnvironmentAdapter):
             self._heading = (self._heading - self._turn_angle_deg) % 360.0
         info["heading"] = self._heading
 
-        # Compute motor_efficiency BEFORE dt-scaling, using raw Unity units/sec.
-        # Normalised by expected full-throttle speed so the signal is [0, 1]:
-        #   free movement → 1.0,  wall-blocked → ~0.0
-        raw_fwd = float(info.get("local_speed_forward", 0.0))
-        motor_efficiency = float(min(max(raw_fwd / self._expected_speed, 0.0), 1.0))
+        # Animal AI 4 does not expose raw velocity — the (7,) vector obs is raycasts.
+        # motor_efficiency: turns and idle always succeed (1.0); forward/back is inferred
+        # from raycasts — a close wall hit on the forward ray means the agent is blocked.
+        raycast = info.get("raycast_hits") or {}
+        wall_blocking = (
+            action_id in _MOVEMENT_ACTIONS
+            and raycast.get("hit_tag") == "wall"
+            and raycast.get("distance", 1.0) < _WALL_BLOCK_THRESHOLD
+        )
+
+        if action_id in ("turn_left", "turn_right", "idle"):
+            position_delta_norm = 0.0   # turns produce no translational displacement
+        else:
+            position_delta_norm = 0.0 if wall_blocking else 1.0
+
+        # motor_efficiency is derived from position_delta_norm so the two signals
+        # never contradict each other in the prompt or PredictionErrorCalculator.
+        motor_efficiency = position_delta_norm if action_id not in ("turn_left", "turn_right") else 1.0
+
         info["motor_efficiency"] = motor_efficiency
         # position_delta_norm = fraction of expected displacement actually achieved.
         # Used by PredictionErrorCalculator to compute motor PE (efference copy channel).
-        info["position_delta_norm"] = motor_efficiency
+        info["position_delta_norm"] = position_delta_norm
 
-        # Scale Unity physics velocity (units/s) to displacement per decision step
-        info["local_speed_forward"] = raw_fwd * self._velocity_dt
-        info["local_speed_right"] = info.get("local_speed_right", 0.0) * self._velocity_dt
-
-        # Stuck detection: movement commanded but local forward speed is near zero
-        local_fwd = info.get("local_speed_forward", 0.0)
-        if action_id in _MOVEMENT_ACTIONS and abs(local_fwd) < _SPEED_STUCK_THRESHOLD:
+        # Stuck detection: consecutive wall-blocked forward steps
+        if wall_blocking:
             self._stuck_adapter_count += 1
         else:
             self._stuck_adapter_count = 0
         motor_stuck = self._stuck_adapter_count >= self._stuck_adapter_threshold
         info["motor_stuck"] = motor_stuck
+
+        # Forward speed for position dead-reckoning: use step_size directly since
+        # we have no velocity signal. Scale by motor_efficiency (0 if wall-blocked).
+        info["local_speed_forward"] = self._step_size * motor_efficiency
+        info["local_speed_right"] = 0.0
 
         self._homeostatic.step(raw_reward, env_done)
 

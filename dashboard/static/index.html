@@ -298,11 +298,23 @@
     width: 220px;
     min-width: 220px;
     overflow-y: auto;
+    max-height: 380px;
     border-right: 1px solid var(--border);
     padding-right: 10px;
     display: flex;
     flex-direction: column;
     gap: 4px;
+  }
+
+  .ep-divider {
+    font-size: 10px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.07em;
+    color: var(--muted);
+    padding: 6px 0 2px;
+    border-top: 1px solid var(--border);
+    margin-top: 4px;
   }
 
   .llm-call-item {
@@ -468,6 +480,10 @@ const state = {
   policyColors: {},
   pendingChartUpdate: false,
   runs: {},             // run_id -> summary
+  llmCalls: [],
+  llmEpisode: 0,        // episode counter, incremented when step resets to 0
+  llmLastStep: -1,      // last seen step, used to detect episode boundaries
+  selectedLlmIdx: null,
 };
 
 const POLICY_PALETTE = [
@@ -629,7 +645,7 @@ function buildChartGrid() {
       <div class="chart-wrap"><canvas id="ch-outcome"></canvas></div>
     </div>
     <div class="chart-card">
-      <div class="chart-title">Step Timing (ms) — spikes = LLM calls</div>
+      <div class="chart-title">Step Timing (ms) — spikes = LLM calls<span id="timing-avg-label" style="margin-left:10px;font-weight:400;color:var(--muted);"></span></div>
       <div class="chart-wrap"><canvas id="ch-timing"></canvas></div>
     </div>
 
@@ -834,20 +850,39 @@ function ingestRunComplete(payload) {
 // ─── LLM reasoning ───────────────────────────────────────────────
 
 function ingestLlmCall(row, autoSelect = false) {
+  // Detect episode boundary: step resets back to 0 (or near 0) after having advanced
+  const step = row.step ?? 0;
+  if (step === 0 && state.llmLastStep > 0) {
+    state.llmEpisode++;
+  }
+  state.llmLastStep = step;
+  row._episode = state.llmEpisode;
+
   state.llmCalls.push(row);
   const idx = state.llmCalls.length - 1;
   renderLlmCallItem(row, idx);
   if (autoSelect || state.selectedLlmIdx === null) {
     selectLlmCall(idx);
   }
+  updateTimingAvg();
+}
+
+function updateTimingAvg() {
+  const label = document.getElementById('timing-avg-label');
+  if (!label) return;
+  const latencies = state.llmCalls
+    .map(c => c.latency_ms)
+    .filter(v => v != null && isFinite(v));
+  if (latencies.length === 0) { label.textContent = ''; return; }
+  const avg = latencies.reduce((a, b) => a + b, 0) / latencies.length;
+  label.textContent = `avg LLM latency: ${Math.round(avg)}ms`;
 }
 
 function renderLlmCallItem(row, idx) {
   const list = document.getElementById('llm-call-list');
   if (!list) return;
-  // Remove placeholder
-  const ph = list.querySelector('div:not(.llm-call-item)');
-  if (ph) ph.remove();
+  // Remove placeholder only when no real items exist yet
+  if (!list.querySelector('.llm-call-item')) list.innerHTML = '';
 
   const trigger = row.trigger_reason || 'initial';
   const latency = row.latency_ms != null ? `${Math.round(row.latency_ms)}ms` : '';
@@ -855,11 +890,20 @@ function renderLlmCallItem(row, idx) {
     ? `↑${row.input_tokens} ↓${row.output_tokens} tok`
     : '';
 
+  // Insert episode separator before the first item of each episode after episode 0
+  if (row._episode > 0 && (idx === 0 || state.llmCalls[idx - 1]._episode !== row._episode)) {
+    const sep = document.createElement('div');
+    sep.className = 'ep-divider';
+    sep.textContent = `Episode ${row._episode + 1}`;
+    list.appendChild(sep);
+  }
+
+  const epLabel = row._episode > 0 ? ` <span style="font-weight:400;color:var(--muted);">Ep ${row._episode + 1}</span>` : '';
   const item = document.createElement('div');
   item.className = 'llm-call-item';
   item.dataset.idx = idx;
   item.innerHTML = `
-    <div class="lci-step">Step ${row.step ?? '?'}</div>
+    <div class="lci-step">Step ${row.step ?? '?'}${epLabel}</div>
     <div class="lci-trigger">${trigger}</div>
     <div class="lci-meta">${latency}${latency && tokens ? '  ' : ''}${tokens}</div>
   `;
@@ -956,7 +1000,11 @@ async function selectRun(runId) {
   state.lastStep = 0;
   state.policyColors = {};
   state.llmCalls = [];
+  state.llmEpisode = 0;
+  state.llmLastStep = -1;
   state.selectedLlmIdx = null;
+  const avgLabel = document.getElementById('timing-avg-label');
+  if (avgLabel) avgLabel.textContent = '';
 
   // Update sidebar active state
   document.querySelectorAll('.run-card').forEach(el => {

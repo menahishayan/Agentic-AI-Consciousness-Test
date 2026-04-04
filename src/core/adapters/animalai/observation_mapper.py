@@ -1,12 +1,14 @@
 """
 Observation Mapper — converts raw Animal AI observations into AgentState.
 
-Animal AI provides:
+Animal AI 4 provides:
   - Visual observation: numpy array of shape (H, W, 3) or (3, H, W) — RGB camera
-  - Velocity/position: 1D float array with 3 elements (forward, right, up) [m/s]
-  - Raycasts (if configured): 1D float array of length n_rays × (n_tags + 1)
-      Each ray: [one-hot over tags..., normalized_distance]
-      distance 0.0 = right next to agent, 1.0 = max range / no hit
+  - Raycast sensor: 1D float array of exactly 7 elements (AAI4 default single-ray config)
+      [GoodGoal, GoodGoalMulti, BadGoal, BadGoalMulti, wall, ramp, distance]
+      First 6: one-hot encoding of the detected tag (>0.5 = hit)
+      Last 1: normalised distance (1.0 = no hit / max range, <1.0 = object detected)
+  - NOTE: Raw velocity is NOT available in Animal AI 4 vector observations.
+      Position is dead-reckoned from actions using step_size from config.
 
 We extract a compact feature vector from the visual observation without GPU:
   - Downsample to 21×21
@@ -52,18 +54,12 @@ _THUMB_SIZE = 21
 # Number of brightness histogram buckets
 _HIST_BUCKETS = 4
 
-# Raycast configuration — Animal AI basic food arena default.
-# Each ray encodes: [one-hot over _RAYCAST_TAGS..., normalized_distance]
-# distance: 0.0 = at agent, 1.0 = max range / no hit
-_RAYCAST_TAGS = ["GoodGoal", "BadGoal", "wall"]
-_FLOATS_PER_RAY = len(_RAYCAST_TAGS) + 1  # 4
-
-# Angle labels indexed from left to right (Animal AI fan is symmetric around forward)
-_RAY_ANGLE_LABELS: Dict[int, List[str]] = {
-    1: ["forward"],
-    3: ["left-45°", "forward", "right-45°"],
-    5: ["left-45°", "left-22°", "forward", "right-22°", "right-45°"],
-}
+# Raycast configuration — Animal AI 4 default single-ray sensor.
+# The vector obs is a flat 1D array: [one-hot over _AAI_RAY_TAGS..., normalized_distance]
+# 6 detectable tags + 1 distance = 7 floats total.
+# distance: 1.0 = max range (no hit), <1.0 = object detected at that fraction of range.
+_AAI_RAY_TAGS = ["GoodGoal", "GoodGoalMulti", "BadGoal", "BadGoalMulti", "wall", "ramp"]
+_AAI_RAY_OBS_LEN = len(_AAI_RAY_TAGS) + 1  # 7
 
 
 def map_obs(
@@ -96,12 +92,14 @@ def map_obs(
     terrain_novelty = _estimate_terrain_novelty(visual_features)
     entity_density = _estimate_entity_density(visual_features)
 
-    # Raycast hits — primary perception source when available
-    raycast_hits: Optional[List[Dict[str, Any]]] = info.get("raycast_hits") or None
+    # Raycast — single-ray dict from AAI4's (7,) vector obs
+    raycast: Dict[str, Any] = info.get("raycast_hits") or {"hit_tag": None, "distance": 1.0}
+    hit_tag = raycast.get("hit_tag")
+    detected_objects: List[str] = [hit_tag] if hit_tag else []
 
     # Resource/threat estimates: raycasts take priority over visual heuristics
-    resource_level = _estimate_resource(visual_features, raycast_hits)
-    threat_proximity = _estimate_threat(visual_features, raycast_hits)
+    resource_level = _estimate_resource(visual_features, raycast)
+    threat_proximity = _estimate_threat(visual_features, raycast)
 
     hs = homeostatic.get_state()
 
@@ -115,11 +113,11 @@ def map_obs(
         position=pos,
         perception=PerceptionState(
             visual_features=visual_features,
-            detected_objects=info.get("detected_objects", []),
+            detected_objects=detected_objects,
             area_id=area_id,
             terrain_novelty=terrain_novelty,
             entity_density=entity_density,
-            raycast_hits=raycast_hits,
+            raycast_hits=[raycast] if hit_tag or raycast["distance"] < 1.0 else None,
         ),
         resources=ResourceState(
             resource_level=resource_level,
@@ -210,57 +208,42 @@ def _extract_local_speed(obs_list: List[Any]) -> Tuple[float, float, float]:
     """
     Extract (forward, right, up) local speeds from Animal AI's vector observation.
 
-    Animal AI's velocity array has exactly 3 elements. We look for exactly-3 first
-    to avoid accidentally consuming the raycast array (which is longer).
+    Animal AI 4 does NOT expose raw velocity in the vector obs. Velocity was a
+    v2/v3 artifact. The only 1D array present is the raycast observation (7 floats
+    for AAI4's default single-ray config: 6 one-hot tag floats + 1 distance).
+    We guard against accidentally consuming that array by refusing any 1D array
+    whose length is not exactly 3.
     """
-    # Prefer exact-3 match (velocity)
     for obs in obs_list:
         arr = np.asarray(obs)
         if arr.ndim == 1 and len(arr) == 3:
             return float(arr[0]), float(arr[1]), float(arr[2])
-    # Fallback: any short 1D array (handles edge cases)
-    for obs in obs_list:
-        arr = np.asarray(obs)
-        if arr.ndim == 1 and 3 <= len(arr) <= 5:
-            return float(arr[0]), float(arr[1]), float(arr[2])
     return 0.0, 0.0, 0.0
 
 
-def _parse_raycasts(obs_list: List[Any]) -> List[Dict[str, Any]]:
+def _parse_raycasts(obs_list: List[Any]) -> Dict[str, Any]:
     """
-    Parse raycast observations from Animal AI's obs_list.
+    Parse Animal AI 4's single-ray vector observation.
 
-    Looks for a 1D float array whose length is a multiple of _FLOATS_PER_RAY (4)
-    and longer than the velocity array (>3). If found, decodes into a list of dicts:
-        [{"angle_idx": i, "angle_label": str, "hit_tag": str|None, "distance": float}]
+    AAI4 emits a flat 1D array of exactly 7 floats:
+        [GoodGoal, GoodGoalMulti, BadGoal, BadGoalMulti, wall, ramp, distance]
+    where the first 6 are a one-hot encoding of the hit tag and the last is
+    normalised distance (1.0 = no hit / max range, <1.0 = object at that fraction).
 
-    Returns an empty list if no raycast array is detected (binary not configured).
+    Returns a dict {"hit_tag": str|None, "distance": float}.
+    If no matching array is found, returns {"hit_tag": None, "distance": 1.0}.
     """
     for obs in obs_list:
         arr = np.asarray(obs, dtype=np.float32)
-        if arr.ndim != 1 or len(arr) <= 3:
-            continue
-        if len(arr) % _FLOATS_PER_RAY != 0:
-            continue
-        n_rays = len(arr) // _FLOATS_PER_RAY
-        angle_labels = _RAY_ANGLE_LABELS.get(n_rays, [f"ray_{i}" for i in range(n_rays)])
-        results: List[Dict[str, Any]] = []
-        for i in range(n_rays):
-            base = i * _FLOATS_PER_RAY
-            onehot = arr[base:base + len(_RAYCAST_TAGS)]
-            distance = float(arr[base + len(_RAYCAST_TAGS)])
-            hit_tag: Optional[str] = None
-            best_idx = int(np.argmax(onehot))
-            if float(onehot[best_idx]) > 0.5:
-                hit_tag = _RAYCAST_TAGS[best_idx] if best_idx < len(_RAYCAST_TAGS) else f"tag_{best_idx}"
-            results.append({
-                "angle_idx": i,
-                "angle_label": angle_labels[i] if i < len(angle_labels) else f"ray_{i}",
-                "hit_tag": hit_tag,
-                "distance": distance,
-            })
-        return results
-    return []
+        if arr.ndim == 1 and len(arr) == _AAI_RAY_OBS_LEN:
+            one_hot = arr[:len(_AAI_RAY_TAGS)]
+            distance = float(arr[len(_AAI_RAY_TAGS)])
+            best_idx = int(np.argmax(one_hot))
+            hit_tag: Optional[str] = (
+                _AAI_RAY_TAGS[best_idx] if float(one_hot[best_idx]) > 0.5 else None
+            )
+            return {"hit_tag": hit_tag, "distance": distance}
+    return {"hit_tag": None, "distance": 1.0}
 
 
 def _build_area_id(x: float, z: float) -> str:
@@ -293,20 +276,20 @@ def _estimate_entity_density(features: List[float]) -> float:
 
 def _estimate_resource(
     features: List[float],
-    raycast_hits: Optional[List[Dict[str, Any]]] = None,
+    raycast: Optional[Dict[str, Any]] = None,
 ) -> float:
     """
     Estimate food resource level.
-    Primary: closest GoodGoal raycast hit (accurate, directional).
+    Primary: GoodGoal/GoodGoalMulti raycast hit (accurate, directional).
     Fallback: green channel dominance from visual features (heuristic).
     """
-    if raycast_hits:
-        food_hits = [r for r in raycast_hits if r.get("hit_tag") == "GoodGoal"]
-        if food_hits:
-            closest = min(food_hits, key=lambda r: r["distance"])
+    if raycast is not None:
+        hit_tag = raycast.get("hit_tag")
+        if hit_tag in ("GoodGoal", "GoodGoalMulti"):
             # 1.0 = food right next to agent, fades linearly with distance
-            return float(max(0.0, 1.0 - closest["distance"]))
-        return 0.1  # Raycasts available but no food visible
+            return float(max(0.0, 1.0 - raycast["distance"]))
+        # Raycast active but no food visible
+        return 0.1
 
     # Visual fallback
     if len(features) < 6:
@@ -318,24 +301,22 @@ def _estimate_resource(
 
 def _estimate_threat(
     features: List[float],
-    raycast_hits: Optional[List[Dict[str, Any]]] = None,
+    raycast: Optional[Dict[str, Any]] = None,
 ) -> float:
     """
     Estimate threat proximity.
-    Primary: BadGoal raycast hits (accurate). Walls are lower-weight threat.
+    Primary: BadGoal/BadGoalMulti raycast hit (accurate). Walls are lower-weight.
     Fallback: red channel anomaly from visual features (heuristic).
     """
-    if raycast_hits:
-        threat = 0.0
-        for r in raycast_hits:
-            tag = r.get("hit_tag")
-            dist = r.get("distance", 1.0)
-            if tag == "BadGoal":
-                threat = max(threat, 1.0 - dist)
-            elif tag == "wall":
-                # Walls are always nearby in bounded arenas — lower weight
-                threat = max(threat, (1.0 - dist) * 0.25)
-        return float(threat)
+    if raycast is not None:
+        hit_tag = raycast.get("hit_tag")
+        dist = raycast.get("distance", 1.0)
+        if hit_tag in ("BadGoal", "BadGoalMulti"):
+            return float(1.0 - dist)
+        elif hit_tag == "wall":
+            # Walls are always nearby in bounded arenas — lower weight
+            return float((1.0 - dist) * 0.25)
+        return 0.0
 
     # Visual fallback
     if len(features) < 6:

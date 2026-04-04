@@ -2,8 +2,8 @@
   "adapter_folder": "animalai",
   "adapter_config": {
     "homeostatic": {
-      "health_depletion_rate": 0.003,
-      "saturation_depletion_rate": 0.004,
+      "health_depletion_rate": 0.0015,
+      "saturation_depletion_rate": 0.0015,
       "food_health_restore": 0.3,
       "food_saturation_restore": 0.5,
       "hazard_health_penalty": 0.2,
@@ -34,11 +34,12 @@
   },
   "llm": {
     "enabled": true,
-    "provider": "anthropic",
-    "model": "claude-sonnet-4-6",
+    "provider": "ollama",
+    "model": "gemma3:4b",
+    "base_url": "http://localhost:11434/v1",
     "temperature": 0.1,
     "max_tokens": 500,
-    "timeout_s": 15.0
+    "timeout_s": 10.0
   },
   "policy_generator": {
     "llm_conflict_threshold": 0.8,
