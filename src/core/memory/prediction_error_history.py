@@ -6,7 +6,9 @@ This feeds into precision weighting in the PredictionErrorCalculator.
 """
 from __future__ import annotations
 
+import json
 import logging
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
@@ -103,6 +105,76 @@ class PredictionErrorHistory:
         except Exception as exc:
             log.debug("FAISS query failed: %s", exc)
             return self._records[-self._k:]
+
+    def save(self, path: Path) -> None:
+        """
+        Persist records to JSON sidecar and FAISS index to disk.
+        Two files: pe_history_records.json + pe_history.faiss
+        """
+        if not self._records:
+            return
+        path.mkdir(parents=True, exist_ok=True)
+        try:
+            (path / "pe_history_records.json").write_text(json.dumps([
+                {
+                    "area_id": r.area_id,
+                    "step": r.step,
+                    "feature_vector": r.feature_vector,
+                    "pe_per_channel": r.pe_per_channel,
+                    "mean_pe": r.mean_pe,
+                    "action_id": r.action_id,
+                }
+                for r in self._records
+            ]))
+        except Exception as exc:
+            log.warning("PredictionErrorHistory: records save failed: %s", exc)
+            return
+        try:
+            import faiss
+            if self._index is not None:
+                faiss.write_index(self._index, str(path / "pe_history.faiss"))
+        except Exception as exc:
+            log.warning("PredictionErrorHistory: FAISS index save failed: %s", exc)
+        log.info("PredictionErrorHistory: saved %d records to %s", len(self._records), path)
+
+    def load(self, path: Path) -> None:
+        """
+        Load records from JSON sidecar and FAISS index from disk.
+        Silently no-ops if files don't exist.
+        """
+        records_file = path / "pe_history_records.json"
+        index_file = path / "pe_history.faiss"
+        if not records_file.exists():
+            return
+        try:
+            data = json.loads(records_file.read_text())
+            self._records = [
+                PredictionErrorRecord(
+                    area_id=r["area_id"],
+                    step=r["step"],
+                    feature_vector=r["feature_vector"],
+                    pe_per_channel=r["pe_per_channel"],
+                    mean_pe=r["mean_pe"],
+                    action_id=r.get("action_id"),
+                )
+                for r in data
+            ]
+            if self._records:
+                self._vectors = np.vstack([
+                    self._to_vector(r).reshape(1, -1) for r in self._records
+                ])
+            try:
+                import faiss
+                if index_file.exists():
+                    self._index = faiss.read_index(str(index_file))
+                else:
+                    self._rebuild_index()
+            except Exception:
+                self._rebuild_index()
+            log.info("PredictionErrorHistory: loaded %d records from %s",
+                     len(self._records), path)
+        except Exception as exc:
+            log.warning("PredictionErrorHistory: load failed: %s", exc)
 
     def _rebuild_index(self) -> None:
         try:

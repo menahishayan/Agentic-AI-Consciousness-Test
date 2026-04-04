@@ -6,7 +6,9 @@ action, what happened?" Used by PolicyGenerator to bias future selections.
 """
 from __future__ import annotations
 
+import json
 import logging
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import numpy as np
@@ -58,6 +60,81 @@ class PolicyTraces:
             return [self._records[i] for i in indices[0] if 0 <= i < len(self._records)]
         except Exception:
             return self._records[-self._k:]
+
+    def save(self, path: Path) -> None:
+        """
+        Persist records to JSON sidecar and FAISS index to disk.
+        Two files: policy_traces_records.json + policy_traces.faiss
+        """
+        if not self._records:
+            return
+        path.mkdir(parents=True, exist_ok=True)
+        try:
+            (path / "policy_traces_records.json").write_text(json.dumps([
+                {
+                    "step": r.step,
+                    "policy_id": r.policy_id,
+                    "context_vector": r.context_vector,
+                    "outcome_score": r.outcome_score,
+                    "drive_signals": r.drive_signals,
+                    "goal_coherence": r.goal_coherence,
+                    "notes": r.notes,
+                }
+                for r in self._records
+            ]))
+        except Exception as exc:
+            log.warning("PolicyTraces: records save failed: %s", exc)
+            return
+        try:
+            import faiss
+            if self._index is not None:
+                faiss.write_index(self._index, str(path / "policy_traces.faiss"))
+        except Exception as exc:
+            log.warning("PolicyTraces: FAISS index save failed: %s", exc)
+        log.info("PolicyTraces: saved %d records to %s", len(self._records), path)
+
+    def load(self, path: Path) -> None:
+        """
+        Load records from JSON sidecar and FAISS index from disk.
+        Silently no-ops if files don't exist.
+        """
+        records_file = path / "policy_traces_records.json"
+        index_file = path / "policy_traces.faiss"
+        if not records_file.exists():
+            return
+        try:
+            data = json.loads(records_file.read_text())
+            self._records = [
+                PolicyTraceRecord(
+                    step=r["step"],
+                    policy_id=r["policy_id"],
+                    context_vector=r["context_vector"],
+                    outcome_score=r["outcome_score"],
+                    drive_signals=r["drive_signals"],
+                    goal_coherence=r.get("goal_coherence"),
+                    notes=r.get("notes"),
+                )
+                for r in data
+            ]
+            if self._records:
+                vecs = []
+                for r in self._records:
+                    vec = np.array(r.context_vector[:_DIM], dtype=np.float32)
+                    if len(vec) < _DIM:
+                        vec = np.pad(vec, (0, _DIM - len(vec)))
+                    vecs.append(vec)
+                self._vectors = np.vstack(vecs)
+            try:
+                import faiss
+                if index_file.exists():
+                    self._index = faiss.read_index(str(index_file))
+                else:
+                    self._rebuild_index()
+            except Exception:
+                self._rebuild_index()
+            log.info("PolicyTraces: loaded %d records from %s", len(self._records), path)
+        except Exception as exc:
+            log.warning("PolicyTraces: load failed: %s", exc)
 
     def _rebuild_index(self) -> None:
         try:

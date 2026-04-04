@@ -84,6 +84,7 @@ class AgentLoop:
         # Layer 3: Action selection
         self._policy_gen = PolicyGenerator(llm_client=llm_client, config=config)
         self._policy_gen.set_policy_history_callback(memory.get_ltm_success_rate)
+        self._policy_gen.set_episodic_memory_callback(memory.query_similar_traces)
 
         def _llm_log_cb(prompt: str, resp: Any, reason: str, step: int, selected: Optional[str] = None) -> None:
             logger.llm(
@@ -167,6 +168,7 @@ class AgentLoop:
             episode_stats["final_health"] = self._current_state.homeostasis.health or 0.0
             episode_stats["final_saturation"] = self._current_state.homeostasis.saturation or 0.0
 
+        self._memory.save_faiss_stores()
         self._memory.log_summary()
         log.info("Episode complete: %s", episode_stats)
         self._logger.event("episode_complete", episode_stats, step=self._step)
@@ -236,6 +238,8 @@ class AgentLoop:
         context["recent_actions"] = list(self._recent_actions)
         # Raycast hits from perception — directional food/threat bearing for LLM
         context["raycast_hits"] = state.perception.raycast_hits
+        # Current AgentState — used by PolicyGenerator to query episodic memory
+        context["current_state"] = state
 
         # --- Layer 3: Free energy scoring ---
         fe_scores = self._free_energy.score(
@@ -283,15 +287,52 @@ class AgentLoop:
         self._memory.update_state_outcome(next_state)
         self._memory.record_prediction_error(next_state, pe_batch, action=selected_id)
 
-        # Outcome score: allostatic error after action (lower urgency = better outcome)
+        # Outcome score: drive-relief based.
+        #
+        # Measures whether this action reduced allostatic urgency, not whether
+        # urgency is currently low. An agent at low urgency scoring high for
+        # every action (including wall hits) would give the LTM no useful signal.
+        #
+        # relief > 0 → action reduced urgency (good)
+        # relief < 0 → action increased urgency (bad, e.g. depletion tick with no progress)
+        #
+        # Per-step urgency change is tiny (~0.001–0.002); scale=5 spreads the
+        # signal so ±0.1 relief maps to ±0.5 around the neutral midpoint of 0.5.
+        # A food collection (~0.18 urgency relief) saturates to 1.0.
+        #
+        # Motor efficiency is a necessary second component: without it, move_forward
+        # into a wall and turn_right produce the same drive urgency delta in most
+        # steps, so the LTM can't differentiate them. motor_eff=0 (wall-blocked)
+        # pulls the score down regardless of urgency change.
         next_vitals = self._vital_monitor.read(next_state)
-        outcome_score = float(max(0.0, min(1.0, 1.0 - self._allostatic.peek_max_urgency(next_vitals))))
+        prev_urgency = drive_batch.max_urgency
+        next_urgency = self._allostatic.peek_max_urgency(next_vitals)
+        relief = prev_urgency - next_urgency
+        relief_score = max(0.0, min(1.0, 0.5 + relief * 5.0))
+        motor_eff = float(next_state.raw_metadata.get("motor_efficiency", 1.0))
+        outcome_score = float(max(0.0, min(1.0, relief_score * 0.7 + motor_eff * 0.3)))
+
+        # Situation note for episodic memory — captured at the moment of action
+        # so the LLM can read "wall ahead → turn_right → outcome: 0.71" in future steps.
+        _rc = prev_state.perception.raycast_hits
+        if _rc:
+            _r = _rc[0]
+            _tag = _r.get("hit_tag")
+            _dist = _r.get("distance", 1.0)
+            _situation = f"{_tag} at {_dist:.2f} ahead" if _tag else "open ahead"
+        else:
+            _situation = "no raycast"
+        _motor = float(prev_state.raw_metadata.get("motor_efficiency", 1.0))
+        if _motor < 0.3:
+            _situation += ", blocked"
+        situation_note = _situation
 
         self._memory.record_policy_trace(
             state=prev_state,
             policy_id=selected_id,
             outcome_score=outcome_score,
             drive_signals={s.channel_id: s.urgency for s in drive_batch.signals},
+            notes=situation_note,
         )
         self._memory.record_episode_outcome(
             selected_id,

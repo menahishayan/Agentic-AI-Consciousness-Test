@@ -84,6 +84,10 @@ class PolicyGenerator:
         # Long-term memory callback (injected by AgentLoop)
         self._get_policy_history: Optional[Callable[[str], float]] = None
 
+        # Episodic memory callback (injected by AgentLoop)
+        # Signature: (state: AgentState, k: int) -> List[PolicyTraceRecord]
+        self._query_episodic_memory: Optional[Callable] = None
+
         # LLM logging callback (injected by AgentLoop)
         # Signature: (prompt: str, response: Any, trigger_reason: str, step: int) -> None
         self._llm_log_cb: Optional[Callable] = None
@@ -99,6 +103,10 @@ class PolicyGenerator:
     def set_policy_history_callback(self, fn: Callable[[str], float]) -> None:
         """Injected by AgentLoop — provides LTM success rates per policy."""
         self._get_policy_history = fn
+
+    def set_episodic_memory_callback(self, fn: Callable) -> None:
+        """Injected by AgentLoop — queries FAISS policy traces for similar past states."""
+        self._query_episodic_memory = fn
 
     def set_llm_log_callback(self, fn: Callable) -> None:
         """Injected by AgentLoop — logs prompt + full CoT response to llm.jsonl."""
@@ -425,6 +433,27 @@ class PolicyGenerator:
         else:
             affect_note = ""
 
+        # --- Step 5: episodic memory ---
+        episodic_text = "  (no prior episodes yet)"
+        if self._query_episodic_memory is not None:
+            current_state = context.get("current_state")
+            if current_state is not None:
+                try:
+                    traces = self._query_episodic_memory(current_state, 3)
+                    if traces:
+                        lines = []
+                        for t in traces:
+                            h = t.drive_signals.get("health", 0.0)
+                            s = t.drive_signals.get("saturation", 0.0)
+                            situation = t.notes or "unknown situation"
+                            lines.append(
+                                f"  - health={h:.2f}, sat={s:.2f}, {situation}"
+                                f" → {t.policy_id} → outcome: {t.outcome_score:.2f}"
+                            )
+                        episodic_text = "\n".join(lines)
+                except Exception:
+                    pass
+
         valid_ids = ", ".join(p["policy_id"] for p in policies)
         return f"""You are the deliberative system for a survival agent (step {step}).
 You have NO declared task. You act only to reduce allostatic drive deficits and minimise surprise.
@@ -454,6 +483,9 @@ Valid policy_ids: {valid_ids}
 ══ STEP 4 — ALLOSTATIC RESOLUTION ══
   Which action most reduces the highest-urgency drive deficit and minimises surprise?{affect_note}
   If food is visible in raycasts, prioritise turning toward it then moving forward.
+
+══ STEP 5 — EPISODIC MEMORY (similar past situations) ══
+{episodic_text}
 
 REASON: """
 
@@ -544,7 +576,7 @@ REASON: """
 
             if self._get_policy_history is not None:
                 ltm_rate = self._get_policy_history(policy["policy_id"])
-                score += ltm_rate * 0.1
+                score += ltm_rate * 0.3
 
             if score > best_score:
                 best_score = score

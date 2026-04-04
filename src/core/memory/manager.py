@@ -8,6 +8,7 @@ the manager; the manager delegates to the appropriate subsystem.
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from core.memory.long_term_memory import LongTermMemory
@@ -45,6 +46,17 @@ class MemoryManager:
         self._self_state = SelfStateTracking(mem_cfg)
         self._policy_traces = PolicyTraces(mem_cfg)
         self._long_term = LongTermMemory(mem_cfg)
+
+        # Persistence path — same directory as LongTermMemory so all memory
+        # artefacts live together under data/long_term_memory/.
+        self._persist_path = Path(mem_cfg.get("long_term_memory_path", "data/long_term_memory"))
+
+        # Auto-load FAISS stores on startup so prior episodes are immediately
+        # available for retrieval. SelfStateTracking is skipped — its vectors
+        # include broken position coordinates and will be persisted once
+        # dead-reckoning is fixed.
+        self._pe_history.load(self._persist_path)
+        self._policy_traces.load(self._persist_path)
 
     # ------------------------------------------------------------------
     # WorkingMemory
@@ -116,13 +128,15 @@ class MemoryManager:
         policy_id: str,
         outcome_score: float,
         drive_signals: Optional[Dict[str, float]] = None,
+        notes: Optional[str] = None,
     ) -> None:
-        # Build context vector: homeostatic + step normalized
+        # Context vector: homeostatic state (6) + step_norm (1) + padding (3).
+        # Position is intentionally excluded — dead-reckoning accumulates unbounded
+        # error so spatial coords would corrupt FAISS similarity distances.
+        # Queries are purely drive-state based, which is what the LLM needs.
         hv = state.homeostatic_vector()
         step_norm = min(1.0, state.step / 1000.0)
-        x = state.position.x or 0.0
-        z = state.position.z or 0.0
-        context_vec = hv + [step_norm, x / 50.0, z / 50.0, 0.0]  # pad to 10-dim
+        context_vec = hv + [step_norm, 0.0, 0.0, 0.0]  # 10-dim, position slots zeroed
 
         rec = PolicyTraceRecord(
             step=state.step,
@@ -130,11 +144,38 @@ class MemoryManager:
             context_vector=context_vec[:10],
             outcome_score=outcome_score,
             drive_signals=drive_signals or {},
+            notes=notes,
         )
         self._policy_traces.record(rec)
 
     def get_policy_outcome_history(self, policy_id: str) -> float:
         return self._policy_traces.get_policy_outcome_history(policy_id)
+
+    def query_similar_traces(self, state: AgentState, k: int = 3) -> list:
+        """
+        Return up to k PolicyTraceRecords from past situations most similar
+        to the current homeostatic + position state.
+
+        Uses the same context vector as record_policy_trace so FAISS distances
+        are meaningful. Called by PolicyGenerator before each LLM prompt to
+        inject episodic memory as a prior.
+        """
+        hv = state.homeostatic_vector()
+        step_norm = min(1.0, state.step / 1000.0)
+        context_vec = hv + [step_norm, 0.0, 0.0, 0.0]  # position excluded (see record_policy_trace)
+        records = self._policy_traces.query_similar(context_vec)
+        return records[:k]
+
+    def save_faiss_stores(self) -> None:
+        """
+        Persist FAISS-backed stores to disk.  Called at episode end.
+
+        PolicyTraces and PredictionErrorHistory are persisted.
+        SelfStateTracking is intentionally skipped until dead-reckoning
+        position coordinates are fixed (spatial vectors are currently corrupt).
+        """
+        self._pe_history.save(self._persist_path)
+        self._policy_traces.save(self._persist_path)
 
     # ------------------------------------------------------------------
     # LongTermMemory
