@@ -399,11 +399,11 @@ class PolicyGenerator:
             tag = r.get("hit_tag")
             dist = r.get("distance", 1.0)
             if tag in ("GoodGoal", "GoodGoalMulti"):
-                raycast_text = f"  forward       food at {dist:.2f} (→ move_forward)"
+                raycast_text = f"  forward       food at {dist:.2f}"
             elif tag in ("BadGoal", "BadGoalMulti"):
-                raycast_text = f"  forward       hazard at {dist:.2f} (→ avoid — turn away)"
+                raycast_text = f"  forward       hazard at {dist:.2f}"
             elif tag == "wall":
-                raycast_text = f"  forward       wall at {dist:.2f} (→ do NOT move_forward)"
+                raycast_text = f"  forward       wall at {dist:.2f}"
             elif tag == "ramp":
                 raycast_text = f"  forward       ramp at {dist:.2f}"
             else:
@@ -433,7 +433,7 @@ class PolicyGenerator:
         else:
             affect_note = ""
 
-        # --- Step 5: episodic memory ---
+        # --- Step 4: episodic memory (before EFE so recency bias amplifies EFE, not memory) ---
         episodic_text = "  (no prior episodes yet)"
         if self._query_episodic_memory is not None:
             current_state = context.get("current_state")
@@ -448,7 +448,7 @@ class PolicyGenerator:
                             situation = t.notes or "unknown situation"
                             lines.append(
                                 f"  - health={h:.2f}, sat={s:.2f}, {situation}"
-                                f" → {t.policy_id} → outcome: {t.outcome_score:.2f}"
+                                f" → {t.policy_id}"
                             )
                         episodic_text = "\n".join(lines)
                 except Exception:
@@ -476,16 +476,16 @@ Valid policy_ids: {valid_ids}
 ══ STEP 2b — DIRECTIONAL PERCEPTION (raycasts) ══
 {raycast_text}
 
-══ STEP 3 — EXPECTED FREE ENERGY PER ACTION ══
+══ STEP 4 — EPISODIC MEMORY (similar past situations — context only) ══
+{episodic_text}
+
+══ STEP 5 — EXPECTED FREE ENERGY PER ACTION ══
 {fe_text}
   (Higher EFE = action better reduces drive deficit + prediction error)
 
-══ STEP 4 — ALLOSTATIC RESOLUTION ══
-  Which action most reduces the highest-urgency drive deficit and minimises surprise?{affect_note}
-  If food is visible in raycasts, prioritise turning toward it then moving forward.
-
-══ STEP 5 — EPISODIC MEMORY (similar past situations) ══
-{episodic_text}
+══ STEP 6 — ALLOSTATIC RESOLUTION ══
+  Select the action with the highest EFE score that is consistent with the perceptual evidence above.
+  If food is visible in raycasts, move_forward has first-order pragmatic value.{affect_note}
 
 REASON: """
 

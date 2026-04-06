@@ -130,13 +130,19 @@ class MemoryManager:
         drive_signals: Optional[Dict[str, float]] = None,
         notes: Optional[str] = None,
     ) -> None:
-        # Context vector: homeostatic state (6) + step_norm (1) + padding (3).
-        # Position is intentionally excluded — dead-reckoning accumulates unbounded
-        # error so spatial coords would corrupt FAISS similarity distances.
-        # Queries are purely drive-state based, which is what the LLM needs.
+        # Context vector (10-dim):
+        #   [0-5] homeostatic_vector: health, saturation, energy, oxygen, threat, resource
+        #   [6]   step_norm
+        #   [7]   food_dist: 0=food far/absent, 1=food at contact — from forward raycast
+        #   [8-9] padding (0.0)
+        # Position excluded — dead-reckoning error would corrupt similarity distances.
         hv = state.homeostatic_vector()
         step_norm = min(1.0, state.step / 1000.0)
-        context_vec = hv + [step_norm, 0.0, 0.0, 0.0]  # 10-dim, position slots zeroed
+        rc = state.perception.raycast_hits
+        food_dist = 0.0
+        if rc and rc[0].get("hit_tag") in ("GoodGoal", "GoodGoalMulti"):
+            food_dist = 1.0 - float(rc[0].get("distance", 1.0))
+        context_vec = hv + [step_norm, food_dist, 0.0, 0.0]  # 10-dim
 
         rec = PolicyTraceRecord(
             step=state.step,
@@ -162,7 +168,11 @@ class MemoryManager:
         """
         hv = state.homeostatic_vector()
         step_norm = min(1.0, state.step / 1000.0)
-        context_vec = hv + [step_norm, 0.0, 0.0, 0.0]  # position excluded (see record_policy_trace)
+        rc = state.perception.raycast_hits
+        food_dist = 0.0
+        if rc and rc[0].get("hit_tag") in ("GoodGoal", "GoodGoalMulti"):
+            food_dist = 1.0 - float(rc[0].get("distance", 1.0))
+        context_vec = hv + [step_norm, food_dist, 0.0, 0.0]
         records = self._policy_traces.query_similar(context_vec)
         return records[:k]
 

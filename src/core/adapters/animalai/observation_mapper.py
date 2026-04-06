@@ -1,14 +1,23 @@
 """
 Observation Mapper — converts raw Animal AI observations into AgentState.
 
-Animal AI 4 provides:
-  - Visual observation: numpy array of shape (H, W, 3) or (3, H, W) — RGB camera
-  - Raycast sensor: 1D float array of exactly 7 elements (AAI4 default single-ray config)
-      [GoodGoal, GoodGoalMulti, BadGoal, BadGoalMulti, wall, ramp, distance]
-      First 6: one-hot encoding of the detected tag (>0.5 = hit)
-      Last 1: normalised distance (1.0 = no hit / max range, <1.0 = object detected)
-  - NOTE: Raw velocity is NOT available in Animal AI 4 vector observations.
-      Position is dead-reckoned from actions using step_size from config.
+Animal AI 4 provides two observation arrays per step:
+
+  1. Visual observation: numpy array of shape (H, W, 3) or (3, H, W) — RGB camera
+
+  2. Agent proprioceptive vector: 1D float array of exactly 8 elements from
+     TrainingAgent.CollectObservations (VectorSensor):
+       [0]   health           (Unity units, 0–100)
+       [1–3] localVel.x/y/z  (local-space velocity, Unity units/s)
+       [4–6] localPos.x/y/z  (world position, Unity units)
+       [7]   speed_magnitude  (Rigidbody.linearVelocity.magnitude, Unity units/s)
+     Index 7 is the proprioceptive speed signal used for motor PE computation:
+       free motion → ~step_size/dt (≈18 units/s at default config)
+       wall contact → ~0 units/s
+
+  NOTE: Directional raycast sensors are not yet added to the ML-Agents obs pipeline.
+  Resource/threat estimation falls back to visual heuristics until a
+  RayPerceptionSensorComponent3D is attached to the agent prefab.
 
 We extract a compact feature vector from the visual observation without GPU:
   - Downsample to 21×21
@@ -54,10 +63,21 @@ _THUMB_SIZE = 21
 # Number of brightness histogram buckets
 _HIST_BUCKETS = 4
 
-# Raycast configuration — Animal AI 4 default single-ray sensor.
-# The vector obs is a flat 1D array: [one-hot over _AAI_RAY_TAGS..., normalized_distance]
-# 6 detectable tags + 1 distance = 7 floats total.
-# distance: 1.0 = max range (no hit), <1.0 = object detected at that fraction of range.
+# Agent proprioceptive observation layout (TrainingAgent.CollectObservations VectorSensor).
+# 8 floats: health(1) + localVel(3) + worldPos_normalised(3) + speed_magnitude(1)
+_AGENT_OBS_LEN = 8
+_AGENT_OBS_SPEED_IDX = 7   # linearVelocity.magnitude — raw Unity units/s
+
+# TrainingAgent._arenaSize used to normalise world position before sending.
+# Must match the C# constant (currently 30f).
+_ARENA_SIZE_UNITY = 30.0
+
+# Raycast sensor layout — emitted by a RayPerceptionSensorComponent3D on the agent prefab
+# as a SEPARATE array in obs_list, distinct from the 8-float proprioceptive obs.
+# Default Animal AI single-ray config: 1 ray × 6 detectable tags + 1 distance = 7 floats.
+#   distance: 1.0 = max range / no hit; <1.0 = object at that fraction of range.
+# NOTE: RayPerceptionSensorComponent3D is not yet attached to the agent prefab; until
+# it is, _parse_raycasts will find no 7-float array and return the no-hit sentinel.
 _AAI_RAY_TAGS = ["GoodGoal", "GoodGoalMulti", "BadGoal", "BadGoalMulti", "wall", "ramp"]
 _AAI_RAY_OBS_LEN = len(_AAI_RAY_TAGS) + 1  # 7
 
@@ -206,32 +226,55 @@ def _extract_visual_features(obs: Optional[np.ndarray]) -> List[float]:
 
 def _extract_local_speed(obs_list: List[Any]) -> Tuple[float, float, float]:
     """
-    Extract (forward, right, up) local speeds from Animal AI's vector observation.
+    Extract proprioceptive speed from Animal AI's vector observation.
 
-    Animal AI 4 does NOT expose raw velocity in the vector obs. Velocity was a
-    v2/v3 artifact. The only 1D array present is the raycast observation (7 floats
-    for AAI4's default single-ray config: 6 one-hot tag floats + 1 distance).
-    We guard against accidentally consuming that array by refusing any 1D array
-    whose length is not exactly 3.
+    TrainingAgent.CollectObservations emits an 8-float VectorSensor array:
+      [health, localVel.x, localVel.y, localVel.z, pos.x, pos.y, pos.z, speed_mag]
+
+    Index 7 (linearVelocity.magnitude) is the authoritative proprioceptive speed:
+      free motion  → ~step_size / velocity_dt (≈18 Unity units/s at default config)
+      wall contact → ~0 Unity units/s
+
+    Returns (speed_magnitude, 0.0, 0.0) so callers receive forward speed in index 0.
+    Right and up components are not needed for the current motor PE pipeline.
     """
     for obs in obs_list:
         arr = np.asarray(obs)
-        if arr.ndim == 1 and len(arr) == 3:
-            return float(arr[0]), float(arr[1]), float(arr[2])
+        if arr.ndim == 1 and len(arr) == _AGENT_OBS_LEN:
+            return float(arr[_AGENT_OBS_SPEED_IDX]), 0.0, 0.0
+    return 0.0, 0.0, 0.0
+
+
+def _extract_world_pos(obs_list: List[Any]) -> Tuple[float, float, float]:
+    """
+    Extract world position from proprioceptive obs indices [4, 5, 6] and un-normalise.
+
+    TrainingAgent.CollectObservations divides transform.position by _arenaSize before
+    sending, so multiply by _ARENA_SIZE_UNITY to recover Unity world coordinates.
+    """
+    for obs in obs_list:
+        arr = np.asarray(obs)
+        if arr.ndim == 1 and len(arr) == _AGENT_OBS_LEN:
+            x = float(arr[4]) * _ARENA_SIZE_UNITY
+            y = float(arr[5]) * _ARENA_SIZE_UNITY
+            z = float(arr[6]) * _ARENA_SIZE_UNITY
+            return x, y, z
     return 0.0, 0.0, 0.0
 
 
 def _parse_raycasts(obs_list: List[Any]) -> Dict[str, Any]:
     """
-    Parse Animal AI 4's single-ray vector observation.
+    Parse the directional raycast observation from obs_list.
 
-    AAI4 emits a flat 1D array of exactly 7 floats:
+    A RayPerceptionSensorComponent3D on the agent prefab emits a separate 1D float
+    array of exactly _AAI_RAY_OBS_LEN (7) floats — distinct from the 8-float
+    proprioceptive obs so there is no collision risk:
         [GoodGoal, GoodGoalMulti, BadGoal, BadGoalMulti, wall, ramp, distance]
-    where the first 6 are a one-hot encoding of the hit tag and the last is
-    normalised distance (1.0 = no hit / max range, <1.0 = object at that fraction).
+    First 6: one-hot tag encoding (>0.5 = hit). Last: normalised distance.
 
-    Returns a dict {"hit_tag": str|None, "distance": float}.
-    If no matching array is found, returns {"hit_tag": None, "distance": 1.0}.
+    If no 7-float array is present (sensor not yet attached to the prefab), returns
+    the no-hit sentinel {"hit_tag": None, "distance": 1.0} so the rest of the
+    pipeline degrades gracefully to visual heuristics.
     """
     for obs in obs_list:
         arr = np.asarray(obs, dtype=np.float32)

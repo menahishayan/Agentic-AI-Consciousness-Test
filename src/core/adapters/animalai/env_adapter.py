@@ -20,7 +20,7 @@ import numpy as np
 
 from core.adapters.animalai.action_mapper import get_policy_descriptors, policy_id_to_action
 from core.adapters.animalai.homeostatic_wrapper import HomeostaticWrapper
-from core.adapters.animalai.observation_mapper import _PositionTracker, _extract_local_speed, _parse_raycasts, map_obs
+from core.adapters.animalai.observation_mapper import _PositionTracker, _extract_local_speed, _extract_world_pos, _parse_raycasts, map_obs
 from core.adapters.base import AbstractEnvironmentAdapter
 from core.models.signals import DriveChannel
 from core.models.state import AgentState
@@ -28,11 +28,7 @@ from core.models.state import AgentState
 log = logging.getLogger(__name__)
 
 # Actions that command translational movement — used for stuck detection
-_MOVEMENT_ACTIONS = {"move_forward", "move_back"}
-
-# Normalised raycast distance below which a forward wall hit is treated as blocking
-# (0.15 = wall within ~15% of max ray range, roughly < 1 arena unit away)
-_WALL_BLOCK_THRESHOLD = 0.15
+_MOVEMENT_ACTIONS = {"move_forward", "move_backward"}
 
 _DRIVE_CHANNELS = [
     DriveChannel(
@@ -109,10 +105,17 @@ class AnimalAIAdapter(AbstractEnvironmentAdapter):
             file_name = str(Path(file_name).resolve())
         self._file_name: Optional[str] = file_name
 
-        # Step size in arena units — used for dead-reckoning position integration.
-        # Animal AI 4 does not expose velocity; we use step_size directly.
+        # Timing: decision_period physics frames per policy step at physics_fps.
+        # velocity_dt converts Unity units/s → arena units/step for dead-reckoning.
+        physics_fps = float(config.get("physics_fps", 30.0))
+        decision_period = float(config.get("decision_period", 5.0))
+        self._velocity_dt: float = decision_period / physics_fps  # seconds per step
+
         sim_cfg = config.get("simulation", {})
         self._step_size: float = float(sim_cfg.get("step_size", 1.0))
+        # Expected full-throttle forward speed in Unity units/s.
+        # motor_efficiency = measured_speed / expected_speed → [0, 1].
+        self._expected_speed: float = self._step_size / max(self._velocity_dt, 1e-6)
 
         # Dead-reckoning heading — integrated from turn actions each step
         self._heading: float = 0.0
@@ -165,41 +168,32 @@ class AnimalAIAdapter(AbstractEnvironmentAdapter):
             self._heading = (self._heading - self._turn_angle_deg) % 360.0
         info["heading"] = self._heading
 
-        # Animal AI 4 does not expose raw velocity — the (7,) vector obs is raycasts.
-        # motor_efficiency: turns and idle always succeed (1.0); forward/back is inferred
-        # from raycasts — a close wall hit on the forward ray means the agent is blocked.
-        raycast = info.get("raycast_hits") or {}
-        wall_blocking = (
-            action_id in _MOVEMENT_ACTIONS
-            and raycast.get("hit_tag") == "wall"
-            and raycast.get("distance", 1.0) < _WALL_BLOCK_THRESHOLD
-        )
+        # Ground-truth motor signal from Unity proprioceptive obs (index 7: linearVelocity.magnitude).
+        # _get_obs() already populated info["local_speed_forward"] from _extract_local_speed().
+        raw_fwd = float(info.get("local_speed_forward", 0.0))
 
         if action_id in ("turn_left", "turn_right", "idle"):
-            position_delta_norm = 0.0   # turns produce no translational displacement
+            motor_efficiency = 1.0
+            position_delta_norm = 0.0
         else:
-            position_delta_norm = 0.0 if wall_blocking else 1.0
-
-        # motor_efficiency is derived from position_delta_norm so the two signals
-        # never contradict each other in the prompt or PredictionErrorCalculator.
-        motor_efficiency = position_delta_norm if action_id not in ("turn_left", "turn_right") else 1.0
+            motor_efficiency = float(min(max(raw_fwd / max(self._expected_speed, 1e-6), 0.0), 1.0))
+            position_delta_norm = motor_efficiency
 
         info["motor_efficiency"] = motor_efficiency
-        # position_delta_norm = fraction of expected displacement actually achieved.
-        # Used by PredictionErrorCalculator to compute motor PE (efference copy channel).
+        # position_delta_norm: fraction of expected displacement achieved this step.
+        # Used by PredictionErrorCalculator for the motor PE (efference copy channel).
         info["position_delta_norm"] = position_delta_norm
 
-        # Stuck detection: consecutive wall-blocked forward steps
-        if wall_blocking:
+        # Stuck detection: low motor efficiency during a movement action.
+        if action_id in _MOVEMENT_ACTIONS and motor_efficiency < 0.3:
             self._stuck_adapter_count += 1
         else:
             self._stuck_adapter_count = 0
         motor_stuck = self._stuck_adapter_count >= self._stuck_adapter_threshold
         info["motor_stuck"] = motor_stuck
 
-        # Forward speed for position dead-reckoning: use step_size directly since
-        # we have no velocity signal. Scale by motor_efficiency (0 if wall-blocked).
-        info["local_speed_forward"] = self._step_size * motor_efficiency
+        # Scale to arena units/step for position dead-reckoning.
+        info["local_speed_forward"] = raw_fwd * self._velocity_dt
         info["local_speed_right"] = 0.0
 
         self._homeostatic.step(raw_reward, env_done)
@@ -335,6 +329,7 @@ class AnimalAIAdapter(AbstractEnvironmentAdapter):
             self._log_obs_shapes(obs_list)
             visual_obs = self._extract_visual(obs_list)
             fwd, right, up = _extract_local_speed(obs_list)
+            wx, wy, wz = _extract_world_pos(obs_list)
             raycast_hits = _parse_raycasts(obs_list)
             return visual_obs, {
                 "raw_reward": raw_reward,
@@ -342,6 +337,9 @@ class AnimalAIAdapter(AbstractEnvironmentAdapter):
                 "local_speed_forward": fwd,
                 "local_speed_right": right,
                 "local_speed_up": up,
+                "x": wx,
+                "y": wy,
+                "z": wz,
                 "raycast_hits": raycast_hits,
             }
 
@@ -354,6 +352,7 @@ class AnimalAIAdapter(AbstractEnvironmentAdapter):
         self._log_obs_shapes(obs_list)
         visual_obs = self._extract_visual(obs_list)
         fwd, right, up = _extract_local_speed(obs_list)
+        wx, wy, wz = _extract_world_pos(obs_list)
         raycast_hits = _parse_raycasts(obs_list)
         return visual_obs, {
             "raw_reward": raw_reward,
@@ -361,6 +360,9 @@ class AnimalAIAdapter(AbstractEnvironmentAdapter):
             "local_speed_forward": fwd,
             "local_speed_right": right,
             "local_speed_up": up,
+            "x": wx,
+            "y": wy,
+            "z": wz,
             "raycast_hits": raycast_hits,
         }
 

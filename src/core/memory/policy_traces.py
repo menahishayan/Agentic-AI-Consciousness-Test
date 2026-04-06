@@ -17,7 +17,9 @@ from core.models.memory_records import PolicyTraceRecord
 
 log = logging.getLogger(__name__)
 
-_DIM = 10  # [health, saturation, energy, threat, resource, pe_mean, urgency, x, z, step_norm]
+_DIM = 10  # [health, saturation, energy, oxygen, threat, resource, step_norm, food_dist, pad, pad]
+# Increment when the context vector layout changes — causes stale persisted indexes to be discarded.
+_VECTOR_VERSION = 2
 
 
 class PolicyTraces:
@@ -70,18 +72,21 @@ class PolicyTraces:
             return
         path.mkdir(parents=True, exist_ok=True)
         try:
-            (path / "policy_traces_records.json").write_text(json.dumps([
-                {
-                    "step": r.step,
-                    "policy_id": r.policy_id,
-                    "context_vector": r.context_vector,
-                    "outcome_score": r.outcome_score,
-                    "drive_signals": r.drive_signals,
-                    "goal_coherence": r.goal_coherence,
-                    "notes": r.notes,
-                }
-                for r in self._records
-            ]))
+            (path / "policy_traces_records.json").write_text(json.dumps({
+                "version": _VECTOR_VERSION,
+                "records": [
+                    {
+                        "step": r.step,
+                        "policy_id": r.policy_id,
+                        "context_vector": r.context_vector,
+                        "outcome_score": r.outcome_score,
+                        "drive_signals": r.drive_signals,
+                        "goal_coherence": r.goal_coherence,
+                        "notes": r.notes,
+                    }
+                    for r in self._records
+                ],
+            }))
         except Exception as exc:
             log.warning("PolicyTraces: records save failed: %s", exc)
             return
@@ -103,7 +108,20 @@ class PolicyTraces:
         if not records_file.exists():
             return
         try:
-            data = json.loads(records_file.read_text())
+            raw = json.loads(records_file.read_text())
+            # Version guard: discard records built with an older context vector layout.
+            if isinstance(raw, dict):
+                if raw.get("version") != _VECTOR_VERSION:
+                    log.info(
+                        "PolicyTraces: discarding stale records (version %s != %s)",
+                        raw.get("version"), _VECTOR_VERSION,
+                    )
+                    return
+                data = raw["records"]
+            else:
+                # Legacy flat-list format — treat as version 1, discard.
+                log.info("PolicyTraces: discarding legacy (unversioned) records")
+                return
             self._records = [
                 PolicyTraceRecord(
                     step=r["step"],

@@ -11,9 +11,9 @@
     },
     "simulation": {
       "arena_size": 30.0,
-      "step_size": 3.0,
-      "turn_angle_deg": 45.0,
-      "interaction_radius": 4.0,
+      "step_size": 1.0,
+      "turn_angle_deg": 33.3,
+      "interaction_radius": 1.0,
       "hazard_margin": 2.0,
       "n_food": 8,
       "seed": null

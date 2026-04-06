@@ -35,6 +35,7 @@ _CHANNEL_SOURCES = {
     "threat_proximity":  "threat",
     "terrain_novelty":   "visual",
     "entity_density":    "visual",
+    "food_distance":     "exteroceptive",
 }
 
 # Actions that command forward/backward translation
@@ -173,6 +174,11 @@ class PredictionErrorCalculator:
         r = state.resources
         p = state.perception
         motor_efficiency = float(state.raw_metadata.get("motor_efficiency", 1.0))
+        rh = state.perception.raycast_hits
+        food_distance = 1.0
+        if rh and rh[0].get("hit_tag") in ("GoodGoal", "GoodGoalMulti"):
+            food_distance = float(rh[0].get("distance", 1.0))
+
         return {
             "health":            h.health or 0.0,
             "saturation":        h.saturation or 0.0,
@@ -183,4 +189,5 @@ class PredictionErrorCalculator:
             "threat_proximity":  r.threat_proximity or 0.0,
             "terrain_novelty":   p.terrain_novelty or 0.0,
             "entity_density":    p.entity_density or 0.0,
+            "food_distance":     food_distance,
         }

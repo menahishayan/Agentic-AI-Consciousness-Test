@@ -14,11 +14,17 @@ Idle:
   → Seth's beast machine at allostatic equilibrium.
 
 Turn actions (epistemic):
-  epistemic = area_novelty  (scanning novel directions reduces directional uncertainty)
-  Cite: Friston et al. (2017) active inference; Seth & Bayne (2022) curiosity.
+  epistemic = area_novelty + EPISTEMIC_FORAGING_BASELINE
+  (scanning novel directions reduces directional uncertainty)
 
 Movement actions:
-  epistemic = mean_PE  (moving through space resolves spatial prediction errors)
+  epistemic = mean_PE + EPISTEMIC_FORAGING_BASELINE
+  (moving through space resolves spatial prediction errors)
+
+The foraging baseline ensures active actions always out-score idle when drives
+are satisfied. An agent that only moves when starving is a thermostat, not a
+beast machine. Epistemic foraging under low-urgency is the canonical active
+inference behaviour (Friston et al. 2017; Seth & Bayne 2022).
 
 No game-specific logic. No adapter imports.
 """
@@ -30,6 +36,13 @@ from core.models.signals import DriveSignalBatch, PredictionErrorBatch
 
 # Actions that scan unseen directions — pure epistemic value
 _EPISTEMIC_ACTIONS = {"turn_left", "turn_right"}
+
+# Intrinsic epistemic foraging baseline added to all active (non-idle) actions.
+# Ensures active actions always beat idle when drives are satisfied — epistemic
+# foraging under allostatic equilibrium (Friston et al. 2017; Seth & Bayne 2022).
+# At default weights (w_epistemic=0.35): 0.15 × 0.35 = 0.0525 score advantage
+# over idle, which scores at most 1.0 - 0.0 = 1.0 only when urgency AND pe are 0.
+_EPISTEMIC_FORAGING_BASELINE = 0.15
 
 # Per-policy metabolic cost in [0, 1]
 _MOTOR_COST: Dict[str, float] = {
@@ -57,6 +70,9 @@ class FreeEnergyMinimizer:
         self._w_pragmatic  = float(weights.get("allostatic_urgency", 0.50))
         self._w_epistemic  = float(weights.get("epistemic_gain",     0.35))
         self._w_motor_cost = float(weights.get("motor_cost",         0.15))
+        # Consecutive steps with motor_eff < 0.3 — penalty only fires after 2+
+        # to avoid suppressing move_forward on the first stale proprioceptive obs.
+        self._motor_fail_streak: int = 0
 
     def score(
         self,
@@ -87,9 +103,16 @@ class FreeEnergyMinimizer:
         pe_mean = pe_batch.mean_magnitude if pe_batch else 0.0
 
         # Motor failure penalty: if the last action failed (efficiency < 0.3),
-        # scale its EFE toward 0 to discourage repeating a blocked action.
+        # scale its EFE to discourage repeating a blocked action.
         motor_eff = float(context.get("motor_efficiency", 1.0)) if context else 1.0
         last_action = context.get("last_action") if context else None
+
+        # Update consecutive-failure streak; penalty requires streak ≥ 2 so a
+        # single stale obs (e.g. the first step after reset) doesn't fire it.
+        if motor_eff < 0.3:
+            self._motor_fail_streak += 1
+        else:
+            self._motor_fail_streak = 0
 
         # tag → max urgency across all drive signals
         urgency_by_tag: Dict[str, float] = {}
@@ -116,13 +139,23 @@ class FreeEnergyMinimizer:
                 default=0.0,
             )
 
-            # Epistemic: information gain from this action class
+            # Exteroceptive pragmatic boost for move_forward when food is directly ahead.
+            # Encodes E[drive_relief | food_visible, move_forward] without requiring the
+            # world model to have learned this yet. Proximity 0=max range, 1=contact;
+            # scaled by max_urgency so it only dominates when drives actually need relief.
+            if pid == "move_forward" and context:
+                raycast = (context.get("raycast_hits") or [{}])[0]
+                if raycast.get("hit_tag") in ("GoodGoal", "GoodGoalMulti"):
+                    proximity = 1.0 - float(raycast.get("distance", 1.0))
+                    pragmatic = max(pragmatic, proximity * max_urgency)
+
+            # Epistemic: information gain from this action class.
+            # The foraging baseline ensures active actions always beat idle at
+            # allostatic equilibrium — epistemic foraging, not just drive relief.
             if pid in _EPISTEMIC_ACTIONS:
-                # Turn actions scan unseen directions — pure novelty-driven IG
-                epistemic = area_novelty
+                epistemic = area_novelty + _EPISTEMIC_FORAGING_BASELINE
             else:
-                # Movement: resolves spatial prediction errors
-                epistemic = pe_mean
+                epistemic = pe_mean + _EPISTEMIC_FORAGING_BASELINE
 
             motor_cost = _MOTOR_COST.get(pid, 0.2)
 
@@ -132,11 +165,11 @@ class FreeEnergyMinimizer:
                 - motor_cost * self._w_motor_cost
             )
 
-            # Motor failure penalty: if the last attempt at this specific action
-            # failed (wall-blocked), scale its score toward 0 so the agent doesn't
-            # immediately retry. motor_eff=0.0 → score=0.0; motor_eff=1.0 → no change.
-            if pid == last_action and motor_eff < 0.3:
-                combined = combined * motor_eff
+            # Motor failure penalty: soften EFE of the last action if it was blocked
+            # for at least 2 consecutive steps (streak guard stops spurious first-obs firing).
+            # motor_eff=0.0 → combined*0.30; motor_eff=0.29 → combined*0.50.
+            if pid == last_action and motor_eff < 0.3 and self._motor_fail_streak >= 2:
+                combined = combined * (0.3 + 0.7 * motor_eff)
 
             scores[pid] = float(max(0.0, min(1.0, combined)))
 

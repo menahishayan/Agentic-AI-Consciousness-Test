@@ -310,21 +310,47 @@ class AgentLoop:
         relief = prev_urgency - next_urgency
         relief_score = max(0.0, min(1.0, 0.5 + relief * 5.0))
         motor_eff = float(next_state.raw_metadata.get("motor_efficiency", 1.0))
-        outcome_score = float(max(0.0, min(1.0, relief_score * 0.7 + motor_eff * 0.3)))
 
-        # Situation note for episodic memory — captured at the moment of action
-        # so the LLM can read "wall ahead → turn_right → outcome: 0.71" in future steps.
+        # Exteroceptive component: did food distance change as the world model expected?
+        # Only computed when move_forward was executed with food visible.
+        # Differentiates "moving toward food" from "blocked facing food" — two outcomes
+        # that produce identical drive relief but opposite exteroceptive consequences.
+        extero_match = 1.0
+        if selected_id == "move_forward":
+            prev_rc = prev_state.perception.raycast_hits
+            next_rc = next_state.perception.raycast_hits
+            if prev_rc and next_rc:
+                p_r, n_r = prev_rc[0], next_rc[0]
+                if p_r.get("hit_tag") in ("GoodGoal", "GoodGoalMulti"):
+                    prev_dist = float(p_r.get("distance", 1.0))
+                    next_dist = float(n_r.get("distance", prev_dist))
+                    actual_delta = next_dist - prev_dist   # negative = approached
+                    heading_deg = float(prev_state.position.heading or 0.0)
+                    expected_delta = self._world_model.get_expected_delta(
+                        "move_forward", "food_distance", heading_deg
+                    )
+                    extero_match = max(0.0, min(1.0, 1.0 - abs(expected_delta - actual_delta)))
+
+        outcome_score = float(max(0.0, min(1.0, relief_score * 0.5 + motor_eff * 0.3 + extero_match * 0.2)))
+
+        # Situation note for episodic memory — encodes perceptual context + causal
+        # consequence so the LLM can read "GoodGoal at 1.32, health_delta=+0.300" and
+        # distinguish "approached food" from "blocked facing food" in retrieved traces.
         _rc = prev_state.perception.raycast_hits
         if _rc:
             _r = _rc[0]
             _tag = _r.get("hit_tag")
             _dist = _r.get("distance", 1.0)
-            _situation = f"{_tag} at {_dist:.2f} ahead" if _tag else "open ahead"
+            _situation = f"{_tag} at {_dist:.2f}" if _tag else "open"
         else:
             _situation = "no raycast"
         _motor = float(prev_state.raw_metadata.get("motor_efficiency", 1.0))
         if _motor < 0.3:
             _situation += ", blocked"
+        _health_before = float(prev_state.homeostasis.health or 0.0)
+        _health_after = float(next_state.homeostasis.health or 0.0)
+        _health_delta = _health_after - _health_before
+        _situation += f", health_delta={_health_delta:+.3f}"
         situation_note = _situation
 
         self._memory.record_policy_trace(
