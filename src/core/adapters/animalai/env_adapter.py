@@ -213,7 +213,8 @@ class AnimalAIAdapter(AbstractEnvironmentAdapter):
             wx_dbg = info.get("x", 0.0)
             wy_dbg = info.get("y", 0.0)
             wz_dbg = info.get("z", 0.0)
-            rc_dbg = info.get("raycast_hits") or {}
+            _rc_list = info.get("raycast_hits") or []
+            rc_dbg = _rc_list[0] if _rc_list else {}
             rr_dbg = info.get("raw_reward", 0.0)
             _arena = float(self._config.get("simulation", {}).get("arena_size", 30.0))
             _dbg(f"[DBG STEP {self._step_count}] parsers →")
@@ -223,9 +224,13 @@ class AnimalAIAdapter(AbstractEnvironmentAdapter):
                   f"({'non-zero' if raw_fwd != 0 else 'ALWAYS 0 = motor broken'})")
             _dbg(f"  world_pos: x={wx_dbg:.3f} y={wy_dbg:.3f} z={wz_dbg:.3f}  "
                   f"({'in_arena' if 0 < wx_dbg < _arena and 0 < wz_dbg < _arena else 'OUT OF ARENA — garbage?'})")
-            _dbg(f"  raycast:  hit_tag={rc_dbg.get('hit_tag')!r} "
+            _dbg(f"  rays({len(_rc_list)}):  fwd hit_tag={rc_dbg.get('hit_tag')!r} "
                   f"distance={rc_dbg.get('distance', 1.0):.4f}  "
                   f"({'no-hit sentinel' if rc_dbg.get('hit_tag') is None and rc_dbg.get('distance', 1.0) == 1.0 else 'hit detected'})")
+            for _ri, _r in enumerate(_rc_list[1:], 1):
+                if _r.get("hit_tag") is not None or _r.get("distance", 1.0) < 1.0:
+                    _dbg(f"    ray[{_ri}] angle={_r.get('angle_deg', 0.0):+.1f}°  "
+                          f"hit_tag={_r.get('hit_tag')!r}  distance={_r.get('distance', 1.0):.4f}")
             if raw_fwd == 0.0 and action_id in ("move_forward", "move_backward"):
                 _dbg(f"  *** WARN: movement action sent but speed=0 — "
                       f"proprioceptive obs missing or wrong index")

@@ -249,12 +249,17 @@ class ArousalValenceSystem:
         health_rpe = (delta_health - expected_health_delta) * self._rpe_scale
         sat_rpe = (delta_sat - expected_sat_delta) * self._rpe_scale
 
-        # Anticipatory valence: food visible ahead → moderate positive.
+        # Anticipatory valence: food visible in any ray → moderate positive.
+        # Using any-ray rather than forward-only so food 45° to the side
+        # still generates incentive salience before the agent has turned toward it.
         food_proximity = 0.0
         if raycast_hits:
-            r = raycast_hits[0]
-            if r.get("hit_tag") in ("GoodGoal", "GoodGoalMulti"):
-                food_proximity = 1.0 - float(r.get("distance", 1.0))
+            food_ray = next(
+                (r for r in raycast_hits if r.get("hit_tag") in ("GoodGoal", "GoodGoalMulti")),
+                None,
+            )
+            if food_ray:
+                food_proximity = 1.0 - float(food_ray.get("distance", 1.0))
         anticipation = food_proximity * self._anticipation_weight
 
         # Threat hit: direct negative penalty (fires only above threshold).

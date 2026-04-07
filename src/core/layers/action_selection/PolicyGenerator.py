@@ -341,20 +341,35 @@ class PolicyGenerator:
         arousal = av.arousal if av else 0.0
         valence = av.valence if av else 0.0
 
-        # Single-line raycast — critical for not walking into walls
-        raycast_hits = context.get("raycast_hits")
-        if raycast_hits:
-            r = raycast_hits[0]
-            tag = r.get("hit_tag")
-            dist = r.get("distance", 1.0)
-            if tag in ("GoodGoal", "GoodGoalMulti"):
-                raycast_line = f"food at {dist:.2f}"
-            elif tag in ("BadGoal", "BadGoalMulti"):
-                raycast_line = f"hazard at {dist:.2f}"
-            elif tag == "wall":
-                raycast_line = f"wall at {dist:.2f}"
-            else:
-                raycast_line = "clear"
+        # Directional raycast summary — scans all rays for food/hazard/wall.
+        # Food in a side ray now produces "food right (+47°) at 0.45" rather than
+        # "clear" from forward-only, giving the model something to act on.
+        raycast_hits = context.get("raycast_hits") or []
+        food_rays = [
+            (r["angle_deg"], r["distance"])
+            for r in raycast_hits
+            if r.get("hit_tag") in ("GoodGoal", "GoodGoalMulti")
+        ]
+        wall_rays = [
+            r["distance"]
+            for r in raycast_hits
+            if r.get("hit_tag") == "wall" and r.get("distance", 1.0) < 0.2
+        ]
+        hazard_rays = [
+            r["distance"]
+            for r in raycast_hits
+            if r.get("hit_tag") in ("BadGoal", "BadGoalMulti")
+        ]
+        if food_rays:
+            angle, dist = min(food_rays, key=lambda x: x[1])
+            direction = "forward" if abs(angle) < 15 else ("left" if angle < 0 else "right")
+            raycast_line = f"food {direction} ({angle:+.0f}°) at {dist:.2f}"
+        elif hazard_rays:
+            raycast_line = f"hazard at {min(hazard_rays):.2f}"
+        elif wall_rays:
+            raycast_line = f"wall at {min(wall_rays):.2f}"
+        elif raycast_hits:
+            raycast_line = "clear"
         else:
             raycast_line = "no data"
 
@@ -457,22 +472,26 @@ class PolicyGenerator:
         pe_mean = pe_batch.mean_magnitude if pe_batch else 0.0
         pe_streak = self._pe_streak
 
-        # --- Step 2b: raycast directional perception ---
-        raycast_hits = context.get("raycast_hits")
+        # --- Step 2b: raycast directional perception (all 7 rays) ---
+        # Each ray: {hit_tag, distance, angle_deg}. Positive angle = right of forward.
+        raycast_hits = context.get("raycast_hits") or []
         if raycast_hits:
-            r = raycast_hits[0]
-            tag = r.get("hit_tag")
-            dist = r.get("distance", 1.0)
-            if tag in ("GoodGoal", "GoodGoalMulti"):
-                raycast_text = f"  forward       food at {dist:.2f}"
-            elif tag in ("BadGoal", "BadGoalMulti"):
-                raycast_text = f"  forward       hazard at {dist:.2f}"
-            elif tag == "wall":
-                raycast_text = f"  forward       wall at {dist:.2f}"
-            elif tag == "ramp":
-                raycast_text = f"  forward       ramp at {dist:.2f}"
-            else:
-                raycast_text = "  forward       clear"
+            ray_lines = []
+            for r in raycast_hits:
+                tag = r.get("hit_tag")
+                dist = r.get("distance", 1.0)
+                angle = float(r.get("angle_deg", 0.0))
+                direction = "forward" if abs(angle) < 5 else (f"right ({angle:+.0f}°)" if angle > 0 else f"left ({angle:+.0f}°)")
+                if tag in ("GoodGoal", "GoodGoalMulti"):
+                    ray_lines.append(f"  {direction:<18} food at {dist:.2f}")
+                elif tag in ("BadGoal", "BadGoalMulti"):
+                    ray_lines.append(f"  {direction:<18} hazard at {dist:.2f}")
+                elif tag == "wall":
+                    ray_lines.append(f"  {direction:<18} wall at {dist:.2f}")
+                elif tag == "ramp":
+                    ray_lines.append(f"  {direction:<18} ramp at {dist:.2f}")
+                # skip "clear" rays to keep the prompt short
+            raycast_text = "\n".join(ray_lines) if ray_lines else "  all rays clear"
         else:
             raycast_text = "  (no raycast data this step)"
 

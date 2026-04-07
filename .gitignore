@@ -13,3 +13,4 @@ data/long_term_memory/
 *.faiss
 animal-ai-unity
 .DS_Store
+debug.log

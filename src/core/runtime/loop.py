@@ -375,10 +375,15 @@ class AgentLoop:
             prev_rc = prev_state.perception.raycast_hits
             next_rc = next_state.perception.raycast_hits
             if prev_rc and next_rc:
-                p_r, n_r = prev_rc[0], next_rc[0]
-                if p_r.get("hit_tag") in ("GoodGoal", "GoodGoalMulti"):
-                    prev_dist = float(p_r.get("distance", 1.0))
-                    next_dist = float(n_r.get("distance", prev_dist))
+                p_food = next(
+                    (r for r in prev_rc if r.get("hit_tag") in ("GoodGoal", "GoodGoalMulti")), None
+                )
+                n_food = next(
+                    (r for r in next_rc if r.get("hit_tag") in ("GoodGoal", "GoodGoalMulti")), None
+                )
+                if p_food:
+                    prev_dist = float(p_food.get("distance", 1.0))
+                    next_dist = float(n_food.get("distance", prev_dist)) if n_food else prev_dist
                     actual_delta = next_dist - prev_dist   # negative = approached
                     heading_deg = float(prev_state.position.heading or 0.0)
                     expected_delta = self._world_model.get_expected_delta(
@@ -393,9 +398,12 @@ class AgentLoop:
         # distinguish "approached food" from "blocked facing food" in retrieved traces.
         _rc = prev_state.perception.raycast_hits
         if _rc:
-            _r = _rc[0]
-            _tag = _r.get("hit_tag")
-            _dist = _r.get("distance", 1.0)
+            # Use the closest food ray for the situation note; fall back to forward ray.
+            _food_r = next(
+                (r for r in _rc if r.get("hit_tag") in ("GoodGoal", "GoodGoalMulti")), _rc[0]
+            )
+            _tag = _food_r.get("hit_tag")
+            _dist = _food_r.get("distance", 1.0)
             _situation = f"{_tag} at {_dist:.2f}" if _tag else "open"
         else:
             _situation = "no raycast"
@@ -424,7 +432,7 @@ class AgentLoop:
         # --- Structured metrics logging ---
         step_ms = (time.monotonic() - t_step_start) * 1000.0
         _rc = next_state.perception.raycast_hits
-        _food_vis = bool(_rc and _rc[0].get("hit_tag") in ("GoodGoal", "GoodGoalMulti"))
+        _food_vis = bool(_rc and any(r.get("hit_tag") in ("GoodGoal", "GoodGoalMulti") for r in _rc))
         affect_state = _affect_label(
             av.arousal, av.valence, drive_batch.dominant_channel, _food_vis
         )

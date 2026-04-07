@@ -139,6 +139,15 @@ class FreeEnergyMinimizer:
                 for tag in signal.suggested_action_tags:
                     urgency_by_tag[tag] = max(urgency_by_tag.get(tag, 0.0), signal.urgency)
 
+        # Find the closest food ray across the full fan — used for directional bonuses.
+        # Scanning all rays means food 45° to the side activates the correct turn bonus
+        # rather than being invisible (forward-only check misses it entirely).
+        all_rays = context.get("raycast_hits") or [] if context else []
+        food_ray = next(
+            (r for r in all_rays if r.get("hit_tag") in ("GoodGoal", "GoodGoalMulti")),
+            None,
+        )
+
         for policy in policies:
             pid = policy["policy_id"]
 
@@ -161,15 +170,11 @@ class FreeEnergyMinimizer:
                 default=0.0,
             )
 
-            # Exteroceptive pragmatic boost for move_forward when food is directly ahead.
-            # Encodes E[drive_relief | food_visible, move_forward] without requiring the
-            # world model to have learned this yet. Proximity 0=max range, 1=contact;
-            # scaled by max_urgency so it only dominates when drives actually need relief.
-            if pid == "move_forward" and context:
-                raycast = (context.get("raycast_hits") or [{}])[0]
-                if raycast.get("hit_tag") in ("GoodGoal", "GoodGoalMulti"):
-                    proximity = 1.0 - float(raycast.get("distance", 1.0))
-                    pragmatic = max(pragmatic, proximity * max_urgency)
+            # Urgency-scaled pragmatic boost when food is visible in the forward ray.
+            # Scaled by max_urgency so it only dominates when drives need relief.
+            if pid == "move_forward" and food_ray and abs(float(food_ray.get("angle_deg", 0.0))) < 15:
+                proximity = 1.0 - float(food_ray.get("distance", 1.0))
+                pragmatic = max(pragmatic, proximity * max_urgency)
 
             # Epistemic: information gain from this action class.
             # The foraging baseline ensures active actions always beat idle at
@@ -187,16 +192,21 @@ class FreeEnergyMinimizer:
                 - motor_cost * self._w_motor_cost
             )
 
-            # Absolute food-proximity bonus for move_forward when food is directly ahead.
-            # The urgency-scaled pragmatic boost above is already present; this term
-            # adds intrinsic EFE value for approaching visible food independent of
-            # current urgency — critical when drives are only moderately depleted but
-            # food is in view (without this, idle outscores move_forward until ~urgency=0.4).
-            if pid == "move_forward" and context:
-                _rc = (context.get("raycast_hits") or [{}])[0]
-                if _rc.get("hit_tag") in ("GoodGoal", "GoodGoalMulti"):
-                    _prox = 1.0 - float(_rc.get("distance", 1.0))
-                    combined += _prox * self._food_proximity_bonus
+            # Directional food-proximity bonus: fire based on where food actually is.
+            #   Food forward (|angle| < 15°) → full bonus on move_forward
+            #   Food right   (angle > 10°)   → 70% bonus on turn_right
+            #   Food left    (angle < -10°)  → 70% bonus on turn_left
+            # This closes the foraging loop: side-ray detection → correct turn EFE boost
+            # → agent faces food → food enters forward ray → move_forward gets full bonus.
+            if food_ray:
+                food_prox = 1.0 - float(food_ray.get("distance", 1.0))
+                food_angle = float(food_ray.get("angle_deg", 0.0))
+                if pid == "move_forward" and abs(food_angle) < 15:
+                    combined += food_prox * self._food_proximity_bonus
+                elif pid == "turn_right" and food_angle > 10:
+                    combined += food_prox * self._food_proximity_bonus * 0.7
+                elif pid == "turn_left" and food_angle < -10:
+                    combined += food_prox * self._food_proximity_bonus * 0.7
 
             # Motor failure penalty: soften EFE of the last action if it was blocked
             # for at least 2 consecutive steps (streak guard stops spurious first-obs firing).

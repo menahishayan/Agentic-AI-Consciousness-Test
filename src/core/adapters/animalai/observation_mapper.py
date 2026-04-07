@@ -122,6 +122,11 @@ _RAY_SENSOR_N_RAYS = 7                  # 2 * raysPerSide(3) + 1 centre
 _RAY_SENSOR_LEN_LEGACY = _RAY_SENSOR_N_RAYS * (_RAY_SENSOR_TAGS_PER_RAY_LEGACY + 1)  # 98
 _RAY_SENSOR_LEN_NEW    = _RAY_SENSOR_N_RAYS * (_RAY_SENSOR_TAGS_PER_RAY_NEW    + 1)  # 112
 
+# Ray angles for AlternatingRayOrder=1, raysPerSide=3, maxDegrees=70.
+# Order: center, +23.3°, -23.3°, +46.6°, -46.6°, +70°, -70°.
+# Positive = right of forward, negative = left of forward.
+_RAY_ANGLES_DEG: List[float] = [0.0, 23.3, -23.3, 46.6, -46.6, 70.0, -70.0]
+
 # Compact single-ray format from current binary: 1 ray × (6 one-hot tags + 1 hit_fraction).
 # Tag order matches the first 6 entries of _RAY_SENSOR_TAG_REMAP:
 #   0=arena, 1=Immovable(wall), 2=Movable, 3=GoodGoal, 4=GoodGoalMulti, 5=BadGoal
@@ -159,14 +164,37 @@ def map_obs(
     terrain_novelty = _estimate_terrain_novelty(visual_features)
     entity_density = _estimate_entity_density(visual_features)
 
-    # Raycast — forward-ray dict parsed from RayPerceptionSensorComponent3D obs
-    raycast: Dict[str, Any] = info.get("raycast_hits") or {"hit_tag": None, "distance": 1.0}
-    hit_tag = raycast.get("hit_tag")
-    detected_objects: List[str] = [hit_tag] if hit_tag else []
+    # Raycasts — list of all rays parsed from RayPerceptionSensorComponent3D obs.
+    # _parse_raycasts always returns a list; may be a 1-entry list for compact formats.
+    rays: List[Dict[str, Any]] = info.get("raycast_hits") or []
+
+    # Collect all detected tags across all rays for detected_objects
+    detected_objects: List[str] = list({
+        r["hit_tag"] for r in rays if r.get("hit_tag")
+    })
+
+    # Use forward ray (index 0) as the primary signal for resource/threat estimates,
+    # falling back to the closest food/threat ray across the full fan.
+    forward_ray = rays[0] if rays else {"hit_tag": None, "distance": 1.0}
+    food_ray = next(
+        (r for r in rays if r.get("hit_tag") in ("GoodGoal", "GoodGoalMulti")),
+        forward_ray,
+    )
+    threat_ray = next(
+        (r for r in rays if r.get("hit_tag") in ("BadGoal", "BadGoalMulti")),
+        forward_ray,
+    )
 
     # Resource/threat estimates: raycasts take priority over visual heuristics
-    resource_level = _estimate_resource(visual_features, raycast)
-    threat_proximity = _estimate_threat(visual_features, raycast)
+    resource_level = _estimate_resource(visual_features, food_ray)
+    threat_proximity = _estimate_threat(visual_features, threat_ray)
+
+    # Store all rays in perception; None only if sentinel (no real obs arrived)
+    any_real_hit = any(
+        r.get("hit_tag") is not None or r.get("distance", 1.0) < 1.0
+        for r in rays
+    )
+    raycast_hits_out = rays if any_real_hit else None
 
     hs = homeostatic.get_state()
 
@@ -184,7 +212,7 @@ def map_obs(
             area_id=area_id,
             terrain_novelty=terrain_novelty,
             entity_density=entity_density,
-            raycast_hits=[raycast] if hit_tag or raycast["distance"] < 1.0 else None,
+            raycast_hits=raycast_hits_out,
         ),
         resources=ResourceState(
             resource_level=resource_level,
@@ -346,62 +374,72 @@ def _extract_unity_health(obs_list: List[Any]) -> Optional[float]:
     return None
 
 
-def _parse_raycasts(obs_list: List[Any]) -> Dict[str, Any]:
+def _parse_raycasts(obs_list: List[Any]) -> List[Dict[str, Any]]:
     """
-    Extract forward ray data from obs_list, handling three binary states:
+    Extract all ray hits from obs_list. Returns a list of dicts:
+      [{"hit_tag": str|None, "distance": float, "angle_deg": float}, ...]
 
-    Post-rebuild (preferred): 10-float vector obs [indices 8–9]
-        TrainingAgent.CollectObservations encodes the forward ray directly:
-          [8] hit_fraction, [9] tag_index via _TagToIndex()
-        Matched when len == _AGENT_OBS_LEN (10).
+    Ray ordering follows AlternatingRayOrder=1 (center-first):
+      index 0 = 0° (forward), 1 = +23.3°, 2 = -23.3°, 3 = +46.6°,
+      4 = -46.6°, 5 = +70°, 6 = -70°
+    Positive angle = right of forward, negative = left of forward.
 
-    Pre-rebuild legacy: separate RayPerceptionSensor array (98 or 112 floats)
-        ML-Agents 1.1.0 format: [one_hot(N), hit_fraction] per ray, N+1 floats/ray.
-        Pre-rebuild binary: N=13, total=98. Post-rebuild (before next rebuild): N=15, total=112.
-        Forward ray = index 0 (AlternatingRayOrder=1, center-first).
+    Handles three obs formats:
+      Post-rebuild 10-float vector obs: encodes only the forward ray → 1 entry.
+      Compact 7-float single-ray obs:   forward ray only → 1 entry.
+      Full 7-ray array (98 or 112 floats): all 7 rays → 7 entries.
 
-    Returns the no-hit sentinel {"hit_tag": None, "distance": 1.0} when no matching
-    array is found.
+    Returns the no-hit sentinel list when no matching array is found.
     """
+    _sentinel = [{"hit_tag": None, "distance": 1.0, "angle_deg": a}
+                 for a in _RAY_ANGLES_DEG]
+
     for obs in obs_list:
         arr = np.asarray(obs, dtype=np.float32)
         if arr.ndim != 1:
             continue
-
         n = len(arr)
 
         # Post-rebuild: forward ray embedded in 10-float vector obs
         if n == _AGENT_OBS_LEN:
             fraction = float(arr[_AGENT_OBS_RAY_FRACTION_IDX])
             tag = _RAY_TAG_INDEX_MAP.get(round(float(arr[_AGENT_OBS_RAY_TAG_IDX])), None)
-            return {"hit_tag": tag, "distance": fraction}
+            return [{"hit_tag": tag, "distance": fraction, "angle_deg": 0.0}]
 
-        # Compact single-ray format from current binary: [one_hot(6), hit_fraction]
-        # 1 ray × 6 one-hot tags + 1 distance float = 7 elements.
+        # Compact single-ray format: [one_hot(6), hit_fraction] = 7 elements
         if n == _RAY_SENSOR_LEN_COMPACT:
             one_hot = arr[:_RAY_SENSOR_TAGS_PER_RAY_COMPACT]
             fraction = float(arr[_RAY_SENSOR_TAGS_PER_RAY_COMPACT])
             best_idx = int(np.argmax(one_hot))
-            hit_tag: Optional[str] = (
+            tag: Optional[str] = (
                 _RAY_SENSOR_TAG_REMAP.get(best_idx)
                 if float(one_hot[best_idx]) > 0.5 else None
             )
-            return {"hit_tag": hit_tag, "distance": fraction}
+            return [{"hit_tag": tag, "distance": fraction, "angle_deg": 0.0}]
 
-        # Pre-rebuild: separate RayPerceptionSensor flat array (7-ray full format)
+        # Full 7-ray array: parse every ray
         if n in (_RAY_SENSOR_LEN_LEGACY, _RAY_SENSOR_LEN_NEW):
-            n_tags = _RAY_SENSOR_TAGS_PER_RAY_LEGACY if n == _RAY_SENSOR_LEN_LEGACY else _RAY_SENSOR_TAGS_PER_RAY_NEW
-            # Forward ray is at offset 0 (AlternatingRayOrder=1, center first)
-            one_hot = arr[:n_tags]
-            fraction = float(arr[n_tags])
-            best_idx = int(np.argmax(one_hot))
-            hit_tag = (
-                _RAY_SENSOR_TAG_REMAP.get(best_idx)
-                if float(one_hot[best_idx]) > 0.5 else None
+            n_tags = (
+                _RAY_SENSOR_TAGS_PER_RAY_LEGACY
+                if n == _RAY_SENSOR_LEN_LEGACY
+                else _RAY_SENSOR_TAGS_PER_RAY_NEW
             )
-            return {"hit_tag": hit_tag, "distance": fraction}
+            floats_per_ray = n_tags + 1
+            rays = []
+            for i in range(_RAY_SENSOR_N_RAYS):
+                offset = i * floats_per_ray
+                one_hot = arr[offset:offset + n_tags]
+                fraction = float(arr[offset + n_tags])
+                best_idx = int(np.argmax(one_hot))
+                ray_tag: Optional[str] = (
+                    _RAY_SENSOR_TAG_REMAP.get(best_idx)
+                    if float(one_hot[best_idx]) > 0.5 else None
+                )
+                angle = _RAY_ANGLES_DEG[i] if i < len(_RAY_ANGLES_DEG) else 0.0
+                rays.append({"hit_tag": ray_tag, "distance": fraction, "angle_deg": angle})
+            return rays
 
-    return {"hit_tag": None, "distance": 1.0}
+    return _sentinel
 
 
 def _build_area_id(x: float, z: float) -> str:

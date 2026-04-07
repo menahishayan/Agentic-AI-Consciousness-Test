@@ -189,8 +189,12 @@ class WorldModelGenerator:
         heading_change = float((state.position.heading or 0.0) / 360.0)
         rh = state.perception.raycast_hits
         food_distance = 1.0
-        if rh and rh[0].get("hit_tag") in ("GoodGoal", "GoodGoalMulti"):
-            food_distance = float(rh[0].get("distance", 1.0))
+        if rh:
+            food_ray = next(
+                (r for r in rh if r.get("hit_tag") in ("GoodGoal", "GoodGoalMulti")), None
+            )
+            if food_ray:
+                food_distance = float(food_ray.get("distance", 1.0))
 
         return {
             "health":               h.health or 0.0,
