@@ -38,8 +38,12 @@ class DriveSignalBatch:
 
     def __post_init__(self) -> None:
         if self.signals:
+            # Dominant channel = highest urgency signal (may be negative when above setpoint)
             dominant = max(self.signals, key=lambda s: s.urgency)
-            self.max_urgency = dominant.urgency
+            # max_urgency is clamped to [0,1]: negative urgency (over-satisfied drives)
+            # is a surplus signal, not a pressure signal. Leaking negative values poisons
+            # urgency_boost in ArousalValenceSystem and idle EFE scoring in FreeEnergyMinimizer.
+            self.max_urgency = max(0.0, min(1.0, dominant.urgency))
             self.dominant_channel = dominant.channel_id
 
 

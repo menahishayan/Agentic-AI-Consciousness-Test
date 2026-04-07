@@ -1,25 +1,29 @@
 """
 PolicyGenerator — Layer 3, Action Selection & Agency
 
-Implements selective LLM calling with 5 trigger conditions:
-  1. Drive conflict — two or more channels above urgency threshold
-  2. Sustained high PE streak — model is wrong and stuck
-  3. No skill satisfies current drive — skill gap
-  4. Periodic re-evaluation — every N steps
-  5. Goal change — new goal message in workspace
+Synchronous tiered-depth model:
+  Every step — LLM is called synchronously.
+  Depth is modulated by arousal and drive state:
+    "fast"  → 2-section prompt (~100 tokens), ACTION only, < 1s on gemma3:4b
+    "full"  → full CoT prompt with episodic memory, REASON + ACTION
 
-LLM calls are async for non-urgent triggers (periodic, goal change).
-Urgent triggers (conflict, PE streak, skill gap) block synchronously.
-Urgency fallback handles all routine steps.
+Depth = "full" when any of:
+  1. arousal > arousal_diversity_threshold  (high uncertainty = deeper inference)
+  2. drive conflict  (2+ channels above conflict_threshold)
+  3. sustained PE streak  (world model is wrong and stuck)
+  4. skill gap  (high urgency, no policy covers the dominant drive)
+
+Fallback: if LLM times out (> 1.5 s) or fails, use argmax(EFE scores).
+This maps cleanly onto Seth: high arousal = high precision on surprise signal
+= deeper inference. Low arousal = confident prior = shallow reflex.
 
 No game-specific logic. No adapter imports.
 """
 from __future__ import annotations
 
 import logging
-import threading
 import time
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from core.coordination.messages import AgentMessage
 from core.coordination.workspace import GlobalWorkspace
@@ -34,16 +38,57 @@ from core.models.signals import (
 log = logging.getLogger(__name__)
 
 
+def _affect_label(
+    arousal: float,
+    valence: float,
+    dominant_channel: Optional[str],
+    food_visible: bool,
+) -> str:
+    """
+    Derive a human-readable affective state label from (arousal, valence, context).
+
+    Computed, not hardcoded — each label is a function of the current affective
+    geometry plus the dominant drive and exteroceptive context. This gives the
+    LLM a holistic frame for reasoning rather than a list of raw numbers.
+
+    Arousal ∈ [0, 1]: 0=quiescent, 1=highly activated (LC-NE pathway)
+    Valence ∈ [-1, 1]: -1=aversive, +1=appetitive
+    """
+    high_arousal = arousal > 0.6
+    low_arousal  = arousal < 0.3
+    neg_valence  = valence < -0.1
+    pos_valence  = valence > 0.1
+    deprivation  = dominant_channel in ("health", "saturation", "energy")
+    threat       = dominant_channel == "safety"
+
+    if high_arousal and neg_valence:
+        if threat:
+            return "fear"
+        if deprivation:
+            return "distress"
+        return "frustration"
+    if high_arousal and pos_valence:
+        if food_visible:
+            return "appetitive anticipation"
+        return "excitement"
+    if low_arousal and pos_valence and not deprivation:
+        return "calm curiosity"
+    if low_arousal and neg_valence:
+        return "lethargy"
+    if high_arousal:
+        return "agitation"
+    return "alert"
+
+
 class PolicyGenerator:
     """
-    Arbitrates between competing action proposals using a hierarchy:
-      1. Urgency fallback (fast, no LLM, handles ~80% of steps)
-      2. Async LLM (non-urgent but novel situations, fires in background)
-      3. Sync LLM (urgent conflicts, blocks until resolved)
+    Selects actions via synchronous LLM call every step.
 
-    This maps onto Seth's System 1 / System 2 distinction:
-      - Urgency fallback = beast machine reactive reflex
-      - LLM arbitration = metacognitive global workspace deliberation
+    Depth is modulated by arousal and drive state (precision-weighted inference):
+      - Low arousal → fast 2-section prompt, ACTION only
+      - High arousal / conflict / PE streak → full CoT with episodic memory
+
+    Fallback on LLM timeout or failure: argmax over EFE scores.
     """
 
     def __init__(
@@ -58,47 +103,22 @@ class PolicyGenerator:
         self._pe_streak_threshold: int = int(cfg.get("pe_streak_threshold", 5))
         self._pe_high_threshold: float = float(cfg.get("pe_high_threshold", 0.7))
         self._skill_gap_urgency: float = float(cfg.get("skill_gap_urgency_threshold", 0.8))
-        self._reeval_interval: int = int(cfg.get("llm_reeval_interval", 10))
-        self._weights: Dict[str, float] = cfg.get("weights", {
-            "goal_coherence": 0.6,
-            "prediction_error": 0.4,
-            "allostatic_survival_fit": 0.2,
-            "allostatic_urgency_alignment": 0.2,
-        })
-        self._fallback_scores: Dict[str, float] = cfg.get("fallback_scores", {
-            "goal_coherence": 0.5,
-            "prediction_error": 0.5,
-            "allostatic_survival_fit": 0.5,
-            "allostatic_urgency_alignment": 0.5,
-        })
-
-        # State tracking
-        self._pe_streak: int = 0
-        self._last_goals_fingerprint: str = ""
-        self._last_llm_step: int = -999
-
-        # Async LLM result slot
-        self._pending_llm_result: Optional[str] = None
-        self._llm_thread: Optional[threading.Thread] = None
-
-        # Long-term memory callback (injected by AgentLoop)
-        self._get_policy_history: Optional[Callable[[str], float]] = None
-
-        # Episodic memory callback (injected by AgentLoop)
-        # Signature: (state: AgentState, k: int) -> List[PolicyTraceRecord]
-        self._query_episodic_memory: Optional[Callable] = None
-
-        # LLM logging callback (injected by AgentLoop)
-        # Signature: (prompt: str, response: Any, trigger_reason: str, step: int) -> None
-        self._llm_log_cb: Optional[Callable] = None
-
-        # Arousal-driven diversity threshold:
-        # When arousal exceeds this value the fallback excludes the last-taken
-        # action from candidates, reducing precision on the failing policy
-        # rather than committing to a hard-coded escape sequence.
+        # Arousal threshold: above this → full CoT depth (high uncertainty = deep inference).
+        # Seth (2021): arousal modulates the precision of interoceptive predictions —
+        # high arousal means the confident-prior shortcut is no longer trustworthy.
         self._arousal_diversity_threshold: float = float(
             cfg.get("arousal_diversity_threshold", 0.6)
         )
+        # Hard latency budget per step: if LLM exceeds this, fall back to EFE argmax.
+        self._llm_timeout_s: float = float(cfg.get("llm_timeout_s", 1.5))
+
+        # PE streak counter — depth modulator, not a call/no-call switch
+        self._pe_streak: int = 0
+
+        # Callbacks injected by AgentLoop
+        self._get_policy_history: Optional[Callable[[str], float]] = None
+        self._query_episodic_memory: Optional[Callable] = None
+        self._llm_log_cb: Optional[Callable] = None
 
     def set_policy_history_callback(self, fn: Callable[[str], float]) -> None:
         """Injected by AgentLoop — provides LTM success rates per policy."""
@@ -123,6 +143,9 @@ class PolicyGenerator:
         """
         Select the best policy_id given current context.
 
+        Every step: call LLM synchronously at fast or full depth.
+        Fallback: argmax(EFE scores) if LLM times out or fails.
+
         Args:
             policies: Available policy descriptors from adapter
             goals: Active Goal objects from workspace
@@ -139,112 +162,91 @@ class PolicyGenerator:
         if len(policies) == 1:
             return policies[0]["policy_id"]
 
-        # Update PE streak tracker
         self._update_pe_streak(context)
 
-        # Determine whether to invoke LLM
-        trigger, reason = self._should_call_llm(goals, context, step)
+        fe_scores: Dict[str, float] = context.get("free_energy_scores", {})
+        depth, reason = self._depth(context)
 
-        selected_id: Optional[str] = None
-        rationale = "reactive_gate"
+        selected = self._call_llm_sync(policies, goals, context, step, depth=depth, trigger_reason=reason)
 
-        if trigger == "urgent":
-            # Block synchronously — conflict or critical PE streak
-            selected_id = self._call_llm_sync(policies, goals, context, step, reason)
-            rationale = f"llm_sync:{reason}"
-            self._pe_streak = 0
-            self._last_goals_fingerprint = self._fingerprint(goals)
-            self._last_llm_step = step
-
-        elif trigger == "async":
-            # Fire LLM in background; use last result or fallback this step
-            self._fire_async_llm(policies, goals, context, step, reason)
-            selected_id = self._pending_llm_result
-            # Reject a stale "idle" when the agent is blocked or arousal is high
-            arousal = context.get("arousal", 0.0)
-            motor_blocked = context.get("motor_stuck", False) or arousal > self._arousal_diversity_threshold
-            if motor_blocked and selected_id == "idle":
-                selected_id = None
-            if selected_id is None or selected_id not in {p["policy_id"] for p in policies}:
-                selected_id = self._urgency_fallback(policies, context)
-                rationale = f"async_pending:{reason}"
+        # Timeout / error fallback: pure EFE argmax, not tag matching.
+        # The generative model's own score is the best available signal when
+        # the deliberative system is unavailable.
+        if selected is None:
+            if fe_scores:
+                selected = max(fe_scores, key=lambda k: fe_scores[k])
+                reason = f"{reason}:efe_argmax"
             else:
-                rationale = f"async_result:{reason}"
+                selected = "idle"
+                reason = f"{reason}:idle_default"
 
-        else:
-            # Pure reactive
-            selected_id = self._urgency_fallback(policies, context)
-
-        # Ensure we have a valid selection
         policy_ids = {p["policy_id"] for p in policies}
-        if selected_id not in policy_ids:
-            selected_id = self._urgency_fallback(policies, context)
-            rationale = "fallback_invalid"
+        if selected not in policy_ids:
+            selected = max(fe_scores, key=lambda k: fe_scores[k]) if fe_scores else "idle"
 
         workspace.publish(AgentMessage(
             sender="PolicyGenerator",
             kind="policy_proposal",
             payload={
-                "selected": selected_id,
-                "rationale": rationale,
-                "trigger": trigger or "reactive",
+                "selected": selected,
+                "depth": depth,
+                "trigger": reason,
                 "step": step,
             },
             step=step,
         ))
 
-        return selected_id
+        return selected
 
     # ------------------------------------------------------------------
-    # LLM trigger gate
+    # Depth modulation
     # ------------------------------------------------------------------
 
-    def _should_call_llm(
-        self,
-        goals: List[Goal],
-        context: Dict[str, Any],
-        step: int,
-    ):
+    def _depth(self, context: Dict[str, Any]) -> Tuple[str, str]:
         """
-        Evaluate 5 trigger conditions. Returns (trigger_type, reason).
-        trigger_type: "urgent" | "async" | None
+        Determine inference depth for this step.
+
+        Returns (depth, reason) where depth is "fast" or "full".
+
+        Conditions that promote to full CoT:
+          1. High arousal  — precision on surprise exceeds prior confidence
+          2. Drive conflict — competing drives need active arbitration
+          3. PE streak     — world model is systematically wrong
+          4. Skill gap     — high urgency drive has no matching policy
         """
         if self._llm is None:
-            return None, "no_llm"
+            return "fast", "no_llm"
+
+        arousal = float(context.get("arousal", 0.0))
+
+        # 1. High arousal: uncertain = deeper inference (Seth 2021)
+        if arousal > self._arousal_diversity_threshold:
+            return "full", "high_arousal"
 
         drive_batch: Optional[DriveSignalBatch] = context.get("drive_batch")
-        pe_batch: Optional[PredictionErrorBatch] = context.get("pe_batch")
 
-        # 1. Drive conflict — two+ channels above threshold (URGENT)
+        # 2. Drive conflict: two+ channels simultaneously urgent
         if drive_batch:
             high = [s for s in drive_batch.signals if s.urgency > self._conflict_threshold]
             if len(high) >= 2:
-                return "urgent", "drive_conflict"
+                return "full", "drive_conflict"
 
-        # 2. Sustained high PE streak (URGENT)
+        # 3. Sustained PE streak: world model is wrong and stuck
         if self._pe_streak >= self._pe_streak_threshold:
-            return "urgent", "pe_streak"
+            return "full", "pe_streak"
 
-        # 3. Skill gap — high urgency but no matching policy tags (URGENT)
+        # 4. Skill gap: high urgency but no policy covers the dominant drive
         if drive_batch and drive_batch.max_urgency > self._skill_gap_urgency:
             dominant = drive_batch.dominant_channel
             if dominant:
                 policies = context.get("policies", [])
-                matching = [
-                    p for p in policies
-                    if dominant in p.get("drive_tags", [])
-                ]
-                if not matching:
-                    return "urgent", "skill_gap"
+                if not any(dominant in p.get("drive_tags", []) for p in policies):
+                    return "full", "skill_gap"
 
-        # 4. Periodic re-evaluation (ASYNC)
-        if step - self._last_llm_step >= self._reeval_interval:
-            return "async", "periodic"
-
-        return None, "reactive"
+        return "fast", "normal"
 
     # ------------------------------------------------------------------
-    # LLM calls
+    # LLM call
     # ------------------------------------------------------------------
 
     def _call_llm_sync(
@@ -253,72 +255,133 @@ class PolicyGenerator:
         goals: List[Goal],
         context: Dict,
         step: int,
-        trigger_reason: str = "urgent",
+        depth: str = "fast",
+        trigger_reason: str = "normal",
     ) -> Optional[str]:
-        """Blocking LLM call for urgent decisions."""
+        """
+        Synchronous LLM call with hard latency budget.
+
+        Returns selected policy_id, or None if timeout / failure / no client.
+        """
+        if self._llm is None:
+            return None
+
         try:
             from core.llm.types import LLMMessage, LLMRequest
-            prompt = self._build_prompt(policies, goals, context, step)
+
+            if depth == "full":
+                prompt = self._build_prompt(policies, goals, context, step)
+                max_tokens = 200
+            else:
+                prompt = self._build_fast_prompt(policies, context, step)
+                max_tokens = 20  # only "ACTION: <id>" needed
+
             request = LLMRequest(
                 messages=[LLMMessage(role="user", content=prompt)],
-                max_tokens=200,
+                max_tokens=max_tokens,
                 temperature=0.0,
             )
+
             t0 = time.monotonic()
             response = self._llm.complete(request)
-            latency_ms = (time.monotonic() - t0) * 1000.0
+            latency_s = time.monotonic() - t0
+
+            # Hard latency gate: if we blew the step budget, discard and fall
+            # back to EFE argmax rather than returning a stale decision.
+            if latency_s > self._llm_timeout_s:
+                log.debug(
+                    "LLM latency %.0fms > budget %.0fms — EFE fallback",
+                    latency_s * 1000, self._llm_timeout_s * 1000,
+                )
+                return None
+
             selected = self._parse_llm_response(response.content, policies)
-            self._pending_llm_result = selected
+
             if self._llm_log_cb is not None:
                 try:
                     self._llm_log_cb(prompt, response, trigger_reason, step, selected)
                 except Exception as log_exc:
                     log.debug("LLM log callback failed: %s", log_exc)
-            return selected
-        except Exception as exc:
-            log.warning("LLM sync call failed: %s", exc)
-            return self._urgency_fallback(policies, context)
 
-    def _fire_async_llm(
+            return selected
+
+        except Exception as exc:
+            log.warning("LLM call failed: %s", exc)
+            return None
+
+    # ------------------------------------------------------------------
+    # Prompt builders
+    # ------------------------------------------------------------------
+
+    def _build_fast_prompt(
         self,
         policies: List[Dict],
-        goals: List[Goal],
         context: Dict,
         step: int,
-        trigger_reason: str = "async",
-    ) -> None:
-        """Non-blocking LLM call — result available next step."""
-        if self._llm_thread is not None and self._llm_thread.is_alive():
-            return  # Already running
+    ) -> str:
+        """
+        Compact 2-section prompt for low-arousal steps (~100 tokens).
 
-        # Capture prompt on the main thread so context is not mutated by the time
-        # the thread reads it (context dict is recreated each step).
-        prompt = self._build_prompt(policies, goals, context, step)
+        Sections: interoceptive state + EFE scores.
+        Output: ACTION: <policy_id> only — no reasoning required.
+        """
+        drive_batch: Optional[DriveSignalBatch] = context.get("drive_batch")
+        fe_scores: Dict[str, float] = context.get("free_energy_scores", {})
+        av: Optional[ArousalValence] = context.get("arousal_valence")
 
-        def _run() -> None:
-            try:
-                from core.llm.types import LLMMessage, LLMRequest
-                request = LLMRequest(
-                    messages=[LLMMessage(role="user", content=prompt)],
-                    max_tokens=200,
-                    temperature=0.1,
-                )
-                response = self._llm.complete(request)
-                selected = self._parse_llm_response(response.content, policies)
-                self._pending_llm_result = selected
-                self._last_llm_step = step
-                self._last_goals_fingerprint = self._fingerprint(goals)
-                if self._llm_log_cb is not None:
-                    try:
-                        self._llm_log_cb(prompt, response, trigger_reason, step, selected)
-                    except Exception as log_exc:
-                        log.debug("LLM log callback failed: %s", log_exc)
-            except Exception as exc:
-                log.warning("LLM async call failed: %s", exc)
-                self._pending_llm_result = None
+        # Compact drive summary — just urgency values, sorted descending
+        if drive_batch and drive_batch.signals:
+            top = sorted(drive_batch.signals, key=lambda s: s.urgency, reverse=True)[:3]
+            drives_compact = "  " + "  ".join(
+                f"{s.channel_id}={s.urgency:.2f}" for s in top
+            )
+        else:
+            drives_compact = "  (none)"
 
-        self._llm_thread = threading.Thread(target=_run, daemon=True)
-        self._llm_thread.start()
+        arousal = av.arousal if av else 0.0
+        valence = av.valence if av else 0.0
+
+        # Single-line raycast — critical for not walking into walls
+        raycast_hits = context.get("raycast_hits")
+        if raycast_hits:
+            r = raycast_hits[0]
+            tag = r.get("hit_tag")
+            dist = r.get("distance", 1.0)
+            if tag in ("GoodGoal", "GoodGoalMulti"):
+                raycast_line = f"food at {dist:.2f}"
+            elif tag in ("BadGoal", "BadGoalMulti"):
+                raycast_line = f"hazard at {dist:.2f}"
+            elif tag == "wall":
+                raycast_line = f"wall at {dist:.2f}"
+            else:
+                raycast_line = "clear"
+        else:
+            raycast_line = "no data"
+
+        # EFE scores — sorted descending so the top action is obvious
+        fe_sorted = sorted(fe_scores.items(), key=lambda x: x[1], reverse=True)
+        fe_line = "  " + "  ".join(f"{pid}={score:.3f}" for pid, score in fe_sorted)
+
+        valid_ids = ", ".join(p["policy_id"] for p in policies)
+
+        motor_eff = float(context.get("motor_efficiency", 1.0))
+        stuck_steps = int(context.get("stuck_steps", 0))
+        stuck_line = (
+            f"STUCK: move_forward blocked for {stuck_steps} consecutive steps. "
+            f"Turning is required.\n"
+            if motor_eff < 0.3 else ""
+        )
+
+        return (
+            f"Step {step}. Output exactly one line: ACTION: <policy_id>\n"
+            f"Valid: {valid_ids}\n\n"
+            f"DRIVES (urgency): {drives_compact}\n"
+            f"  arousal={arousal:.2f}  valence={valence:.2f}\n"
+            f"RAYCAST: {raycast_line}\n"
+            f"{stuck_line}"
+            f"EFE (higher=prefer): {fe_line}\n\n"
+            f"ACTION: "
+        )
 
     def _build_prompt(
         self,
@@ -328,17 +391,17 @@ class PolicyGenerator:
         step: int,
     ) -> str:
         """
-        Drive-arbitration prompt: LLM reasons as a planner-as-inference over
-        expected free energy across the drive space (Seth/Friston hierarchy).
+        Full CoT prompt for high-arousal / conflict / PE-streak steps.
 
-        No task-goal framing — the agent has no declared objective.
-        It acts solely to reduce allostatic error and prediction error.
+        Sections:
+          Step 1: Interoceptive state — drives, arousal, valence, affect
+          Step 2: Exteroceptive / motor state — heading, efficiency, PE
+          Step 2b: Directional perception — raycasts
+          Step 4: Episodic memory — similar past situations
+          Step 5: Expected free energy per action
+          Step 6: Allostatic resolution — commit
 
-          Step 1: Interoceptive state — which drives are urgent and trending?
-          Step 2: Exteroceptive / motor state — what is the agent doing?
-          Step 3: EFE scores per action — what does the generative model predict?
-          Step 4: Allostatic resolution — commit to the action that most relieves
-                  the highest-urgency drive while minimising surprise.
+        Output: REASON: <one sentence>\nACTION: <policy_id>
         """
         drive_batch: Optional[DriveSignalBatch] = context.get("drive_batch")
         pe_batch: Optional[PredictionErrorBatch] = context.get("pe_batch")
@@ -358,6 +421,11 @@ class PolicyGenerator:
         else:
             drive_lines = "  (no drive data)"
 
+        dominant_channel = drive_batch.dominant_channel if drive_batch else None
+        _rc = context.get("raycast_hits")
+        food_visible = bool(_rc and _rc[0].get("hit_tag") in ("GoodGoal", "GoodGoalMulti"))
+        affect_state = _affect_label(arousal, valence, dominant_channel, food_visible)
+
         # --- Step 2: recent action history ---
         recent = context.get("recent_actions", [])
         if recent:
@@ -371,7 +439,6 @@ class PolicyGenerator:
                 compressed.append(f"{action}×{count}" if count > 1 else action)
                 i += count
             recent_text = ", ".join(compressed)
-            # Degenerate sequence note — surfaces stuck loops to the model
             if len(recent) >= 4 and len(set(recent[-4:])) == 1:
                 reps = recent[-4:].count(recent[-1])
                 recent_text += f"\n  [NOTE: '{recent[-1]}' repeated {reps}× — consider alternatives]"
@@ -391,8 +458,6 @@ class PolicyGenerator:
         pe_streak = self._pe_streak
 
         # --- Step 2b: raycast directional perception ---
-        # AAI4 single-ray sensor always fires straight forward — label is always "forward".
-        # raycast_hits is a list with one dict: {"hit_tag": str|None, "distance": float}
         raycast_hits = context.get("raycast_hits")
         if raycast_hits:
             r = raycast_hits[0]
@@ -411,7 +476,7 @@ class PolicyGenerator:
         else:
             raycast_text = "  (no raycast data this step)"
 
-        # --- Step 3: EFE per action — show drive_tags so LLM sees the connection ---
+        # --- Step 3: EFE per action ---
         fe_lines = []
         for p in policies:
             pid = p["policy_id"]
@@ -420,7 +485,7 @@ class PolicyGenerator:
             fe_lines.append(f"  {pid:<16} EFE={fe:.3f}  drives=[{tags}]")
         fe_text = "\n".join(fe_lines) if fe_lines else "  (no scores)"
 
-        # --- Affect interpretation for Step 4 ---
+        # --- Affect note ---
         if arousal > self._arousal_diversity_threshold and valence < -0.1:
             affect_note = (
                 f"\n  ⚠ arousal={arousal:.2f} HIGH + valence={valence:.2f} NEGATIVE"
@@ -433,7 +498,7 @@ class PolicyGenerator:
         else:
             affect_note = ""
 
-        # --- Step 4: episodic memory (before EFE so recency bias amplifies EFE, not memory) ---
+        # --- Step 4: episodic memory ---
         episodic_text = "  (no prior episodes yet)"
         if self._query_episodic_memory is not None:
             current_state = context.get("current_state")
@@ -465,11 +530,11 @@ Valid policy_ids: {valid_ids}
 
 ══ STEP 1 — INTEROCEPTIVE STATE ══
 {drive_lines}
-  Arousal: {arousal:.2f}  |  Valence: {valence:.2f}
+  Arousal: {arousal:.2f}  |  Valence: {valence:.2f}  |  Affect: {affect_state}
 
 ══ STEP 2 — EXTEROCEPTIVE / MOTOR STATE ══
   Heading:        {heading_deg:.0f}°
-  Motor:          efficiency={motor_eff:.2f}
+  Motor:          efficiency={motor_eff:.2f}  stuck_steps={context.get("stuck_steps", 0)}
   PE streak:      {pe_streak} steps  |  Mean PE: {pe_mean:.4f}
   Recent actions: {recent_text}
 
@@ -485,9 +550,13 @@ Valid policy_ids: {valid_ids}
 
 ══ STEP 6 — ALLOSTATIC RESOLUTION ══
   Select the action with the highest EFE score that is consistent with the perceptual evidence above.
-  If food is visible in raycasts, move_forward has first-order pragmatic value.{affect_note}
+  If food is visible in raycasts, move_forward has first-order pragmatic value.{affect_note}{f"{chr(10)}  ⚠ STUCK: move_forward blocked for {context.get('stuck_steps', 0)} steps. You MUST turn." if motor_eff < 0.3 else ""}
 
 REASON: """
+
+    # ------------------------------------------------------------------
+    # Response parsing
+    # ------------------------------------------------------------------
 
     def _parse_llm_response(
         self,
@@ -496,12 +565,11 @@ REASON: """
     ) -> Optional[str]:
         """Extract policy_id from LLM response text.
 
-        Primary: look for the explicit ACTION: line from the structured prompt.
-        Fallback: scan full response text for any valid policy_id substring.
+        Primary: look for the explicit ACTION: line.
+        Fallback: scan full response for any valid policy_id substring.
         """
         policy_ids = {p["policy_id"] for p in policies}
 
-        # The prompt primes "REASON: ...\nACTION: ..." — scan all lines
         for line in response.splitlines():
             stripped = line.strip()
             if stripped.upper().startswith("ACTION:"):
@@ -510,80 +578,13 @@ REASON: """
                 if first_word in policy_ids:
                     return first_word
 
-        # Fallback: find first policy_id substring in response
+        # Fallback: first policy_id substring in response
         lower = response.lower()
         for pid in policy_ids:
             if pid in lower:
                 return pid
 
         return None
-
-    # ------------------------------------------------------------------
-    # Urgency fallback
-    # ------------------------------------------------------------------
-
-    def _urgency_fallback(
-        self,
-        policies: List[Dict],
-        context: Dict,
-    ) -> str:
-        """
-        Fast reactive selection — no LLM, purely drive-tag matching.
-
-        Arousal-sensitive diversity:
-          When arousal exceeds the threshold (motor PE high = agent is blocked,
-          or drives are critically low), the last-taken action is excluded from
-          the candidate set. This reduces the precision weight on the failing
-          policy, allowing other actions to compete — Seth-consistent affect
-          modulation without a hard-coded escape sequence.
-        """
-        arousal: float = context.get("arousal", 0.0)
-        active_policies = list(policies)
-
-        if arousal > self._arousal_diversity_threshold:
-            last_action = context.get("last_action")
-            if last_action is not None:
-                eligible = [p for p in active_policies if p["policy_id"] != last_action]
-                if eligible:
-                    active_policies = eligible
-
-        # Wall suppression: if the forward ray detects a wall, exclude move_forward
-        # entirely from the candidate set. This applies to all steps, not just LLM steps,
-        # so the 80% of steps using this fallback don't repeatedly bang into walls.
-        raycast_hits = context.get("raycast_hits")
-        if raycast_hits:
-            r = raycast_hits[0]
-            if r.get("hit_tag") == "wall":
-                no_forward = [p for p in active_policies if p["policy_id"] != "move_forward"]
-                if no_forward:
-                    active_policies = no_forward
-
-        drive_batch: Optional[DriveSignalBatch] = context.get("drive_batch")
-        urgency_by_tag: Dict[str, float] = {}
-
-        if drive_batch:
-            for signal in drive_batch.signals:
-                for tag in signal.suggested_action_tags:
-                    urgency_by_tag[tag] = max(urgency_by_tag.get(tag, 0.0), signal.urgency)
-
-        best_id = None
-        best_score = -1.0
-
-        for policy in active_policies:
-            score = 0.0
-            for tag in policy.get("drive_tags", []) + policy.get("tags", []):
-                score = max(score, urgency_by_tag.get(tag, 0.0))
-
-            if self._get_policy_history is not None:
-                ltm_rate = self._get_policy_history(policy["policy_id"])
-                score += ltm_rate * 0.3
-
-            if score > best_score:
-                best_score = score
-                best_id = policy["policy_id"]
-
-        # Default to idle — a satisfied, unsurprised agent does nothing
-        return best_id or "idle"
 
     # ------------------------------------------------------------------
     # Helpers
@@ -595,6 +596,3 @@ REASON: """
             self._pe_streak += 1
         else:
             self._pe_streak = max(0, self._pe_streak - 1)
-
-    def _fingerprint(self, goals: List[Goal]) -> str:
-        return "|".join(sorted(g.goal_id for g in goals))

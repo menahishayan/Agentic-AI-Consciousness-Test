@@ -65,6 +65,11 @@ class PredictionErrorCalculator:
         self._sigma_clip: float = float(pe.get("sigma_clip", 3.0))    # outlier suppression
         self._default_precision: float = float(pe.get("default_precision", 0.5))
         self._min_precision: float = float(pe.get("min_precision", 0.3))
+        # LC-NE gain: arousal multiplies effective precision so high-arousal states
+        # produce faster belief updating. Yu & Dayan (2005): NE signals unexpected
+        # uncertainty and transiently boosts sensory gain.
+        # arousal=0.0 → ×1.0; arousal=1.0 → ×1.5
+        self._arousal_precision_gain: float = float(pe.get("arousal_precision_gain", 0.5))
 
         # EMA baseline per channel (represents "normal" value history)
         self._baseline: Dict[str, float] = {}
@@ -79,6 +84,7 @@ class PredictionErrorCalculator:
         workspace: GlobalWorkspace,
         step: int,
         area_familiarity: float = 0.5,
+        arousal: float = 0.0,
     ) -> PredictionErrorBatch:
         """
         Compute prediction error between predicted and actual state channels.
@@ -115,15 +121,16 @@ class PredictionErrorCalculator:
             if normalized_error > self._sigma_clip:
                 normalized_error = self._sigma_clip
 
-            # Precision = familiarity × model confidence for this action-channel
+            # Precision = familiarity × model confidence for this action-channel,
+            # then scaled by LC-NE arousal pathway: high arousal → sharper updating.
+            # Aston-Jones & Cohen (2005): LC-NE release transiently boosts cortical gain.
             model_precision = (
                 self._world_model.get_precision(last_action, ch)
                 if last_action else self._default_precision
             )
-            precision = max(
-                self._min_precision,
-                area_familiarity * 0.5 + model_precision * 0.5,
-            )
+            base_precision = area_familiarity * 0.5 + model_precision * 0.5
+            arousal_multiplier = 1.0 + arousal * self._arousal_precision_gain
+            precision = max(self._min_precision, base_precision * arousal_multiplier)
 
             # Precision-weighted magnitude: novel areas dampen errors; familiar amplify
             magnitude = normalized_error * precision

@@ -5,19 +5,17 @@ Animal AI 4 provides two observation arrays per step:
 
   1. Visual observation: numpy array of shape (H, W, 3) or (3, H, W) — RGB camera
 
-  2. Agent proprioceptive vector: 1D float array of exactly 8 elements from
+  2. Agent proprioceptive vector: 1D float array of exactly 10 elements from
      TrainingAgent.CollectObservations (VectorSensor):
-       [0]   health           (Unity units, 0–100)
-       [1–3] localVel.x/y/z  (local-space velocity, Unity units/s)
-       [4–6] localPos.x/y/z  (world position, Unity units)
-       [7]   speed_magnitude  (Rigidbody.linearVelocity.magnitude, Unity units/s)
-     Index 7 is the proprioceptive speed signal used for motor PE computation:
-       free motion → ~step_size/dt (≈18 units/s at default config)
-       wall contact → ~0 units/s
-
-  NOTE: Directional raycast sensors are not yet added to the ML-Agents obs pipeline.
-  Resource/threat estimation falls back to visual heuristics until a
-  RayPerceptionSensorComponent3D is attached to the agent prefab.
+       [0]   health              (normalised 0–1)
+       [1–3] localVel.x/y/z     (local-space velocity, Unity units/s)
+       [4–6] localPos.x/y/z     (world position normalised by _arenaSize)
+       [7]   speed_magnitude     (Rigidbody.linearVelocity.magnitude, Unity units/s)
+       [8]   ray_hit_fraction    (forward ray distance, 0=agent 1=no hit / max range)
+       [9]   ray_tag_index       (float index: 0=none, 1=GoodGoal, 2=GoodGoalMulti,
+                                  3=BadGoal, 4=Immovable/wall, 5=OuterWall/wall)
+     Indices 8–9 are injected by CollectObservations via CollectRaycastObservations()
+     since Animal AI 5.x does not forward RayPerceptionSensor output to Python obs_list.
 
 We extract a compact feature vector from the visual observation without GPU:
   - Downsample to 21×21
@@ -64,22 +62,71 @@ _THUMB_SIZE = 21
 _HIST_BUCKETS = 4
 
 # Agent proprioceptive observation layout (TrainingAgent.CollectObservations VectorSensor).
-# 8 floats: health(1) + localVel(3) + worldPos_normalised(3) + speed_magnitude(1)
-_AGENT_OBS_LEN = 8
-_AGENT_OBS_SPEED_IDX = 7   # linearVelocity.magnitude — raw Unity units/s
+# 10 floats: health(1) + localVel(3) + worldPos_normalised(3) + speed_magnitude(1) + ray(2)
+_AGENT_OBS_LEN = 10
+_AGENT_OBS_SPEED_IDX = 7        # linearVelocity.magnitude — raw Unity units/s
+_AGENT_OBS_RAY_FRACTION_IDX = 8 # forward ray hit_fraction (0=agent, 1=max range / no hit)
+_AGENT_OBS_RAY_TAG_IDX = 9      # forward ray tag encoded as float index (see _TagToIndex in C#)
 
 # TrainingAgent._arenaSize used to normalise world position before sending.
-# Must match the C# constant (currently 30f).
-_ARENA_SIZE_UNITY = 30.0
+# Animal AI's default arena is 40×40 Unity units. Must match the C# constant.
+_ARENA_SIZE_UNITY = 40.0
 
-# Raycast sensor layout — emitted by a RayPerceptionSensorComponent3D on the agent prefab
-# as a SEPARATE array in obs_list, distinct from the 8-float proprioceptive obs.
-# Default Animal AI single-ray config: 1 ray × 6 detectable tags + 1 distance = 7 floats.
-#   distance: 1.0 = max range / no hit; <1.0 = object at that fraction of range.
-# NOTE: RayPerceptionSensorComponent3D is not yet attached to the agent prefab; until
-# it is, _parse_raycasts will find no 7-float array and return the no-hit sentinel.
-_AAI_RAY_TAGS = ["GoodGoal", "GoodGoalMulti", "BadGoal", "BadGoalMulti", "wall", "ramp"]
-_AAI_RAY_OBS_LEN = len(_AAI_RAY_TAGS) + 1  # 7
+# Maps the float tag index from _TagToIndex (TrainingAgent.cs) to internal canonical names.
+# Index 0 = no hit / unrecognised tag.  Used by the 10-float vector obs path (post-rebuild).
+_RAY_TAG_INDEX_MAP: Dict[float, Optional[str]] = {
+    0.0: None,
+    1.0: "GoodGoal",
+    2.0: "GoodGoalMulti",
+    3.0: "BadGoal",
+    4.0: "wall",   # Immovable
+    5.0: "wall",   # OuterWall
+}
+
+# ---------------------------------------------------------------------------
+# RayPerceptionSensor separate obs array — current pre-rebuild binary
+#
+# shape (98,) = 7 rays × 14 floats, format [one_hot(13), hit_fraction]
+# ML-Agents 1.1.0 uses N+1 per ray (no separate hit_bool).
+#
+# Tag order matches the 13-tag detectable list compiled into the binary prefab.
+# Index mapping (same order as m_DetectableTags, binary predates DecoyGoalBounce):
+#   0=arena, 1=Immovable, 2=Movable, 3=goodGoal, 4=goodGoalMulti, 5=badGoal,
+#   6=GoalSpawner, 7=DeathZone, 8=HotZone, 9=Ramp, 10=PillarButton,
+#   11=SignPoster, 12=DecoyGoal
+#
+# After rebuild (15 tags + OuterWall): shape becomes (112,) = 7 × (15+1).
+# The 10-float vector obs path supersedes this once rebuilt, but this path
+# provides working ray detection in the interim.
+# ---------------------------------------------------------------------------
+_RAY_SENSOR_TAG_REMAP: Dict[int, Optional[str]] = {
+    0:  "arena",        # floor/ceiling
+    1:  "wall",         # Immovable (obstacle walls)
+    2:  None,           # Movable — not relevant for nav
+    3:  "GoodGoal",
+    4:  "GoodGoalMulti",
+    5:  "BadGoal",
+    6:  None,           # GoalSpawner
+    7:  None,           # DeathZone
+    8:  None,           # HotZone
+    9:  None,           # Ramp
+    10: None,           # PillarButton
+    11: None,           # SignPoster
+    12: None,           # DecoyGoal
+    # After rebuild: 13=DecoyGoalBounce, 14=OuterWall (→ "wall")
+    14: "wall",         # OuterWall (post-rebuild binary)
+}
+_RAY_SENSOR_TAGS_PER_RAY_LEGACY = 13    # pre-rebuild: 13 tags + 1 fraction = 14 per ray
+_RAY_SENSOR_TAGS_PER_RAY_NEW    = 15    # post-rebuild: 15 tags + 1 fraction = 16 per ray
+_RAY_SENSOR_N_RAYS = 7                  # 2 * raysPerSide(3) + 1 centre
+_RAY_SENSOR_LEN_LEGACY = _RAY_SENSOR_N_RAYS * (_RAY_SENSOR_TAGS_PER_RAY_LEGACY + 1)  # 98
+_RAY_SENSOR_LEN_NEW    = _RAY_SENSOR_N_RAYS * (_RAY_SENSOR_TAGS_PER_RAY_NEW    + 1)  # 112
+
+# Compact single-ray format from current binary: 1 ray × (6 one-hot tags + 1 hit_fraction).
+# Tag order matches the first 6 entries of _RAY_SENSOR_TAG_REMAP:
+#   0=arena, 1=Immovable(wall), 2=Movable, 3=GoodGoal, 4=GoodGoalMulti, 5=BadGoal
+_RAY_SENSOR_LEN_COMPACT          = 7
+_RAY_SENSOR_TAGS_PER_RAY_COMPACT = 6
 
 
 def map_obs(
@@ -112,7 +159,7 @@ def map_obs(
     terrain_novelty = _estimate_terrain_novelty(visual_features)
     entity_density = _estimate_entity_density(visual_features)
 
-    # Raycast — single-ray dict from AAI4's (7,) vector obs
+    # Raycast — forward-ray dict parsed from RayPerceptionSensorComponent3D obs
     raycast: Dict[str, Any] = info.get("raycast_hits") or {"hit_tag": None, "distance": 1.0}
     hit_tag = raycast.get("hit_tag")
     detected_objects: List[str] = [hit_tag] if hit_tag else []
@@ -150,6 +197,7 @@ def map_obs(
             "motor_stuck": info.get("motor_stuck", False),
             "motor_efficiency": info.get("motor_efficiency", 1.0),
             "position_delta_norm": info.get("position_delta_norm", 0.0),
+            "stuck_steps": info.get("stuck_steps", 0),
         },
     )
 
@@ -228,20 +276,32 @@ def _extract_local_speed(obs_list: List[Any]) -> Tuple[float, float, float]:
     """
     Extract proprioceptive speed from Animal AI's vector observation.
 
-    TrainingAgent.CollectObservations emits an 8-float VectorSensor array:
-      [health, localVel.x, localVel.y, localVel.z, pos.x, pos.y, pos.z, speed_mag]
+    Searched in reverse so the proprioceptive obs (last 1D array in obs_list)
+    is found before the compact ray obs (also 7 elements, earlier in the list).
 
-    Index 7 (linearVelocity.magnitude) is the authoritative proprioceptive speed:
-      free motion  → ~step_size / velocity_dt (≈18 Unity units/s at default config)
-      wall contact → ~0 Unity units/s
+    Current binary (7-element prop obs layout):
+      [0] health  [1] vel_x  [2] vel_y  [3] vel_z  [4] pos_x/40  [5] pos_y/40  [6] pos_z/40
+      arr[3] = vel_z ≈ local-forward velocity (Unity units/s, ~17 u/s at full throttle)
 
-    Returns (speed_magnitude, 0.0, 0.0) so callers receive forward speed in index 0.
-    Right and up components are not needed for the current motor PE pipeline.
+    Post-rebuild (10-element prop obs):
+      arr[7] = linearVelocity.magnitude — authoritative speed signal
+
+    NOTE: Motor efficiency is now computed from consecutive position delta in
+    env_adapter.py rather than raw speed. This function is used only as a
+    fallback for dead-reckoning when world position is unavailable.
+
+    Returns (fwd_speed, 0.0, 0.0).
     """
-    for obs in obs_list:
+    for obs in reversed(obs_list):
         arr = np.asarray(obs)
-        if arr.ndim == 1 and len(arr) == _AGENT_OBS_LEN:
+        if arr.ndim != 1:
+            continue
+        n = len(arr)
+        if n == _AGENT_OBS_LEN and n > _AGENT_OBS_SPEED_IDX:
             return float(arr[_AGENT_OBS_SPEED_IDX]), 0.0, 0.0
+        if n == 7:
+            # 7-element prop obs: vel_z at index 3 approximates forward speed
+            return float(arr[3]), 0.0, 0.0
     return 0.0, 0.0, 0.0
 
 
@@ -251,10 +311,20 @@ def _extract_world_pos(obs_list: List[Any]) -> Tuple[float, float, float]:
 
     TrainingAgent.CollectObservations divides transform.position by _arenaSize before
     sending, so multiply by _ARENA_SIZE_UNITY to recover Unity world coordinates.
+
+    Both the 10-element (post-rebuild) and 7-element (current binary) proprioceptive
+    obs have normalised position at [4, 5, 6]:
+      7-element:  [health, vel_x, vel_y, vel_z, px/40, py/40, pz/40]
+      10-element: [health, vel_x, vel_y, vel_z, px/40, py/40, pz/40, speed_mag, ray_frac, ray_tag]
+
+    Searched in REVERSE so the proprioceptive obs (last in obs_list) is found before
+    the compact ray obs (also 7 elements, earlier in obs_list). The ray obs has
+    one-hot values at [0:6] which would be misread as fractional positions — reversing
+    the search eliminates the collision without needing a content-based discriminator.
     """
-    for obs in obs_list:
+    for obs in reversed(obs_list):
         arr = np.asarray(obs)
-        if arr.ndim == 1 and len(arr) == _AGENT_OBS_LEN:
+        if arr.ndim == 1 and len(arr) in (_AGENT_OBS_LEN, 7):
             x = float(arr[4]) * _ARENA_SIZE_UNITY
             y = float(arr[5]) * _ARENA_SIZE_UNITY
             z = float(arr[6]) * _ARENA_SIZE_UNITY
@@ -262,30 +332,75 @@ def _extract_world_pos(obs_list: List[Any]) -> Tuple[float, float, float]:
     return 0.0, 0.0, 0.0
 
 
+def _extract_unity_health(obs_list: List[Any]) -> Optional[float]:
+    """
+    Extract Unity's ground-truth health from the proprioceptive obs (index 0).
+
+    Returns None if the proprioceptive obs is not found (caller should not sync).
+    Searched in reverse for the same collision-avoidance reason as _extract_world_pos.
+    """
+    for obs in reversed(obs_list):
+        arr = np.asarray(obs)
+        if arr.ndim == 1 and len(arr) in (_AGENT_OBS_LEN, 7):
+            return float(np.clip(arr[0], 0.0, 1.0))
+    return None
+
+
 def _parse_raycasts(obs_list: List[Any]) -> Dict[str, Any]:
     """
-    Parse the directional raycast observation from obs_list.
+    Extract forward ray data from obs_list, handling three binary states:
 
-    A RayPerceptionSensorComponent3D on the agent prefab emits a separate 1D float
-    array of exactly _AAI_RAY_OBS_LEN (7) floats — distinct from the 8-float
-    proprioceptive obs so there is no collision risk:
-        [GoodGoal, GoodGoalMulti, BadGoal, BadGoalMulti, wall, ramp, distance]
-    First 6: one-hot tag encoding (>0.5 = hit). Last: normalised distance.
+    Post-rebuild (preferred): 10-float vector obs [indices 8–9]
+        TrainingAgent.CollectObservations encodes the forward ray directly:
+          [8] hit_fraction, [9] tag_index via _TagToIndex()
+        Matched when len == _AGENT_OBS_LEN (10).
 
-    If no 7-float array is present (sensor not yet attached to the prefab), returns
-    the no-hit sentinel {"hit_tag": None, "distance": 1.0} so the rest of the
-    pipeline degrades gracefully to visual heuristics.
+    Pre-rebuild legacy: separate RayPerceptionSensor array (98 or 112 floats)
+        ML-Agents 1.1.0 format: [one_hot(N), hit_fraction] per ray, N+1 floats/ray.
+        Pre-rebuild binary: N=13, total=98. Post-rebuild (before next rebuild): N=15, total=112.
+        Forward ray = index 0 (AlternatingRayOrder=1, center-first).
+
+    Returns the no-hit sentinel {"hit_tag": None, "distance": 1.0} when no matching
+    array is found.
     """
     for obs in obs_list:
         arr = np.asarray(obs, dtype=np.float32)
-        if arr.ndim == 1 and len(arr) == _AAI_RAY_OBS_LEN:
-            one_hot = arr[:len(_AAI_RAY_TAGS)]
-            distance = float(arr[len(_AAI_RAY_TAGS)])
+        if arr.ndim != 1:
+            continue
+
+        n = len(arr)
+
+        # Post-rebuild: forward ray embedded in 10-float vector obs
+        if n == _AGENT_OBS_LEN:
+            fraction = float(arr[_AGENT_OBS_RAY_FRACTION_IDX])
+            tag = _RAY_TAG_INDEX_MAP.get(round(float(arr[_AGENT_OBS_RAY_TAG_IDX])), None)
+            return {"hit_tag": tag, "distance": fraction}
+
+        # Compact single-ray format from current binary: [one_hot(6), hit_fraction]
+        # 1 ray × 6 one-hot tags + 1 distance float = 7 elements.
+        if n == _RAY_SENSOR_LEN_COMPACT:
+            one_hot = arr[:_RAY_SENSOR_TAGS_PER_RAY_COMPACT]
+            fraction = float(arr[_RAY_SENSOR_TAGS_PER_RAY_COMPACT])
             best_idx = int(np.argmax(one_hot))
             hit_tag: Optional[str] = (
-                _AAI_RAY_TAGS[best_idx] if float(one_hot[best_idx]) > 0.5 else None
+                _RAY_SENSOR_TAG_REMAP.get(best_idx)
+                if float(one_hot[best_idx]) > 0.5 else None
             )
-            return {"hit_tag": hit_tag, "distance": distance}
+            return {"hit_tag": hit_tag, "distance": fraction}
+
+        # Pre-rebuild: separate RayPerceptionSensor flat array (7-ray full format)
+        if n in (_RAY_SENSOR_LEN_LEGACY, _RAY_SENSOR_LEN_NEW):
+            n_tags = _RAY_SENSOR_TAGS_PER_RAY_LEGACY if n == _RAY_SENSOR_LEN_LEGACY else _RAY_SENSOR_TAGS_PER_RAY_NEW
+            # Forward ray is at offset 0 (AlternatingRayOrder=1, center first)
+            one_hot = arr[:n_tags]
+            fraction = float(arr[n_tags])
+            best_idx = int(np.argmax(one_hot))
+            hit_tag = (
+                _RAY_SENSOR_TAG_REMAP.get(best_idx)
+                if float(one_hot[best_idx]) > 0.5 else None
+            )
+            return {"hit_tag": hit_tag, "distance": fraction}
+
     return {"hit_tag": None, "distance": 1.0}
 
 

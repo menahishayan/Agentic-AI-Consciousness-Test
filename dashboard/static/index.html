@@ -270,14 +270,13 @@
 
   /* ── LLM Reasoning panel ─────────────────────────────────────── */
   #llm-card {
-    grid-column: span 2;
     background: var(--surface);
     border: 1px solid var(--border);
     border-radius: 10px;
     padding: 12px 14px;
     display: flex;
     flex-direction: column;
-    gap: 10px;
+    gap: 8px;
   }
 
   #llm-title {
@@ -286,24 +285,58 @@
     text-transform: uppercase;
     letter-spacing: 0.07em;
     color: var(--muted);
+    flex-shrink: 0;
   }
 
-  #llm-body {
-    display: flex;
-    gap: 12px;
-    min-height: 260px;
-  }
-
-  #llm-call-list {
-    width: 220px;
-    min-width: 220px;
+  #llm-feed {
     overflow-y: auto;
-    max-height: 380px;
-    border-right: 1px solid var(--border);
-    padding-right: 10px;
+    max-height: 320px;
     display: flex;
     flex-direction: column;
-    gap: 4px;
+    gap: 3px;
+  }
+
+  .llm-feed-row {
+    display: grid;
+    grid-template-columns: 70px 90px 130px 90px;
+    align-items: baseline;
+    gap: 8px;
+    padding: 5px 8px;
+    border-radius: 5px;
+    font-size: 12px;
+    border-left: 2px solid transparent;
+  }
+
+  .llm-feed-row:hover { background: var(--surface2); }
+
+  .llm-feed-row .fr-step {
+    font-family: monospace;
+    color: var(--accent);
+    font-weight: 700;
+    white-space: nowrap;
+  }
+
+  .llm-feed-row .fr-trigger {
+    font-size: 10px;
+    color: var(--warn);
+    white-space: nowrap;
+  }
+
+  .llm-feed-row .fr-affect {
+    font-size: 10px;
+    color: #50fa7b;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .llm-feed-row .fr-action {
+    font-family: monospace;
+    font-size: 11px;
+    font-weight: 700;
+    color: var(--accent);
+    text-align: right;
+    white-space: nowrap;
   }
 
   .ep-divider {
@@ -317,83 +350,6 @@
     margin-top: 4px;
   }
 
-  .llm-call-item {
-    padding: 7px 8px;
-    border-radius: 6px;
-    cursor: pointer;
-    border: 1px solid transparent;
-    transition: background 0.1s;
-  }
-
-  .llm-call-item:hover { background: var(--surface2); }
-
-  .llm-call-item.active {
-    background: var(--surface2);
-    border-color: var(--accent);
-  }
-
-  .llm-call-item .lci-step {
-    font-family: monospace;
-    font-size: 12px;
-    color: var(--accent);
-    font-weight: 700;
-  }
-
-  .llm-call-item .lci-trigger {
-    font-size: 11px;
-    color: var(--warn);
-    margin-top: 1px;
-  }
-
-  .llm-call-item .lci-meta {
-    font-size: 10px;
-    color: var(--muted);
-    margin-top: 2px;
-  }
-
-  #llm-response {
-    flex: 1;
-    overflow-y: auto;
-    padding-left: 12px;
-    font-size: 12.5px;
-    line-height: 1.6;
-    color: var(--text);
-  }
-
-  #llm-response .cot-section {
-    margin-bottom: 14px;
-  }
-
-  #llm-response .cot-header {
-    font-size: 10px;
-    font-weight: 700;
-    text-transform: uppercase;
-    letter-spacing: 0.08em;
-    color: var(--accent);
-    margin-bottom: 4px;
-    padding-bottom: 3px;
-    border-bottom: 1px solid var(--border);
-  }
-
-  #llm-response .cot-body {
-    color: #c9d1e0;
-    white-space: pre-wrap;
-    font-family: monospace;
-    font-size: 12px;
-  }
-
-  #llm-response .cot-action {
-    display: inline-block;
-    margin-top: 6px;
-    padding: 3px 10px;
-    background: rgba(124,140,248,0.15);
-    border: 1px solid var(--accent);
-    border-radius: 5px;
-    font-family: monospace;
-    font-size: 12px;
-    font-weight: 700;
-    color: var(--accent);
-  }
 
   /* ── Placeholder ──────────────────────────────────────── */
   #placeholder {
@@ -484,6 +440,7 @@ const state = {
   llmEpisode: 0,        // episode counter, incremented when step resets to 0
   llmLastStep: -1,      // last seen step, used to detect episode boundaries
   selectedLlmIdx: null,
+  stepAffect: {},       // step -> affect_state string for policy scatter tooltip
 };
 
 const POLICY_PALETTE = [
@@ -655,18 +612,21 @@ function buildChartGrid() {
       <div class="chart-wrap"><canvas id="ch-policy"></canvas></div>
     </div>
 
-    <!-- Row 5 - wide -->
-    <div class="chart-card wide">
-      <div class="chart-title">Position Trajectory (X / Z)</div>
-      <div class="chart-wrap"><canvas id="ch-position"></canvas></div>
-    </div>
-
-    <!-- LLM Reasoning -->
-    <div id="llm-card">
-      <div id="llm-title">LLM Chain-of-Thought Reasoning</div>
-      <div id="llm-body">
-        <div id="llm-call-list"><div style="color:var(--muted);font-size:12px;">No LLM calls yet.</div></div>
-        <div id="llm-response"><div style="color:var(--muted);font-size:12px;">Select a call on the left to view its reasoning.</div></div>
+    <!-- Row 5 - position + LLM feed side by side -->
+    <div style="grid-column:span 2;display:grid;grid-template-columns:1fr 1fr;gap:16px;min-height:320px;">
+      <div class="chart-card" style="margin:0;">
+        <div class="chart-title">Position Trajectory (X / Z)</div>
+        <div class="chart-wrap"><canvas id="ch-position"></canvas></div>
+      </div>
+      <div id="llm-card" style="grid-column:unset;">
+        <div id="llm-title">LLM Reasoning Feed &nbsp;<span id="timing-avg-label" style="font-weight:400;color:var(--muted);text-transform:none;letter-spacing:0;"></span></div>
+        <div style="display:grid;grid-template-columns:70px 90px 130px 90px;gap:8px;padding:0 8px 4px;border-bottom:1px solid var(--border);flex-shrink:0;">
+          <span style="font-size:10px;color:var(--muted);font-weight:700;text-transform:uppercase;">Step</span>
+          <span style="font-size:10px;color:var(--muted);font-weight:700;text-transform:uppercase;">Trigger</span>
+          <span style="font-size:10px;color:var(--muted);font-weight:700;text-transform:uppercase;">Affect</span>
+          <span style="font-size:10px;color:var(--muted);font-weight:700;text-transform:uppercase;text-align:right;">Action</span>
+        </div>
+        <div id="llm-feed"><div data-placeholder style="color:var(--muted);font-size:12px;padding:8px;">No LLM calls yet.</div></div>
       </div>
     </div>
 
@@ -718,6 +678,17 @@ function initCharts() {
       ticks: { color: '#6b7280', font: { size: 10 } },
       grid: { color: 'rgba(45,50,80,0.5)' },
     };
+    opts.plugins.tooltip = {
+      ...opts.plugins.tooltip,
+      callbacks: {
+        label: (ctx) => {
+          const pt = ctx.raw;
+          const affect = pt.affect || state.stepAffect[pt.x] || '';
+          return affect ? `${ctx.dataset.label}  ·  ${affect}` : ctx.dataset.label;
+        },
+        title: (items) => `Step ${items[0]?.raw?.x ?? ''}`,
+      },
+    };
     state.charts.policy = new Chart(policyCanvas, {
       type: 'scatter',
       data: { datasets: [] },
@@ -745,6 +716,9 @@ function ingestMetric(row) {
   const step = row.step;
   if (step > state.lastStep) state.lastStep = step;
 
+  // Store affect state per step for tooltip enrichment
+  if (row.affect_state) state.stepAffect[step] = row.affect_state;
+
   // helpers
   function push(chart, ...vals) {
     if (!chart) return;
@@ -765,12 +739,12 @@ function ingestMetric(row) {
   }
 
   // policy scatter
-  ingestPolicy(step, row.policy_id);
+  ingestPolicy(step, row.policy_id, row.affect_state);
 
   scheduleUpdate();
 }
 
-function ingestPolicy(step, policyId) {
+function ingestPolicy(step, policyId, affect) {
   if (!policyId || !state.charts.policy) return;
   const chart = state.charts.policy;
   const color = policyColor(policyId);
@@ -792,7 +766,8 @@ function ingestPolicy(step, policyId) {
     };
     chart.data.datasets.push(ds);
   }
-  ds.data.push({ x: step, y: policyId });
+  // Store affect on the point so the tooltip can display it
+  ds.data.push({ x: step, y: policyId, affect: affect || '' });
 }
 
 function ingestPosition(row) {
@@ -847,121 +822,74 @@ function ingestRunComplete(payload) {
   }
 }
 
-// ─── LLM reasoning ───────────────────────────────────────────────
+// ─── LLM reasoning feed ──────────────────────────────────────────
+
+function extractReasonAction(text) {
+  // Extract the REASON: and ACTION: lines from the LLM response
+  const reasonMatch = text.match(/REASON\s*:\s*(.+?)(?:\n|$)/i);
+  const actionMatch = text.match(/ACTION\s*:\s*(\S+)/i);
+  return {
+    reason: reasonMatch ? reasonMatch[1].trim() : '',
+    action: actionMatch ? actionMatch[1].trim() : (text.trim().split(/\s+/).pop() || ''),
+  };
+}
 
 function ingestLlmCall(row, autoSelect = false) {
-  // Detect episode boundary: step resets back to 0 (or near 0) after having advanced
+  // Detect episode boundary
   const step = row.step ?? 0;
-  if (step === 0 && state.llmLastStep > 0) {
-    state.llmEpisode++;
-  }
+  if (step === 0 && state.llmLastStep > 0) state.llmEpisode++;
   state.llmLastStep = step;
   row._episode = state.llmEpisode;
 
   state.llmCalls.push(row);
-  const idx = state.llmCalls.length - 1;
-  renderLlmCallItem(row, idx);
-  if (autoSelect || state.selectedLlmIdx === null) {
-    selectLlmCall(idx);
-  }
+  renderLlmFeedRow(row);
   updateTimingAvg();
 }
 
 function updateTimingAvg() {
   const label = document.getElementById('timing-avg-label');
   if (!label) return;
-  const latencies = state.llmCalls
-    .map(c => c.latency_ms)
-    .filter(v => v != null && isFinite(v));
+  const latencies = state.llmCalls.map(c => c.latency_ms).filter(v => v != null && isFinite(v));
   if (latencies.length === 0) { label.textContent = ''; return; }
   const avg = latencies.reduce((a, b) => a + b, 0) / latencies.length;
-  label.textContent = `avg LLM latency: ${Math.round(avg)}ms`;
+  label.textContent = `avg latency: ${Math.round(avg)}ms  ·  ${latencies.length} calls`;
 }
 
-function renderLlmCallItem(row, idx) {
-  const list = document.getElementById('llm-call-list');
-  if (!list) return;
-  // Remove placeholder only when no real items exist yet
-  if (!list.querySelector('.llm-call-item')) list.innerHTML = '';
+function renderLlmFeedRow(row) {
+  const feed = document.getElementById('llm-feed');
+  if (!feed) return;
+  // Remove placeholder
+  if (feed.querySelector('[data-placeholder]')) feed.innerHTML = '';
 
+  const { reason, action } = extractReasonAction(row.response || '');
   const trigger = row.trigger_reason || 'initial';
-  const latency = row.latency_ms != null ? `${Math.round(row.latency_ms)}ms` : '';
-  const tokens = (row.input_tokens != null && row.output_tokens != null)
-    ? `↑${row.input_tokens} ↓${row.output_tokens} tok`
-    : '';
+  // Affect: prefer value stored from metrics at the same step
+  const affect = state.stepAffect[row.step] || '';
 
-  // Insert episode separator before the first item of each episode after episode 0
-  if (row._episode > 0 && (idx === 0 || state.llmCalls[idx - 1]._episode !== row._episode)) {
+  // Episode divider
+  const idx = state.llmCalls.length - 1;
+  if (row._episode > 0 && (idx === 0 || state.llmCalls[idx - 1]?._episode !== row._episode)) {
     const sep = document.createElement('div');
     sep.className = 'ep-divider';
     sep.textContent = `Episode ${row._episode + 1}`;
-    list.appendChild(sep);
+    feed.appendChild(sep);
   }
 
-  const epLabel = row._episode > 0 ? ` <span style="font-weight:400;color:var(--muted);">Ep ${row._episode + 1}</span>` : '';
-  const item = document.createElement('div');
-  item.className = 'llm-call-item';
-  item.dataset.idx = idx;
-  item.innerHTML = `
-    <div class="lci-step">Step ${row.step ?? '?'}${epLabel}</div>
-    <div class="lci-trigger">${trigger}</div>
-    <div class="lci-meta">${latency}${latency && tokens ? '  ' : ''}${tokens}</div>
+  const el = document.createElement('div');
+  el.className = 'llm-feed-row';
+  el.innerHTML = `
+    <span class="fr-step">Step ${row.step ?? '?'}</span>
+    <span class="fr-trigger">${escHtml(trigger)}</span>
+    <span class="fr-affect">${escHtml(affect)}</span>
+    <span class="fr-action">${escHtml(action)}</span>
   `;
-  item.onclick = () => selectLlmCall(idx);
-  list.appendChild(item);
-}
-
-function selectLlmCall(idx) {
-  state.selectedLlmIdx = idx;
-
-  // Update active state in list
-  document.querySelectorAll('.llm-call-item').forEach(el => {
-    el.classList.toggle('active', Number(el.dataset.idx) === idx);
-  });
-
-  const row = state.llmCalls[idx];
-  const el = document.getElementById('llm-response');
-  if (!el || !row) return;
-
-  el.innerHTML = formatCoT(row.response || '');
-}
-
-function formatCoT(text) {
-  if (!text.trim()) return '<div style="color:var(--muted);font-size:12px;">No response text.</div>';
-
-  // Split on ### section headers
-  const parts = text.split(/(?=###\s)/);
-  let html = '';
-
-  for (const part of parts) {
-    const headerMatch = part.match(/^###\s+(.+?)\n([\s\S]*)/);
-    if (headerMatch) {
-      const header = headerMatch[1].trim();
-      const body = headerMatch[2].trim();
-      // Extract ACTION line if present
-      const actionMatch = body.match(/ACTION\s*:\s*(\S+)/i);
-      const bodyDisplay = actionMatch
-        ? body.replace(/ACTION\s*:\s*\S+/i, '').trim()
-        : body;
-      html += `<div class="cot-section">
-        <div class="cot-header">${escHtml(header)}</div>
-        <div class="cot-body">${escHtml(bodyDisplay)}</div>
-        ${actionMatch ? `<span class="cot-action">ACTION: ${escHtml(actionMatch[1])}</span>` : ''}
-      </div>`;
-    } else {
-      // Top-level text (## header or preamble) — skip decorative headers
-      const cleaned = part.replace(/^##\s+.+\n?/, '').trim();
-      if (cleaned) {
-        html += `<div class="cot-section"><div class="cot-body">${escHtml(cleaned)}</div></div>`;
-      }
-    }
-  }
-
-  return html || `<div class="cot-section"><div class="cot-body">${escHtml(text)}</div></div>`;
+  feed.appendChild(el);
+  // Keep newest rows visible
+  feed.scrollTop = feed.scrollHeight;
 }
 
 function escHtml(s) {
-  return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
 }
 
 // ─────────────────────────────────────────────────────────────────
@@ -976,10 +904,6 @@ function loadBulkData(data) {
   // Force update all charts
   for (const chart of Object.values(state.charts)) {
     if (chart) chart.update('none');
-  }
-  // Auto-select latest LLM call after bulk load
-  if (state.llmCalls.length > 0) {
-    selectLlmCall(state.llmCalls.length - 1);
   }
   updateStepCounter();
 }
@@ -1003,6 +927,7 @@ async function selectRun(runId) {
   state.llmEpisode = 0;
   state.llmLastStep = -1;
   state.selectedLlmIdx = null;
+  state.stepAffect = {};
   const avgLabel = document.getElementById('timing-avg-label');
   if (avgLabel) avgLabel.textContent = '';
 

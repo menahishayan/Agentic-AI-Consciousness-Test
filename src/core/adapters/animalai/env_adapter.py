@@ -13,22 +13,35 @@ adapter_folder in config.json.
 from __future__ import annotations
 
 import logging
+import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 
+# Set AAI_DEBUG=1 (or "true"/"yes") in the environment to enable per-step
+# diagnostic logging for all five observation gates.
+# Example: AAI_DEBUG=1 python run.py
+DEBUG: bool = os.getenv("AAI_DEBUG", "").lower() in ("1", "true", "yes")
+# Path for debug output file. Defaults to debug.log in the working directory.
+# Override with: AAI_DEBUG_LOG=/path/to/file.log AAI_DEBUG=1 python run.py
+_DEBUG_LOG_PATH: str = os.getenv("AAI_DEBUG_LOG", "debug.log")
+
+
+def _dbg(msg: str) -> None:
+    """Append a debug line to the debug log file (line-buffered)."""
+    with open(_DEBUG_LOG_PATH, "a", buffering=1) as _f:
+        _f.write(msg + "\n")
+
 from core.adapters.animalai.action_mapper import get_policy_descriptors, policy_id_to_action
 from core.adapters.animalai.homeostatic_wrapper import HomeostaticWrapper
-from core.adapters.animalai.observation_mapper import _PositionTracker, _extract_local_speed, _extract_world_pos, _parse_raycasts, map_obs
+from core.adapters.animalai.observation_mapper import _PositionTracker, _extract_local_speed, _extract_unity_health, _extract_world_pos, _parse_raycasts, map_obs
 from core.adapters.base import AbstractEnvironmentAdapter
 from core.models.signals import DriveChannel
 from core.models.state import AgentState
 
 log = logging.getLogger(__name__)
 
-# Actions that command translational movement — used for stuck detection
-_MOVEMENT_ACTIONS = {"move_forward", "move_backward"}
 
 _DRIVE_CHANNELS = [
     DriveChannel(
@@ -128,6 +141,11 @@ class AnimalAIAdapter(AbstractEnvironmentAdapter):
         # One-shot obs shape diagnostic — logged on first step to verify raycast presence
         self._obs_shapes_logged: bool = False
 
+        # Previous step's world position (x, z) for position-delta motor efficiency.
+        # None until first obs arrives.
+        self._prev_wx: Optional[float] = None
+        self._prev_wz: Optional[float] = None
+
     # ------------------------------------------------------------------
     # AbstractEnvironmentAdapter interface
     # ------------------------------------------------------------------
@@ -138,9 +156,28 @@ class AnimalAIAdapter(AbstractEnvironmentAdapter):
         self._homeostatic.reset()
         self._position_tracker.reset()
         self._stuck_adapter_count = 0
+        self._prev_wx = None
+        self._prev_wz = None
 
         env = self._get_or_create_env()
         env.reset()
+
+        if DEBUG:
+            _dbg(f"\n[DBG RESET] Behavior: {self._behavior_name}")
+            try:
+                spec = self._env.behavior_specs[self._behavior_name]
+                _dbg(f"  action_spec:  {spec.action_spec}")
+                _dbg(f"  obs_specs:    {spec.observation_specs}")
+            except Exception as _e:
+                _dbg(f"  (could not read behavior_specs: {_e})")
+            _dbg(f"  velocity_dt={self._velocity_dt:.4f}s  "
+                  f"expected_speed={self._expected_speed:.4f} Unity units/s")
+            _dbg(f"  (if motor_efficiency always=0, expected_speed may be miscalibrated — "
+                  f"divide one observed raw_fwd by {self._expected_speed:.3f} to diagnose)")
+            sim_cfg = self._config.get("simulation", {})
+            arena_size = float(sim_cfg.get("arena_size", 30.0))
+            _dbg(f"  arena_size={arena_size}  (positions should be in [0, {arena_size}])")
+
         obs, info = self._get_obs()
         state = map_obs(obs, info, self._homeostatic, self._step_count, self._position_tracker)
         return state
@@ -172,25 +209,89 @@ class AnimalAIAdapter(AbstractEnvironmentAdapter):
         # _get_obs() already populated info["local_speed_forward"] from _extract_local_speed().
         raw_fwd = float(info.get("local_speed_forward", 0.0))
 
+        if DEBUG:
+            wx_dbg = info.get("x", 0.0)
+            wy_dbg = info.get("y", 0.0)
+            wz_dbg = info.get("z", 0.0)
+            rc_dbg = info.get("raycast_hits") or {}
+            rr_dbg = info.get("raw_reward", 0.0)
+            _arena = float(self._config.get("simulation", {}).get("arena_size", 30.0))
+            _dbg(f"[DBG STEP {self._step_count}] parsers →")
+            _dbg(f"  speed:    fwd={raw_fwd:.4f}  "
+                  f"right={info.get('local_speed_right', 0.0):.4f}  "
+                  f"up={info.get('local_speed_up', 0.0):.4f}  "
+                  f"({'non-zero' if raw_fwd != 0 else 'ALWAYS 0 = motor broken'})")
+            _dbg(f"  world_pos: x={wx_dbg:.3f} y={wy_dbg:.3f} z={wz_dbg:.3f}  "
+                  f"({'in_arena' if 0 < wx_dbg < _arena and 0 < wz_dbg < _arena else 'OUT OF ARENA — garbage?'})")
+            _dbg(f"  raycast:  hit_tag={rc_dbg.get('hit_tag')!r} "
+                  f"distance={rc_dbg.get('distance', 1.0):.4f}  "
+                  f"({'no-hit sentinel' if rc_dbg.get('hit_tag') is None and rc_dbg.get('distance', 1.0) == 1.0 else 'hit detected'})")
+            if raw_fwd == 0.0 and action_id in ("move_forward", "move_backward"):
+                _dbg(f"  *** WARN: movement action sent but speed=0 — "
+                      f"proprioceptive obs missing or wrong index")
+            if not (0 < wx_dbg < _arena):
+                _dbg(f"  *** WARN: world_pos.x={wx_dbg:.3f} out of arena — "
+                      f"_extract_world_pos reading wrong array indices")
+            if rc_dbg.get("hit_tag") is None and rc_dbg.get("distance", 1.0) == 1.0:
+                _dbg(f"  *** WARN: raycast always returning no-hit sentinel — "
+                      f"_parse_raycasts format mismatch (check n=7 path)")
+            _dbg(f"  raw_reward={rr_dbg:.6f}  env_done={info.get('env_done', False)}")
+
+        # Motor efficiency from consecutive world-position delta.
+        # Using position rather than speed avoids the 2.8× inflation from Unity's
+        # velocity magnitude including vertical bounce. Position delta over one step
+        # divided by expected step size gives exactly the fraction of intended
+        # displacement achieved: ~1.0 at full speed, ~0.0 at wall contact.
+        curr_wx = float(info.get("x", 0.0))
+        curr_wz = float(info.get("z", 0.0))
+
         if action_id in ("turn_left", "turn_right", "idle"):
             motor_efficiency = 1.0
             position_delta_norm = 0.0
+            self._stuck_adapter_count = 0
         else:
-            motor_efficiency = float(min(max(raw_fwd / max(self._expected_speed, 1e-6), 0.0), 1.0))
+            if self._prev_wx is not None and self._prev_wz is not None:
+                dx = curr_wx - self._prev_wx
+                dz = curr_wz - self._prev_wz
+                actual_disp = float(np.sqrt(dx * dx + dz * dz))
+                motor_efficiency = float(min(1.0, actual_disp / max(self._step_size, 1e-6)))
+            else:
+                # No prior position yet (first step after reset) — assume full movement.
+                motor_efficiency = 1.0
             position_delta_norm = motor_efficiency
+
+            if motor_efficiency < 0.3:
+                self._stuck_adapter_count += 1
+            else:
+                self._stuck_adapter_count = 0
+
+        self._prev_wx = curr_wx
+        self._prev_wz = curr_wz
 
         info["motor_efficiency"] = motor_efficiency
         # position_delta_norm: fraction of expected displacement achieved this step.
         # Used by PredictionErrorCalculator for the motor PE (efference copy channel).
         info["position_delta_norm"] = position_delta_norm
 
-        # Stuck detection: low motor efficiency during a movement action.
-        if action_id in _MOVEMENT_ACTIONS and motor_efficiency < 0.3:
-            self._stuck_adapter_count += 1
-        else:
-            self._stuck_adapter_count = 0
         motor_stuck = self._stuck_adapter_count >= self._stuck_adapter_threshold
         info["motor_stuck"] = motor_stuck
+        info["stuck_steps"] = self._stuck_adapter_count
+
+        if DEBUG:
+            _dbg(f"[DBG STEP {self._step_count}] motor signals →")
+            _dbg(f"  action={action_id!r}  raw_fwd={raw_fwd:.4f}  "
+                  f"expected_speed={self._expected_speed:.4f}  "
+                  f"motor_efficiency={motor_efficiency:.4f}  "
+                  f"position_delta_norm={position_delta_norm:.4f}  "
+                  f"stuck_count={self._stuck_adapter_count}  motor_stuck={motor_stuck}")
+            if action_id == "move_forward" and motor_efficiency == 0.0:
+                _dbg(f"  *** WARN: motor_efficiency=0 on move_forward — "
+                      f"expected_speed={self._expected_speed:.3f} but raw_fwd={raw_fwd:.4f}. "
+                      f"Check _velocity_dt={self._velocity_dt:.4f}s and "
+                      f"step_size={self._step_size} (stuck_count={self._stuck_adapter_count})")
+            if action_id in ("turn_left", "turn_right"):
+                _dbg(f"  heading: {self._heading:.1f}°  "
+                      f"(should have changed by ±{self._turn_angle_deg}°)")
 
         # Scale to arena units/step for position dead-reckoning.
         info["local_speed_forward"] = raw_fwd * self._velocity_dt
@@ -198,7 +299,45 @@ class AnimalAIAdapter(AbstractEnvironmentAdapter):
 
         self._homeostatic.step(raw_reward, env_done)
 
+        # Sync HomeostaticWrapper health from Unity's ground-truth obs (index 0).
+        # Unity is authoritative — it tracks food collection and hazard penalties
+        # directly. The wrapper's simulated depletion diverges within a few steps.
+        # Use the raw obs_list (threaded through info) rather than the extracted
+        # visual array — _extract_unity_health needs a list of 1D sensor arrays.
+        _raw_obs_list = info.pop("_obs_list", [])
+        unity_health = _extract_unity_health(_raw_obs_list)
+        if unity_health is not None:
+            self._homeostatic.sync_health(unity_health)
+
         state = map_obs(obs, info, self._homeostatic, self._step_count, self._position_tracker)
+
+        if DEBUG:
+            h = state.homeostasis
+            pos = state.position
+            perc = state.perception
+            res = state.resources
+            _dbg(f"[DBG STEP {self._step_count}] AgentState →")
+            _dbg(f"  homeostasis: health={h.health:.4f} sat={h.saturation:.4f} "
+                  f"energy={h.energy:.4f} alive={h.is_alive}")
+            _dbg(f"  position:    x={pos.x:.3f} z={pos.z:.3f} "
+                  f"heading={pos.heading:.1f}°  vx={pos.velocity_x:.4f}")
+            _dbg(f"  perception:  area_id={perc.area_id}  "
+                  f"terrain_novelty={perc.terrain_novelty:.4f}  "
+                  f"entity_density={perc.entity_density:.4f}")
+            rc_s = perc.raycast_hits
+            if rc_s:
+                _dbg(f"  raycast_hits: tag={rc_s[0].get('hit_tag')!r}  "
+                      f"dist={rc_s[0].get('distance', 1.0):.4f}")
+            else:
+                _dbg(f"  raycast_hits: None  *** WARN: no raycast in state")
+            _dbg(f"  resources:   resource_level={res.resource_level:.4f}  "
+                  f"threat_proximity={res.threat_proximity:.4f}")
+            vf = perc.visual_features or []
+            if vf:
+                all_zero = all(v == 0.0 for v in vf)
+                _dbg(f"  visual_features[0:6]={[round(v, 3) for v in vf[:6]]}  "
+                      f"({'ALL ZERO — visual broken' if all_zero else 'ok'})")
+
         # Termination is homeostatic collapse only.
         # env_done (task object reached) is logged as an event but does not end
         # the episode — the agent continues to act in the environment.
@@ -300,6 +439,9 @@ class AnimalAIAdapter(AbstractEnvironmentAdapter):
             worker_id=self._worker_id,
             base_port=self._base_port,
             additional_args=self._additional_args or None,
+            useRayCasts=True,
+            raysPerSide=3,    # must match m_RaysPerDirection in AAI3Agent.prefab
+            rayMaxDegrees=70, # must match m_MaxRayDegrees in AAI3Agent.prefab
         )
         # Discover behavior name
         specs = env.behavior_specs
@@ -327,6 +469,8 @@ class AnimalAIAdapter(AbstractEnvironmentAdapter):
             obs_list = terminal_steps[agent_id].obs
             raw_reward = float(terminal_steps[agent_id].reward)
             self._log_obs_shapes(obs_list)
+            if DEBUG:
+                self._debug_gate1(obs_list, raw_reward, env_done=True)
             visual_obs = self._extract_visual(obs_list)
             fwd, right, up = _extract_local_speed(obs_list)
             wx, wy, wz = _extract_world_pos(obs_list)
@@ -341,6 +485,7 @@ class AnimalAIAdapter(AbstractEnvironmentAdapter):
                 "y": wy,
                 "z": wz,
                 "raycast_hits": raycast_hits,
+                "_obs_list": obs_list,
             }
 
         if len(decision_steps) == 0:
@@ -350,6 +495,8 @@ class AnimalAIAdapter(AbstractEnvironmentAdapter):
         obs_list = decision_steps[agent_id].obs
         raw_reward = float(decision_steps[agent_id].reward)
         self._log_obs_shapes(obs_list)
+        if DEBUG:
+            self._debug_gate1(obs_list, raw_reward, env_done=False)
         visual_obs = self._extract_visual(obs_list)
         fwd, right, up = _extract_local_speed(obs_list)
         wx, wy, wz = _extract_world_pos(obs_list)
@@ -364,7 +511,23 @@ class AnimalAIAdapter(AbstractEnvironmentAdapter):
             "y": wy,
             "z": wz,
             "raycast_hits": raycast_hits,
+            "_obs_list": obs_list,
         }
+
+    def _debug_gate1(self, obs_list: List[Any], raw_reward: float, env_done: bool) -> None:
+        """Gate 1: Print raw obs_list contents received from Unity this step."""
+        step = self._step_count
+        _dbg(f"\n[DBG STEP {step}] obs_list has {len(obs_list)} arrays")
+        for i, obs in enumerate(obs_list):
+            arr = np.asarray(obs)
+            _dbg(f"  obs[{i}]: shape={arr.shape} dtype={arr.dtype} "
+                  f"min={arr.min():.4f} max={arr.max():.4f} mean={arr.mean():.4f}")
+            if arr.ndim == 1 and len(arr) <= 20:
+                _dbg(f"    values: {arr.round(4).tolist()}")
+            elif arr.ndim == 3:
+                _dbg(f"    visual: H={arr.shape[0]} W={arr.shape[1]} C={arr.shape[2]}  "
+                      f"normalized={'yes' if arr.max() <= 1.0 else 'no'}")
+        _dbg(f"  raw_reward={raw_reward:.6f}  env_done={env_done}")
 
     def _log_obs_shapes(self, obs_list: List[Any]) -> None:
         """Log obs_list shapes once on the first step to confirm raycast presence."""
@@ -373,7 +536,6 @@ class AnimalAIAdapter(AbstractEnvironmentAdapter):
         self._obs_shapes_logged = True
         shapes = [np.asarray(o).shape for o in obs_list if hasattr(o, '__len__')]
         log.info("obs_list shapes (step 1): %s", shapes)
-        print(f"[AnimalAI] obs_list shapes: {shapes}")
 
     def _extract_visual(self, obs_list: List[Any]) -> Optional[np.ndarray]:
         """Extract the first visual observation from the observation list."""

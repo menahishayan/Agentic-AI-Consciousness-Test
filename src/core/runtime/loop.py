@@ -18,15 +18,26 @@ Brain layers access the adapter ONLY through this controlled interface.
 from __future__ import annotations
 
 import logging
+import os
 import time
 from typing import Any, Callable, Dict, List, Optional
+
+# Set AAI_DEBUG=1 to enable per-step signal diagnostics (Gate 5).
+DEBUG: bool = os.getenv("AAI_DEBUG", "").lower() in ("1", "true", "yes")
+_DEBUG_LOG_PATH: str = os.getenv("AAI_DEBUG_LOG", "debug.log")
+
+
+def _dbg(msg: str) -> None:
+    """Append a debug line to the debug log file (line-buffered)."""
+    with open(_DEBUG_LOG_PATH, "a", buffering=1) as _f:
+        _f.write(msg + "\n")
 
 from core.adapters.base import AbstractEnvironmentAdapter
 from core.coordination.messages import AgentMessage
 from core.coordination.workspace import GlobalWorkspace
 from core.layers.action_selection.FreeEnergyMinimizer import FreeEnergyMinimizer
 from core.layers.action_selection.MotorControlInterface import MotorControlInterface
-from core.layers.action_selection.PolicyGenerator import PolicyGenerator
+from core.layers.action_selection.PolicyGenerator import PolicyGenerator, _affect_label
 from core.layers.interoceptive.AllostaticController import AllostaticController
 from core.layers.interoceptive.ArousalValenceSystem import ArousalValenceSystem
 from core.layers.interoceptive.VitalStateMonitor import VitalStateMonitor
@@ -117,6 +128,10 @@ class AgentLoop:
         self._step: int = 0
         # Rolling action history for LLM context (last 10 actions)
         self._recent_actions: List[str] = []
+        # Previous step's arousal — passed to PEC so LC-NE precision scaling uses
+        # the arousal that was current when the action was taken, not the one computed
+        # from its outcome (which isn't available yet at PEC call time).
+        self._last_arousal: float = 0.0
 
     # ------------------------------------------------------------------
     # Public API
@@ -213,6 +228,7 @@ class AgentLoop:
             workspace=self._workspace,
             step=step,
             area_familiarity=familiarity,
+            arousal=self._last_arousal,
         )
 
         # --- Layer 1 continued: Arousal/Valence ---
@@ -222,16 +238,46 @@ class AgentLoop:
             pe_batch=pe_batch,
             workspace=self._workspace,
             step=step,
+            raycast_hits=state.perception.raycast_hits,
         )
+
+        if DEBUG:
+            _motor_pe_dbg = 0.0
+            if pe_batch:
+                for _e in pe_batch.errors:
+                    if _e.channel == "motor":
+                        _motor_pe_dbg = float(_e.magnitude)
+                        break
+            _dbg(f"[DBG STEP {step}] signals →")
+            _dbg(f"  arousal={av.arousal:.4f}  valence={av.valence:.4f}  "
+                  f"lr_mod={av.learning_rate_mod:.4f}")
+            _dbg(f"  drive_urgency max={drive_batch.max_urgency:.4f}  "
+                  f"dominant={drive_batch.dominant_channel}")
+            for _s in drive_batch.signals:
+                _dbg(f"    {_s.channel_id}: val={_s.current_value:.4f}  "
+                      f"urgency={_s.urgency:.4f}")
+            if pe_batch:
+                _dbg(f"  PE mean={pe_batch.mean_magnitude:.4f}  "
+                      f"max={pe_batch.max_magnitude:.4f}")
+                _me = next((e for e in pe_batch.errors if e.channel == "motor"), None)
+                if _me:
+                    _warn = "  *** always 1.0 = motor_efficiency broken" if _me.magnitude > 0.9 else ""
+                    _dbg(f"  PE motor: expected={_me.expected:.3f}  "
+                          f"observed={_me.observed:.3f}  "
+                          f"magnitude={_me.magnitude:.4f}{_warn}")
+            _dbg(f"  lc_ne_motor_pe_contribution≈{min(_motor_pe_dbg, 1.0) * 0.4:.4f}  "
+                  f"(should be ~0 in open space, ~0.4 at wall)")
 
         # --- Layer 4: Metacognitive ---
         context = self._metacognitive.update(self._workspace, [], step)
         context["policies"] = self._policies
         context["heading"] = state.position.heading or 0.0
         context["motor_efficiency"] = float(state.raw_metadata.get("motor_efficiency", 1.0))
+        context["stuck_steps"] = int(state.raw_metadata.get("stuck_steps", 0))
         # Affect state — used by PolicyGenerator arousal-diversity fallback
         context["arousal"] = av.arousal
         context["valence"] = av.valence
+        self._last_arousal = av.arousal   # carried into next step's PEC precision
         # Last action — excluded from candidates when arousal is high
         context["last_action"] = self._last_policy_id
         # Rolling history for LLM prompt — lets the model detect repetition
@@ -309,7 +355,16 @@ class AgentLoop:
         next_urgency = self._allostatic.peek_max_urgency(next_vitals)
         relief = prev_urgency - next_urgency
         relief_score = max(0.0, min(1.0, 0.5 + relief * 5.0))
-        motor_eff = float(next_state.raw_metadata.get("motor_efficiency", 1.0))
+
+        # Homeostatic delta: direct physiological improvement this step.
+        # Replaces motor_eff * 0.3, which was always 0.0 when the proprioceptive
+        # obs wasn't available and added no signal. A positive health+saturation
+        # delta is the ground-truth consequence of successful foraging.
+        prev_health = float(prev_state.homeostasis.health or 0.0)
+        prev_sat = float(prev_state.homeostasis.saturation or 0.0)
+        next_health = float(next_state.homeostasis.health or 0.0)
+        next_sat = float(next_state.homeostasis.saturation or 0.0)
+        homeo_delta = max(0.0, (next_health - prev_health) + (next_sat - prev_sat))
 
         # Exteroceptive component: did food distance change as the world model expected?
         # Only computed when move_forward was executed with food visible.
@@ -331,7 +386,7 @@ class AgentLoop:
                     )
                     extero_match = max(0.0, min(1.0, 1.0 - abs(expected_delta - actual_delta)))
 
-        outcome_score = float(max(0.0, min(1.0, relief_score * 0.5 + motor_eff * 0.3 + extero_match * 0.2)))
+        outcome_score = float(max(0.0, min(1.0, relief_score * 0.5 + homeo_delta * 0.3 + extero_match * 0.2)))
 
         # Situation note for episodic memory — encodes perceptual context + causal
         # consequence so the LLM can read "GoodGoal at 1.32, health_delta=+0.300" and
@@ -368,6 +423,11 @@ class AgentLoop:
 
         # --- Structured metrics logging ---
         step_ms = (time.monotonic() - t_step_start) * 1000.0
+        _rc = next_state.perception.raycast_hits
+        _food_vis = bool(_rc and _rc[0].get("hit_tag") in ("GoodGoal", "GoodGoalMulti"))
+        affect_state = _affect_label(
+            av.arousal, av.valence, drive_batch.dominant_channel, _food_vis
+        )
         self._logger.metrics(
             step=step,
             health=next_state.homeostasis.health or 0.0,
@@ -383,6 +443,7 @@ class AgentLoop:
                 "dominant_channel": drive_batch.dominant_channel,
                 "area_id": area_id,
                 "outcome_score": outcome_score,
+                "affect_state": affect_state,
             },
         )
 

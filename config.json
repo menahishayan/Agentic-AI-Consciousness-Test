@@ -2,8 +2,8 @@
   "adapter_folder": "animalai",
   "adapter_config": {
     "homeostatic": {
-      "health_depletion_rate": 0.0015,
-      "saturation_depletion_rate": 0.0015,
+      "health_depletion_rate": 0.002,
+      "saturation_depletion_rate": 0.002,
       "food_health_restore": 0.3,
       "food_saturation_restore": 0.5,
       "hazard_health_penalty": 0.2,
@@ -35,11 +35,11 @@
   "llm": {
     "enabled": true,
     "provider": "ollama",
-    "model": "gemma3:4b",
+    "model": "gemma3:1b",
     "base_url": "http://localhost:11434/v1",
     "temperature": 0.1,
     "max_tokens": 500,
-    "timeout_s": 10.0
+    "timeout_s": 2.0
   },
   "policy_generator": {
     "llm_conflict_threshold": 0.8,
@@ -53,7 +53,9 @@
     "weights": {
       "allostatic_urgency": 0.50,
       "epistemic_gain": 0.35,
-      "motor_cost": 0.15
+      "motor_cost": 0.15,
+      "idle_urgency_penalty": 2.0,
+      "food_proximity_bonus": 0.6
     }
   },
   "allostatic_controller": {
@@ -78,16 +80,15 @@
     "min_precision": 0.3
   },
   "arousal_valence": {
-    "w_health": 0.35,
-    "w_saturation": 0.25,
     "w_threat": 0.30,
-    "w_pred_err": 0.10,
+    "w_pred_err": 0.35,
+    "w_threat_roc": 0.20,
+    "w_food_pe": 0.40,
     "lc_ne_gain": 0.40,
-    "v_health": 0.30,
-    "v_saturation": 0.25,
-    "v_resource": 0.20,
-    "v_safety": 0.25,
-    "v_motor_pe": 0.15
+    "rpe_scale": 3.0,
+    "anticipation_weight": 0.4,
+    "threat_hit_threshold": 0.3,
+    "threat_hit_weight": 0.5
   },
   "memory": {
     "working_memory_capacity": 100,

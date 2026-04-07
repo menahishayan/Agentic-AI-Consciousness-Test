@@ -16,6 +16,8 @@ from __future__ import annotations
 
 from typing import Any, Dict
 
+import numpy as np
+
 
 class HomeostaticWrapper:
     """
@@ -77,6 +79,21 @@ class HomeostaticWrapper:
             # Hazard / penalty — health drops proportional to negative reward
             penalty_scale = min(abs(raw_reward), 1.0)
             self._health = max(0.0, self._health - penalty_scale * self.hazard_health_penalty)
+
+    def sync_health(self, unity_health: float) -> None:
+        """
+        Override simulated health with Unity's ground-truth value.
+
+        Unity tracks health independently and is authoritative — food collection
+        events, hazard penalties, and engine-side death conditions all modify it.
+        HomeostaticWrapper's own depletion model diverges from Unity within a few
+        steps, causing the architecture to feel hunger that doesn't match reality.
+
+        Call after step() so the simulated depletion for the current step is
+        immediately corrected by the observed Unity value.
+        Saturation remains simulated (Unity doesn't expose it).
+        """
+        self._health = float(np.clip(unity_health, 0.0, 1.0))
 
     def get_state(self) -> Dict[str, float]:
         """

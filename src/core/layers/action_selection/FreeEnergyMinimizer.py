@@ -70,6 +70,15 @@ class FreeEnergyMinimizer:
         self._w_pragmatic  = float(weights.get("allostatic_urgency", 0.50))
         self._w_epistemic  = float(weights.get("epistemic_gain",     0.35))
         self._w_motor_cost = float(weights.get("motor_cost",         0.15))
+        # Idle urgency penalty: reduces idle EFE proportional to drive urgency so
+        # that "do nothing" cannot score near 1.0 while drives are actively depleting.
+        # At urgency=0.20 with penalty=2.0: idle drops from 0.80 → 0.40.
+        self._idle_urgency_penalty: float = float(weights.get("idle_urgency_penalty", 2.0))
+        # Absolute food-proximity bonus for move_forward when food is directly ahead.
+        # Independent of urgency level — food in view has intrinsic EFE value even
+        # when drives are only moderately depleted. Complements the urgency-scaled
+        # pragmatic boost already present.
+        self._food_proximity_bonus: float = float(weights.get("food_proximity_bonus", 0.6))
         # Consecutive steps with motor_eff < 0.3 — penalty only fires after 2+
         # to avoid suppressing move_forward on the first stale proprioceptive obs.
         self._motor_fail_streak: int = 0
@@ -102,6 +111,15 @@ class FreeEnergyMinimizer:
         max_urgency = drive_batch.max_urgency if drive_batch else 0.0
         pe_mean = pe_batch.mean_magnitude if pe_batch else 0.0
 
+        # Valence precision scaler on the pragmatic term.
+        # Negative valence (threat/deprivation) → drive relief is more valuable → amplify.
+        # Positive valence (satiated/safe) → epistemic foraging can dominate → suppress.
+        # Scale is centered at 1.0 and moves ±0.3 across the [-1, 1] valence range:
+        #   valence=-1.0 → ×1.3  |  valence=0.0 → ×1.0  |  valence=+1.0 → ×0.7
+        # Seth (2021): valence modulates the precision of interoceptive predictions.
+        valence = float(context.get("valence", 0.0)) if context else 0.0
+        valence_precision = max(0.7, min(1.3, 1.0 - 0.3 * valence))
+
         # Motor failure penalty: if the last action failed (efficiency < 0.3),
         # scale its EFE to discourage repeating a blocked action.
         motor_eff = float(context.get("motor_efficiency", 1.0)) if context else 1.0
@@ -126,8 +144,12 @@ class FreeEnergyMinimizer:
 
             if pid == "idle":
                 # Allostatic equilibrium: rest is appropriate when quiet and unsurprised.
-                # The agent rests only when it has nothing to resolve.
+                # The base score decays as urgency/PE rise. The additional urgency
+                # penalty ensures idle cannot hold near 1.0 while drives are actively
+                # depleting — without it, idle outscores all movement actions until
+                # urgency exceeds ~0.5, which is too late given slow depletion rates.
                 score = 1.0 - max(max_urgency, pe_mean)
+                score -= max(0.0, max_urgency) * self._idle_urgency_penalty
                 scores[pid] = float(max(0.0, min(1.0, score)))
                 continue
 
@@ -160,10 +182,21 @@ class FreeEnergyMinimizer:
             motor_cost = _MOTOR_COST.get(pid, 0.2)
 
             combined = (
-                pragmatic * self._w_pragmatic
+                pragmatic * self._w_pragmatic * valence_precision
                 + epistemic * self._w_epistemic
                 - motor_cost * self._w_motor_cost
             )
+
+            # Absolute food-proximity bonus for move_forward when food is directly ahead.
+            # The urgency-scaled pragmatic boost above is already present; this term
+            # adds intrinsic EFE value for approaching visible food independent of
+            # current urgency — critical when drives are only moderately depleted but
+            # food is in view (without this, idle outscores move_forward until ~urgency=0.4).
+            if pid == "move_forward" and context:
+                _rc = (context.get("raycast_hits") or [{}])[0]
+                if _rc.get("hit_tag") in ("GoodGoal", "GoodGoalMulti"):
+                    _prox = 1.0 - float(_rc.get("distance", 1.0))
+                    combined += _prox * self._food_proximity_bonus
 
             # Motor failure penalty: soften EFE of the last action if it was blocked
             # for at least 2 consecutive steps (streak guard stops spurious first-obs firing).
