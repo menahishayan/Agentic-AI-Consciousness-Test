@@ -116,16 +116,12 @@ _RAY_SENSOR_TAG_REMAP: Dict[int, Optional[str]] = {
     # After rebuild: 13=DecoyGoalBounce, 14=OuterWall (→ "wall")
     14: "wall",         # OuterWall (post-rebuild binary)
 }
-_RAY_SENSOR_TAGS_PER_RAY_LEGACY = 13    # pre-rebuild: 13 tags + 1 fraction = 14 per ray
-_RAY_SENSOR_TAGS_PER_RAY_NEW    = 15    # post-rebuild: 15 tags + 1 fraction = 16 per ray
-_RAY_SENSOR_N_RAYS = 7                  # 2 * raysPerSide(3) + 1 centre
-_RAY_SENSOR_LEN_LEGACY = _RAY_SENSOR_N_RAYS * (_RAY_SENSOR_TAGS_PER_RAY_LEGACY + 1)  # 98
-_RAY_SENSOR_LEN_NEW    = _RAY_SENSOR_N_RAYS * (_RAY_SENSOR_TAGS_PER_RAY_NEW    + 1)  # 112
-
-# Ray angles for AlternatingRayOrder=1, raysPerSide=3, maxDegrees=70.
-# Order: center, +23.3°, -23.3°, +46.6°, -46.6°, +70°, -70°.
-# Positive = right of forward, negative = left of forward.
-_RAY_ANGLES_DEG: List[float] = [0.0, 23.3, -23.3, 46.6, -46.6, 70.0, -70.0]
+_RAY_SENSOR_TAGS_PER_RAY_LEGACY = 13    # pre-rebuild binary: 13 tags + 1 fraction = 14/ray, 7 rays = 98
+_RAY_SENSOR_TAGS_PER_RAY_NEW    = 15    # post-rebuild binary: 15 tags + 1 fraction = 16/ray, 9 rays = 144
+_RAY_SENSOR_N_RAYS_LEGACY = 7           # pre-rebuild: 2 * raysPerSide(3) + 1 centre
+_RAY_SENSOR_N_RAYS_NEW    = 9           # post-rebuild: 2 * raysPerSide(4) + 1 centre
+_RAY_SENSOR_LEN_LEGACY = _RAY_SENSOR_N_RAYS_LEGACY * (_RAY_SENSOR_TAGS_PER_RAY_LEGACY + 1)  # 98
+_RAY_SENSOR_LEN_NEW    = _RAY_SENSOR_N_RAYS_NEW    * (_RAY_SENSOR_TAGS_PER_RAY_NEW    + 1)  # 144
 
 
 def map_obs(
@@ -373,20 +369,20 @@ def _parse_raycasts(obs_list: List[Any]) -> List[Dict[str, Any]]:
     Extract all ray hits from obs_list. Returns a list of dicts:
       [{"hit_tag": str|None, "distance": float, "angle_deg": float}, ...]
 
-    Ray ordering follows AlternatingRayOrder=1 (center-first):
-      index 0 = 0° (forward), 1 = +23.3°, 2 = -23.3°, 3 = +46.6°,
-      4 = -46.6°, 5 = +70°, 6 = -70°
-    Positive angle = right of forward, negative = left of forward.
+    Ray ordering follows AlternatingRayOrder=1 (center-first).
+    Pre-rebuild (7 rays, raysPerSide=3, maxDeg=70):
+      0=0°, 1=+23.3°, 2=-23.3°, 3=+46.6°, 4=-46.6°, 5=+70°, 6=-70°
+    Post-rebuild (9 rays, raysPerSide=4, maxDeg=80):
+      0=0°, 1=+20°, 2=-20°, 3=+40°, 4=-40°, 5=+60°, 6=-60°, 7=+80°, 8=-80°
 
-    Handles three obs formats:
+    Handles two obs formats:
       Post-rebuild 10-float vector obs: encodes only the forward ray → 1 entry.
-      Compact 7-float single-ray obs:   forward ray only → 1 entry.
-      Full 7-ray array (98 or 112 floats): all 7 rays → 7 entries.
+      Full ray array (98 legacy / 144 post-rebuild floats): all rays decoded.
 
     Returns the no-hit sentinel list when no matching array is found.
     """
-    _sentinel = [{"hit_tag": None, "distance": 1.0, "angle_deg": a}
-                 for a in _RAY_ANGLES_DEG]
+    _ANGLES_LEGACY = [0.0, 23.3, -23.3, 46.6, -46.6, 70.0, -70.0]
+    _ANGLES_NEW    = [0.0, 20.0, -20.0, 40.0, -40.0, 60.0, -60.0, 80.0, -80.0]
 
     for obs in obs_list:
         arr = np.asarray(obs, dtype=np.float32)
@@ -400,16 +396,15 @@ def _parse_raycasts(obs_list: List[Any]) -> List[Dict[str, Any]]:
             tag = _RAY_TAG_INDEX_MAP.get(round(float(arr[_AGENT_OBS_RAY_TAG_IDX])), None)
             return [{"hit_tag": tag, "distance": fraction, "angle_deg": 0.0}]
 
-        # Full 7-ray array: parse every ray
+        # Full ray array: parse every ray
         if n in (_RAY_SENSOR_LEN_LEGACY, _RAY_SENSOR_LEN_NEW):
-            n_tags = (
-                _RAY_SENSOR_TAGS_PER_RAY_LEGACY
-                if n == _RAY_SENSOR_LEN_LEGACY
-                else _RAY_SENSOR_TAGS_PER_RAY_NEW
-            )
+            is_legacy = (n == _RAY_SENSOR_LEN_LEGACY)
+            n_tags = _RAY_SENSOR_TAGS_PER_RAY_LEGACY if is_legacy else _RAY_SENSOR_TAGS_PER_RAY_NEW
+            n_rays = _RAY_SENSOR_N_RAYS_LEGACY if is_legacy else _RAY_SENSOR_N_RAYS_NEW
+            angles = _ANGLES_LEGACY if is_legacy else _ANGLES_NEW
             floats_per_ray = n_tags + 1
             rays = []
-            for i in range(_RAY_SENSOR_N_RAYS):
+            for i in range(n_rays):
                 offset = i * floats_per_ray
                 one_hot = arr[offset:offset + n_tags]
                 fraction = float(arr[offset + n_tags])
@@ -418,11 +413,11 @@ def _parse_raycasts(obs_list: List[Any]) -> List[Dict[str, Any]]:
                     _RAY_SENSOR_TAG_REMAP.get(best_idx)
                     if float(one_hot[best_idx]) > 0.15 else None
                 )
-                angle = _RAY_ANGLES_DEG[i] if i < len(_RAY_ANGLES_DEG) else 0.0
-                rays.append({"hit_tag": ray_tag, "distance": fraction, "angle_deg": angle})
+                rays.append({"hit_tag": ray_tag, "distance": fraction,
+                             "angle_deg": angles[i] if i < len(angles) else 0.0})
             return rays
 
-    return _sentinel
+    return [{"hit_tag": None, "distance": 1.0, "angle_deg": 0.0}]
 
 
 def _build_area_id(x: float, z: float) -> str:

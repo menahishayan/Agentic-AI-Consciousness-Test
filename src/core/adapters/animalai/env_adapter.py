@@ -445,8 +445,8 @@ class AnimalAIAdapter(AbstractEnvironmentAdapter):
             base_port=self._base_port,
             additional_args=self._additional_args or None,
             useRayCasts=True,
-            raysPerSide=3,    # must match m_RaysPerDirection in AAI3Agent.prefab
-            rayMaxDegrees=70, # must match m_MaxRayDegrees in AAI3Agent.prefab
+            raysPerSide=4,    # must match m_RaysPerDirection in AAI3Agent.prefab
+            rayMaxDegrees=80, # must match m_MaxRayDegrees in AAI3Agent.prefab
         )
         # Discover behavior name
         specs = env.behavior_specs
