@@ -57,6 +57,10 @@ class RunLogger:
 
         self._write_run_metadata(config)
 
+    @property
+    def run_dir(self) -> Path:
+        return self._dir
+
     # ------------------------------------------------------------------
     # Public logging methods
     # ------------------------------------------------------------------

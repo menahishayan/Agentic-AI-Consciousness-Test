@@ -116,12 +116,18 @@ _RAY_SENSOR_TAG_REMAP: Dict[int, Optional[str]] = {
     # After rebuild: 13=DecoyGoalBounce, 14=OuterWall (→ "wall")
     14: "wall",         # OuterWall (post-rebuild binary)
 }
-_RAY_SENSOR_TAGS_PER_RAY_LEGACY = 13    # pre-rebuild binary: 13 tags + 1 fraction = 14/ray, 7 rays = 98
-_RAY_SENSOR_TAGS_PER_RAY_NEW    = 15    # post-rebuild binary: 15 tags + 1 fraction = 16/ray, 9 rays = 144
-_RAY_SENSOR_N_RAYS_LEGACY = 7           # pre-rebuild: 2 * raysPerSide(3) + 1 centre
-_RAY_SENSOR_N_RAYS_NEW    = 9           # post-rebuild: 2 * raysPerSide(4) + 1 centre
-_RAY_SENSOR_LEN_LEGACY = _RAY_SENSOR_N_RAYS_LEGACY * (_RAY_SENSOR_TAGS_PER_RAY_LEGACY + 1)  # 98
-_RAY_SENSOR_LEN_NEW    = _RAY_SENSOR_N_RAYS_NEW    * (_RAY_SENSOR_TAGS_PER_RAY_NEW    + 1)  # 144
+_RAY_SENSOR_TAGS_PER_RAY_LEGACY = 13    # binary compiled with 13 tags
+_RAY_SENSOR_TAGS_PER_RAY_NEW    = 15    # future binary with 15 tags (OuterWall + DecoyGoalBounce added)
+_RAY_SENSOR_N_RAYS_LEGACY = 7           # raysPerSide=3: 2×3+1
+_RAY_SENSOR_N_RAYS_CURRENT = 9          # raysPerSide=4: 2×4+1 (current rebuild, still 13 compiled tags)
+_RAY_SENSOR_N_RAYS_NEW    = 9           # raysPerSide=4: 2×4+1 (future rebuild with 15 tags)
+_RAY_SENSOR_LEN_LEGACY  = _RAY_SENSOR_N_RAYS_LEGACY  * (_RAY_SENSOR_TAGS_PER_RAY_LEGACY + 1)  # 98
+_RAY_SENSOR_LEN_CURRENT = _RAY_SENSOR_N_RAYS_CURRENT * (_RAY_SENSOR_TAGS_PER_RAY_LEGACY + 1)  # 126
+_RAY_SENSOR_LEN_NEW     = _RAY_SENSOR_N_RAYS_NEW     * (_RAY_SENSOR_TAGS_PER_RAY_NEW    + 1)  # 144
+
+# Ray angles per format (AlternatingRayOrder=1, center-first)
+_RAY_ANGLES_7 = [0.0, 23.3, -23.3, 46.6, -46.6, 70.0, -70.0]   # raysPerSide=3, maxDeg=70
+_RAY_ANGLES_9 = [0.0, 20.0, -20.0, 40.0, -40.0, 60.0, -60.0, 80.0, -80.0]  # raysPerSide=4, maxDeg=80
 
 
 def map_obs(
@@ -397,22 +403,34 @@ def _parse_raycasts(obs_list: List[Any]) -> List[Dict[str, Any]]:
             return [{"hit_tag": tag, "distance": fraction, "angle_deg": 0.0}]
 
         # Full ray array: parse every ray
-        if n in (_RAY_SENSOR_LEN_LEGACY, _RAY_SENSOR_LEN_NEW):
-            is_legacy = (n == _RAY_SENSOR_LEN_LEGACY)
-            n_tags = _RAY_SENSOR_TAGS_PER_RAY_LEGACY if is_legacy else _RAY_SENSOR_TAGS_PER_RAY_NEW
-            n_rays = _RAY_SENSOR_N_RAYS_LEGACY if is_legacy else _RAY_SENSOR_N_RAYS_NEW
-            angles = _ANGLES_LEGACY if is_legacy else _ANGLES_NEW
+        if n in (_RAY_SENSOR_LEN_LEGACY, _RAY_SENSOR_LEN_CURRENT, _RAY_SENSOR_LEN_NEW):
+            is_legacy  = (n == _RAY_SENSOR_LEN_LEGACY)
+            is_current = (n == _RAY_SENSOR_LEN_CURRENT)
+
+            n_tags = (_RAY_SENSOR_TAGS_PER_RAY_LEGACY if (is_legacy or is_current)
+                      else _RAY_SENSOR_TAGS_PER_RAY_NEW)
+            n_rays = (_RAY_SENSOR_N_RAYS_LEGACY if is_legacy else _RAY_SENSOR_N_RAYS_CURRENT)
+            angles = (_RAY_ANGLES_7 if is_legacy else _RAY_ANGLES_9)
+
             floats_per_ray = n_tags + 1
             rays = []
             for i in range(n_rays):
                 offset = i * floats_per_ray
                 one_hot = arr[offset:offset + n_tags]
                 fraction = float(arr[offset + n_tags])
-                best_idx = int(np.argmax(one_hot))
-                ray_tag: Optional[str] = (
-                    _RAY_SENSOR_TAG_REMAP.get(best_idx)
-                    if float(one_hot[best_idx]) > 0.15 else None
-                )
+
+                # Priority-check food indices before falling back to argmax:
+                # indices 3=goodGoal, 4=goodGoalMulti in the 13-tag compiled mapping.
+                ray_tag: Optional[str] = None
+                for fi in (3, 4):
+                    if fi < len(one_hot) and float(one_hot[fi]) > 0.08:
+                        ray_tag = _RAY_SENSOR_TAG_REMAP.get(fi)
+                        break
+                if ray_tag is None:
+                    best_idx = int(np.argmax(one_hot))
+                    ray_tag = (_RAY_SENSOR_TAG_REMAP.get(best_idx)
+                               if float(one_hot[best_idx]) > 0.15 else None)
+
                 rays.append({"hit_tag": ray_tag, "distance": fraction,
                              "angle_deg": angles[i] if i < len(angles) else 0.0})
             return rays

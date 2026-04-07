@@ -24,13 +24,6 @@ from typing import Any, Callable, Dict, List, Optional
 
 # Set AAI_DEBUG=1 to enable per-step signal diagnostics (Gate 5).
 DEBUG: bool = os.getenv("AAI_DEBUG", "").lower() in ("1", "true", "yes")
-_DEBUG_LOG_PATH: str = os.getenv("AAI_DEBUG_LOG", "debug.log")
-
-
-def _dbg(msg: str) -> None:
-    """Append a debug line to the debug log file (line-buffered)."""
-    with open(_DEBUG_LOG_PATH, "a", buffering=1) as _f:
-        _f.write(msg + "\n")
 
 from core.adapters.base import AbstractEnvironmentAdapter
 from core.coordination.messages import AgentMessage
@@ -73,6 +66,11 @@ class AgentLoop:
         self._llm = llm_client
         self._logger = logger
         self._config = config
+
+        # Debug log: written to the run directory so each run gets its own file.
+        # Falls back to "debug.log" in cwd if run_dir is unavailable.
+        _debug_path = str(logger.run_dir / "debug.log") if hasattr(logger, "run_dir") else "debug.log"
+        self._debug_log_path: str = _debug_path
 
         # Workspace — cleared at top of each step
         self._workspace = GlobalWorkspace()
@@ -132,6 +130,11 @@ class AgentLoop:
         # the arousal that was current when the action was taken, not the one computed
         # from its outcome (which isn't available yet at PEC call time).
         self._last_arousal: float = 0.0
+
+    def _dbg(self, msg: str) -> None:
+        """Append a debug line to this run's debug.log (line-buffered)."""
+        with open(self._debug_log_path, "a", buffering=1) as _f:
+            _f.write(msg + "\n")
 
     # ------------------------------------------------------------------
     # Public API
@@ -248,24 +251,24 @@ class AgentLoop:
                     if _e.channel == "motor":
                         _motor_pe_dbg = float(_e.magnitude)
                         break
-            _dbg(f"[DBG STEP {step}] signals →")
-            _dbg(f"  arousal={av.arousal:.4f}  valence={av.valence:.4f}  "
+            self._dbg(f"[DBG STEP {step}] signals →")
+            self._dbg(f"  arousal={av.arousal:.4f}  valence={av.valence:.4f}  "
                   f"lr_mod={av.learning_rate_mod:.4f}")
-            _dbg(f"  drive_urgency max={drive_batch.max_urgency:.4f}  "
+            self._dbg(f"  drive_urgency max={drive_batch.max_urgency:.4f}  "
                   f"dominant={drive_batch.dominant_channel}")
             for _s in drive_batch.signals:
-                _dbg(f"    {_s.channel_id}: val={_s.current_value:.4f}  "
+                self._dbg(f"    {_s.channel_id}: val={_s.current_value:.4f}  "
                       f"urgency={_s.urgency:.4f}")
             if pe_batch:
-                _dbg(f"  PE mean={pe_batch.mean_magnitude:.4f}  "
+                self._dbg(f"  PE mean={pe_batch.mean_magnitude:.4f}  "
                       f"max={pe_batch.max_magnitude:.4f}")
                 _me = next((e for e in pe_batch.errors if e.channel == "motor"), None)
                 if _me:
                     _warn = "  *** always 1.0 = motor_efficiency broken" if _me.magnitude > 0.9 else ""
-                    _dbg(f"  PE motor: expected={_me.expected:.3f}  "
+                    self._dbg(f"  PE motor: expected={_me.expected:.3f}  "
                           f"observed={_me.observed:.3f}  "
                           f"magnitude={_me.magnitude:.4f}{_warn}")
-            _dbg(f"  lc_ne_motor_pe_contribution≈{min(_motor_pe_dbg, 1.0) * 0.4:.4f}  "
+            self._dbg(f"  lc_ne_motor_pe_contribution≈{min(_motor_pe_dbg, 1.0) * 0.4:.4f}  "
                   f"(should be ~0 in open space, ~0.4 at wall)")
 
         # --- Layer 4: Metacognitive ---

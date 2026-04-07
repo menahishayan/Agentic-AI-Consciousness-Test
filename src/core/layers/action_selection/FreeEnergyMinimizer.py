@@ -160,7 +160,8 @@ class FreeEnergyMinimizer:
                 # This caps idle at 0.5 whenever the area is novel, making epistemic
                 # turns competitive at allostatic equilibrium without needing urgency.
                 allostatic_sat = 1.0 - max_urgency
-                epistemic_sat  = 1.0 - area_novelty
+                effective_novelty = max(0.15, area_novelty)  # floor: idle never fully wins
+                epistemic_sat  = 1.0 - effective_novelty
                 score = allostatic_sat * epistemic_sat
                 score -= max(0.0, max_urgency) * self._idle_urgency_penalty
                 scores[pid] = float(max(0.0, min(1.0, score)))
