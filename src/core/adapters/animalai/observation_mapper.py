@@ -127,12 +127,6 @@ _RAY_SENSOR_LEN_NEW    = _RAY_SENSOR_N_RAYS * (_RAY_SENSOR_TAGS_PER_RAY_NEW    +
 # Positive = right of forward, negative = left of forward.
 _RAY_ANGLES_DEG: List[float] = [0.0, 23.3, -23.3, 46.6, -46.6, 70.0, -70.0]
 
-# Compact single-ray format from current binary: 1 ray × (6 one-hot tags + 1 hit_fraction).
-# Tag order matches the first 6 entries of _RAY_SENSOR_TAG_REMAP:
-#   0=arena, 1=Immovable(wall), 2=Movable, 3=GoodGoal, 4=GoodGoalMulti, 5=BadGoal
-_RAY_SENSOR_LEN_COMPACT          = 7
-_RAY_SENSOR_TAGS_PER_RAY_COMPACT = 6
-
 
 def map_obs(
     visual_obs: Optional[np.ndarray],
@@ -406,17 +400,6 @@ def _parse_raycasts(obs_list: List[Any]) -> List[Dict[str, Any]]:
             tag = _RAY_TAG_INDEX_MAP.get(round(float(arr[_AGENT_OBS_RAY_TAG_IDX])), None)
             return [{"hit_tag": tag, "distance": fraction, "angle_deg": 0.0}]
 
-        # Compact single-ray format: [one_hot(6), hit_fraction] = 7 elements
-        if n == _RAY_SENSOR_LEN_COMPACT:
-            one_hot = arr[:_RAY_SENSOR_TAGS_PER_RAY_COMPACT]
-            fraction = float(arr[_RAY_SENSOR_TAGS_PER_RAY_COMPACT])
-            best_idx = int(np.argmax(one_hot))
-            tag: Optional[str] = (
-                _RAY_SENSOR_TAG_REMAP.get(best_idx)
-                if float(one_hot[best_idx]) > 0.5 else None
-            )
-            return [{"hit_tag": tag, "distance": fraction, "angle_deg": 0.0}]
-
         # Full 7-ray array: parse every ray
         if n in (_RAY_SENSOR_LEN_LEGACY, _RAY_SENSOR_LEN_NEW):
             n_tags = (
@@ -433,7 +416,7 @@ def _parse_raycasts(obs_list: List[Any]) -> List[Dict[str, Any]]:
                 best_idx = int(np.argmax(one_hot))
                 ray_tag: Optional[str] = (
                     _RAY_SENSOR_TAG_REMAP.get(best_idx)
-                    if float(one_hot[best_idx]) > 0.5 else None
+                    if float(one_hot[best_idx]) > 0.15 else None
                 )
                 angle = _RAY_ANGLES_DEG[i] if i < len(_RAY_ANGLES_DEG) else 0.0
                 rays.append({"hit_tag": ray_tag, "distance": fraction, "angle_deg": angle})

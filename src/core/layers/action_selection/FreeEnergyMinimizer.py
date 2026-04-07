@@ -9,9 +9,9 @@ Structure follows Friston's EFE decomposition (Friston et al. 2017):
          - motor_cost       *  w_motor_cost  (metabolic cost of action)
 
 Idle:
-  score = 1.0 − max(max_urgency, mean_PE)
-  → rest scores highest when the agent is satisfied AND unsurprised.
-  → Seth's beast machine at allostatic equilibrium.
+  score = (1 − urgency) × (1 − area_novelty) − urgency_penalty
+  → rest scores highest when the agent is satisfied AND in a familiar area.
+  → caps at 0.5 when area is novel, letting epistemic turns dominate.
 
 Turn actions (epistemic):
   epistemic = area_novelty + EPISTEMIC_FORAGING_BASELINE
@@ -38,11 +38,11 @@ from core.models.signals import DriveSignalBatch, PredictionErrorBatch
 _EPISTEMIC_ACTIONS = {"turn_left", "turn_right"}
 
 # Intrinsic epistemic foraging baseline added to all active (non-idle) actions.
-# Ensures active actions always beat idle when drives are satisfied — epistemic
-# foraging under allostatic equilibrium (Friston et al. 2017; Seth & Bayne 2022).
-# At default weights (w_epistemic=0.35): 0.15 × 0.35 = 0.0525 score advantage
-# over idle, which scores at most 1.0 - 0.0 = 1.0 only when urgency AND pe are 0.
-_EPISTEMIC_FORAGING_BASELINE = 0.15
+# At w_epistemic=0.70: 0.60 × 0.70 = 0.42 for move_forward; 0.42 + area_novelty×0.70
+# for turns. Combined with the product-form idle cap (≤0.5 at novelty≥0.5), turns
+# beat idle at equilibrium → agent scans until food is found → move_forward wins
+# via food-proximity bonus once food enters the ray fan.
+_EPISTEMIC_FORAGING_BASELINE = 0.60
 
 # Per-policy metabolic cost in [0, 1]
 _MOTOR_COST: Dict[str, float] = {
@@ -152,12 +152,16 @@ class FreeEnergyMinimizer:
             pid = policy["policy_id"]
 
             if pid == "idle":
-                # Allostatic equilibrium: rest is appropriate when quiet and unsurprised.
-                # The base score decays as urgency/PE rise. The additional urgency
-                # penalty ensures idle cannot hold near 1.0 while drives are actively
-                # depleting — without it, idle outscores all movement actions until
-                # urgency exceeds ~0.5, which is too late given slow depletion rates.
-                score = 1.0 - max(max_urgency, pe_mean)
+                # Idle is only appropriate when BOTH allostatic AND epistemic demands
+                # are satisfied. Using a product forces both factors to be high:
+                #   urgency=0, area_novelty=0.0 (fully familiar) → score=1.0  (correct: rest)
+                #   urgency=0, area_novelty=0.5 (novel)          → score=0.5  (exploration beats rest)
+                #   urgency=0.5, area_novelty=0.5                → score=0.25 (drives beat rest)
+                # This caps idle at 0.5 whenever the area is novel, making epistemic
+                # turns competitive at allostatic equilibrium without needing urgency.
+                allostatic_sat = 1.0 - max_urgency
+                epistemic_sat  = 1.0 - area_novelty
+                score = allostatic_sat * epistemic_sat
                 score -= max(0.0, max_urgency) * self._idle_urgency_penalty
                 scores[pid] = float(max(0.0, min(1.0, score)))
                 continue
