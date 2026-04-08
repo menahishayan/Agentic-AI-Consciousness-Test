@@ -46,17 +46,17 @@ class HomeostaticWrapper:
         self.death_threshold: float = float(hc.get("death_threshold", 0.0))
 
         # Internal state
-        self._health: float = 1.0
-        self._saturation: float = 1.0
+        self._health: float = 0.5
+        self._saturation: float = 0.5
 
     # ------------------------------------------------------------------
     # Public interface
     # ------------------------------------------------------------------
 
     def reset(self) -> None:
-        """Restore full physiological state at episode start."""
-        self._health = 1.0
-        self._saturation = 1.0
+        """Reset physiological state to 50% at episode start."""
+        self._health = 0.5
+        self._saturation = 0.5
 
     def step(self, raw_reward: float, env_done: bool) -> None:
         """

@@ -285,10 +285,20 @@ class AgentLoop:
         context["last_action"] = self._last_policy_id
         # Rolling history for LLM prompt — lets the model detect repetition
         context["recent_actions"] = list(self._recent_actions)
-        # Raycast hits from perception — directional food/threat bearing for LLM
-        context["raycast_hits"] = state.perception.raycast_hits
+        # Raycast hits from perception — directional food/threat bearing for LLM.
+        # Use `or []` so context always holds a list; downstream consumers (FEA,
+        # PolicyGenerator) iterate directly without their own None-guards.
+        context["raycast_hits"] = state.perception.raycast_hits or []
         # Current AgentState — used by PolicyGenerator to query episodic memory
         context["current_state"] = state
+
+        if DEBUG:
+            _rc_ctx = context["raycast_hits"]
+            _food_rc = [r for r in _rc_ctx if r.get("hit_tag") in ("GoodGoal", "GoodGoalMulti")]
+            self._dbg(
+                f"CONTEXT_RC step={step}  n_rays={len(_rc_ctx)}  food_rays={_food_rc}"
+                f"  state_rc_none={state.perception.raycast_hits is None}"
+            )
 
         # --- Layer 3: Free energy scoring ---
         fe_scores = self._free_energy.score(

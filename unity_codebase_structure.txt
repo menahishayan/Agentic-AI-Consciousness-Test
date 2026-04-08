@@ -1,0 +1,135 @@
+animal-ai-unity/
+├── Relevant Unity assets (scripts, prefabs, scenes, ML-Agents, test configs)
+│   Assets/Scripts/
+│   ├── Operations/
+│   │   ├── EndEpisodeOperation.cs
+│   │   ├── FreezeAgentOperation.cs
+│   │   ├── GrantContinuousRewardOperation.cs
+│   │   ├── GrantRewardOperation.cs
+│   │   ├── LimitedInvocationsOperation.cs
+│   │   ├── NoneOperation.cs
+│   │   ├── OperationFromList.cs
+│   │   ├── Operations.cs
+│   │   └── ToggleObjectOperation.cs
+│   ├── Rewards/
+│   │   ├── BallGoal.cs
+│   │   ├── BallGoalBounce.cs
+│   │   ├── DeathZone.cs
+│   │   ├── DecayGoal.cs
+│   │   ├── FullDecayGoal.cs
+│   │   ├── Goal.cs
+│   │   ├── HotZone.cs
+│   │   └── SizeChangeGoal.cs
+│   ├── Spawners/
+│   │   ├── GoalSpawner.cs
+│   │   ├── SpawnerButton.cs
+│   │   └── SpawnerStockpiler.cs
+│   ├── UI/
+│   │   └── BuildVersionControl.cs
+│   ├── AAI3EnvironmentManager.cs
+│   ├── AnimalSkinManager.cs
+│   ├── ArenaBuilders.cs
+│   ├── ArenasParameters.cs
+│   ├── ArenasParametersEventArgs.cs
+│   ├── ArenasParametersSideChannel.cs
+│   ├── CameraCollision.cs
+│   ├── CameraFollow.cs
+│   ├── CollisionImpulseTracker.cs
+│   ├── ComputeScaleRatios.cs
+│   ├── CSVUploader.cs
+│   ├── CSVWriter.cs
+│   ├── DataZone.cs
+│   ├── Fade.cs
+│   ├── FlashingImage.cs
+│   ├── Grounded.cs
+│   ├── Holders.cs
+│   ├── Lights.cs
+│   ├── NotificationManager.cs
+│   ├── PlayerControls.cs
+│   ├── Prefab.cs
+│   ├── PrefabsInterface.cs
+│   ├── ProgressBar.cs
+│   ├── ScreenshotCamera.cs
+│   ├── Scripts.asmdef
+│   ├── SignBoard.cs
+│   ├── TrainingAgent.cs
+│   ├── TrainingArena.cs
+│   ├── UnityEngineExtensions.cs
+│   ├── WebGLConstants.cs
+│   └── YAMLclasses.cs
+│   Assets/Prefabs/
+│   ├── DataZone/
+│   │   └── DataZone.prefab
+│   ├── Immoveable/
+│   │   ├── CylinderTunnel.prefab
+│   │   ├── CylinderTunnelTransparent.prefab
+│   │   ├── Ramp.prefab
+│   │   ├── RAMP_NEW.fbx
+│   │   ├── RampOld.prefab
+│   │   ├── Wall.prefab
+│   │   └── WallTransparent.prefab
+│   ├── Moveable/
+│   │   ├── HeavyBlock.prefab
+│   │   ├── HollowBox.prefab
+│   │   ├── JBlock.prefab
+│   │   ├── LBlock.prefab
+│   │   ├── LightBlock.prefab
+│   │   └── UBlock.prefab
+│   ├── Rewards/
+│   │   ├── BadGoal.prefab
+│   │   ├── BadGoalBounce.prefab
+│   │   ├── BadGoalMulti.prefab
+│   │   ├── DeathZone.prefab
+│   │   ├── DecayGoal.prefab
+│   │   ├── DecayGoalEpEnding.prefab
+│   │   ├── DecoyGoal.prefab
+│   │   ├── DecoyGoalBounce.prefab
+│   │   ├── DecoyGoalMulti.prefab
+│   │   ├── GoodGoal.prefab
+│   │   ├── GoodGoalBounce.prefab
+│   │   ├── GoodGoalMulti.prefab
+│   │   ├── GoodGoalMultiBounce.prefab
+│   │   ├── GrowGoal.prefab
+│   │   ├── HotZone.prefab
+│   │   ├── RipenGoal.prefab
+│   │   ├── RipenGoalEpEnding.prefab
+│   │   └── ShrinkGoal.prefab
+│   ├── SignBoard/
+│   │   └── SignBoard.prefab
+│   ├── Spawners/
+│   │   ├── SpawnerButton.prefab
+│   │   ├── SpawnerContainerShort.prefab
+│   │   ├── SpawnerDispenserTall.prefab
+│   │   └── SpawnerTree.prefab
+│   ├── AAI3Agent.prefab
+│   ├── AAI3Arena.prefab
+│   └── SpawnedObjectsHolder.prefab
+│   Assets/Scenes/
+│   ├── AAI3EnvironmentManager/
+│   │   ├── LightingData.asset
+│   │   └── ReflectionProbe-0.exr
+│   ├── AAI3ArenaScene.unity
+│   └── AAI3EnvironmentManager.unity
+│   Assets/ML-Agents/
+│   └── Timers/
+│   Assets/Resources/test_configs/
+│   ├── agent_freeze-delay_test.yaml
+│   ├── animal_skins_test.yaml
+│   ├── arenas_multiple_cycling_test.yaml
+│   ├── datazone-test.yaml
+│   ├── decoy-file-test.yaml
+│   ├── empty-arena.yaml
+│   ├── every_object_spawn_test.yaml
+│   ├── global_parameters_test.yaml
+│   ├── signboard_symbol_test.yaml
+│   ├── spawner_button_test.yaml
+│   ├── spawner_hollowobj_test.yaml
+│   ├── spawnerButton-experimental1.yaml
+│   └── testMergedArenas.yaml
+├── Adapter/project connection files
+│   ├── Packages/manifest.json
+│   ├── Packages/packages-lock.json
+│   ├── ProjectSettings/ProjectSettings.asset
+│   ├── ProjectSettings/EditorBuildSettings.asset
+│   └── ProjectSettings/ProjectVersion.txt
+└── Excluded: Library/, Logs/, Temp/, build artifacts, caches, and *.meta files

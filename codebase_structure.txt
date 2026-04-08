@@ -1,0 +1,129 @@
+Capstone/
+├── .claude/
+│   └── settings.local.json
+├── animalai_configs/
+│   └── basic_food.yaml
+├── dashboard/
+│   ├── routers/
+│   │   ├── __init__.py
+│   │   ├── runs.py
+│   │   └── stream.py
+│   ├── services/
+│   │   ├── __init__.py
+│   │   ├── log_tailer.py
+│   │   └── run_registry.py
+│   ├── static/
+│   │   └── index.html
+│   ├── __init__.py
+│   ├── config.py
+│   └── server.py
+├── data/
+│   └── long_term_memory/
+│       ├── pe_history.faiss
+│       ├── pe_history_records.json
+│       ├── policies.json
+│       ├── policy_traces.faiss
+│       └── policy_traces_records.json
+├── scripts/
+│   ├── generate_codebase_structure.py
+│   └── generate_unity_codebase_structure.py
+├── src/
+│   ├── core/
+│   │   ├── adapters/
+│   │   │   ├── animalai/
+│   │   │   │   ├── __init__.py
+│   │   │   │   ├── action_mapper.py
+│   │   │   │   ├── env_adapter.py
+│   │   │   │   ├── homeostatic_wrapper.py
+│   │   │   │   └── observation_mapper.py
+│   │   │   ├── headless/
+│   │   │   │   ├── __init__.py
+│   │   │   │   └── env_adapter.py
+│   │   │   ├── iot/
+│   │   │   │   ├── __init__.py
+│   │   │   │   └── env_adapter.py
+│   │   │   ├── __init__.py
+│   │   │   ├── base.py
+│   │   │   └── loader.py
+│   │   ├── coordination/
+│   │   │   ├── __init__.py
+│   │   │   ├── messages.py
+│   │   │   └── workspace.py
+│   │   ├── layers/
+│   │   │   ├── action_selection/
+│   │   │   │   ├── __init__.py
+│   │   │   │   ├── FreeEnergyMinimizer.py
+│   │   │   │   ├── MotorControlInterface.py
+│   │   │   │   └── PolicyGenerator.py
+│   │   │   ├── interoceptive/
+│   │   │   │   ├── __init__.py
+│   │   │   │   ├── AllostaticController.py
+│   │   │   │   ├── ArousalValenceSystem.py
+│   │   │   │   └── VitalStateMonitor.py
+│   │   │   ├── metacognitive/
+│   │   │   │   ├── __init__.py
+│   │   │   │   ├── GoalCoherenceChecker.py
+│   │   │   │   └── MetacognitiveMonitor.py
+│   │   │   ├── predictive/
+│   │   │   │   ├── __init__.py
+│   │   │   │   ├── PredictionErrorCalculator.py
+│   │   │   │   └── WorldModelGenerator.py
+│   │   │   └── __init__.py
+│   │   ├── llm/
+│   │   │   ├── providers/
+│   │   │   │   ├── __init__.py
+│   │   │   │   ├── anthropic.py
+│   │   │   │   ├── gemini.py
+│   │   │   │   ├── ollama.py
+│   │   │   │   └── openai.py
+│   │   │   ├── __init__.py
+│   │   │   ├── base.py
+│   │   │   ├── factory.py
+│   │   │   └── types.py
+│   │   ├── memory/
+│   │   │   ├── __init__.py
+│   │   │   ├── long_term_memory.py
+│   │   │   ├── manager.py
+│   │   │   ├── policy_traces.py
+│   │   │   ├── prediction_error_history.py
+│   │   │   ├── self_state_tracking.py
+│   │   │   └── working_memory_buffer.py
+│   │   ├── models/
+│   │   │   ├── __init__.py
+│   │   │   ├── memory_records.py
+│   │   │   ├── signals.py
+│   │   │   └── state.py
+│   │   ├── observability/
+│   │   │   ├── __init__.py
+│   │   │   ├── exceptions.py
+│   │   │   ├── logger.py
+│   │   │   ├── paths.py
+│   │   │   └── serializer.py
+│   │   ├── runtime/
+│   │   │   ├── __init__.py
+│   │   │   └── loop.py
+│   │   ├── __init__.py
+│   │   └── main.py
+│   └── __init__.py
+├── tests/
+│   ├── core/
+│   │   ├── __init__.py
+│   │   ├── test_adapter_contract.py
+│   │   ├── test_allostatic_controller.py
+│   │   ├── test_homeostatic_wrapper.py
+│   │   ├── test_memory_system.py
+│   │   ├── test_policy_generator.py
+│   │   ├── test_prediction_error.py
+│   │   └── test_runtime_loop.py
+│   ├── __init__.py
+│   └── conftest.py
+├── .env
+├── .env.sample
+├── .gitignore
+├── .python-version
+├── config.json
+├── README.md
+├── requirements.txt
+├── run.sh
+├── run_dashboard.sh
+└── unity_codebase_structure.txt

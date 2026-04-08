@@ -110,7 +110,10 @@ class PolicyGenerator:
             cfg.get("arousal_diversity_threshold", 0.6)
         )
         # Hard latency budget per step: if LLM exceeds this, fall back to EFE argmax.
-        self._llm_timeout_s: float = float(cfg.get("llm_timeout_s", 1.5))
+        # Read from config["llm"]["timeout_s"] — the policy_generator block does not
+        # carry this key, so reading cfg would always return the 1.5s default.
+        llm_cfg = config.get("llm", {})
+        self._llm_timeout_s: float = float(llm_cfg.get("timeout_s", 4.0))
 
         # PE streak counter — depth modulator, not a call/no-call switch
         self._pe_streak: int = 0
@@ -166,15 +169,15 @@ class PolicyGenerator:
 
         fe_scores: Dict[str, float] = context.get("free_energy_scores", {})
 
-        # EFE bypass: skip LLM when one action is unambiguous.
-        # Fires when top score >= 0.95 OR the gap to second place >= 0.4.
-        # At food approach (move_forward=1.0 vs next=0.46, gap=0.54) this
-        # always bypasses the LLM — deliberation only adds latency, not value.
+        # EFE bypass: skip LLM only when the decision is truly unambiguous.
+        # Threshold raised to 0.65 gap / 0.98 top so the LLM still runs during
+        # food-approach scenarios (food proximity pushes gap ~0.40–0.54) — those
+        # are exactly the steps where deliberative reasoning adds value.
         if fe_scores and len(fe_scores) >= 2:
             sorted_scores = sorted(fe_scores.values(), reverse=True)
             top_score = sorted_scores[0]
             second_score = sorted_scores[1]
-            if top_score >= 0.95 or (top_score - second_score) >= 0.4:
+            if top_score >= 0.98 or (top_score - second_score) >= 0.65:
                 return max(fe_scores, key=lambda k: fe_scores[k])
 
         depth, reason = self._depth(context)
@@ -450,7 +453,10 @@ class PolicyGenerator:
 
         dominant_channel = drive_batch.dominant_channel if drive_batch else None
         _rc = context.get("raycast_hits")
-        food_visible = bool(_rc and _rc[0].get("hit_tag") in ("GoodGoal", "GoodGoalMulti"))
+        food_visible = bool(any(
+            r.get("hit_tag") in ("GoodGoal", "GoodGoalMulti")
+            for r in (_rc or [])
+        ))
         affect_state = _affect_label(arousal, valence, dominant_channel, food_visible)
 
         # --- Step 2: recent action history ---

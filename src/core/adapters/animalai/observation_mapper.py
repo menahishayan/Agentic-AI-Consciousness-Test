@@ -47,6 +47,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 
+
 from core.adapters.animalai.homeostatic_wrapper import HomeostaticWrapper
 from core.models.state import (
     AgentState,
@@ -84,27 +85,57 @@ _RAY_TAG_INDEX_MAP: Dict[float, Optional[str]] = {
 }
 
 # ---------------------------------------------------------------------------
-# RayPerceptionSensor separate obs array — current pre-rebuild binary
+# RayPerceptionSensor obs array
 #
-# shape (98,) = 7 rays × 14 floats, format [one_hot(13), hit_fraction]
-# ML-Agents 1.1.0 uses N+1 per ray (no separate hit_bool).
+# ML-Agents format: [one_hot(N_tags), hit_fraction] per ray, N+1 floats per ray.
 #
-# Tag order matches m_DetectableTags in AAI3Agent.prefab (current binary, 15 tags):
+# TWO possible layouts depending on binary build:
+#
+# 13-tag layout (legacy, raysPerSide=3):   7 × 14 = 98 floats
+#   0=arena, 1=Immovable, 2=Movable, 3=goodGoal, 4=goodGoalMulti, 5=badGoal,
+#   6=GoalSpawner, 7=DeathZone, 8=HotZone, 9=Ramp, 10=PillarButton,
+#   11=SignPoster, 12=DecoyGoal
+#
+# 13-tag layout (current binary, raysPerSide=4): 9 × 14 = 126 floats
+#   Same tag order as above.
+#
+# 15-tag layout (current prefab m_DetectableTags, raysPerSide=4): 9 × 16 = 144 floats
 #   0=arena, 1=OuterWall, 2=Immovable, 3=Movable, 4=goodGoal, 5=goodGoalMulti,
 #   6=badGoal, 7=GoalSpawner, 8=DeathZone, 9=HotZone, 10=Ramp, 11=PillarButton,
 #   12=SignPoster, 13=DecoyGoal, 14=DecoyGoalBounce
 #
-# IMPORTANT: OuterWall is at index 1 (not index 13 as in old assumptions).
-# goodGoal is at index 4, goodGoalMulti at index 5 — shifted by 1 vs legacy map.
+# CRITICAL: goodGoal is at index 3 in 13-tag layout, index 4 in 15-tag layout.
+# Using the wrong remap silently drops all food detections.
+# The actual array size is logged on step 1 — check run logs to confirm.
 # ---------------------------------------------------------------------------
-_RAY_SENSOR_TAG_REMAP: Dict[int, Optional[str]] = {
-    0:  "arena",          # floor/ceiling
+
+# 13-tag remap: used for 98-float (7-ray) and 126-float (9-ray) arrays.
+# Indices match _TagToIndex in TrainingAgent.cs (return values 0f–5f).
+_RAY_SENSOR_TAG_REMAP_13: Dict[int, Optional[str]] = {
+    0:  "arena",
+    1:  "GoodGoal",       # goodGoal — per _TagToIndex return 1f
+    2:  "GoodGoalMulti",  # goodGoalMulti — per _TagToIndex return 2f
+    3:  "BadGoal",        # badGoal — per _TagToIndex return 3f
+    4:  "wall",           # Immovable
+    5:  "wall",           # OuterWall
+    6:  None,
+    7:  None,
+    8:  None,
+    9:  None,
+    10: None,
+    11: None,
+    12: None,
+}
+
+# 15-tag remap: used for 144-float (9-ray) arrays (current prefab m_DetectableTags)
+_RAY_SENSOR_TAG_REMAP_15: Dict[int, Optional[str]] = {
+    0:  "arena",
     1:  "wall",           # OuterWall
-    2:  "wall",           # Immovable (obstacle walls)
-    3:  None,             # Movable — not relevant for nav
-    4:  "GoodGoal",       # goodGoal
+    2:  "wall",           # Immovable
+    3:  None,             # Movable
+    4:  "GoodGoal",       # goodGoal  ← index 4 in 15-tag layout
     5:  "GoodGoalMulti",  # goodGoalMulti
-    6:  "BadGoal",        # badGoal
+    6:  "BadGoal",
     7:  None,             # GoalSpawner
     8:  None,             # DeathZone
     9:  None,             # HotZone
@@ -114,13 +145,18 @@ _RAY_SENSOR_TAG_REMAP: Dict[int, Optional[str]] = {
     13: None,             # DecoyGoal
     14: None,             # DecoyGoalBounce
 }
-_RAY_SENSOR_TAGS_PER_RAY_LEGACY = 13    # old binary: 13 tags (no OuterWall at index 1)
-_RAY_SENSOR_TAGS_PER_RAY_NEW    = 15    # current binary: 15 tags (matches prefab m_DetectableTags)
-_RAY_SENSOR_N_RAYS_LEGACY = 7           # raysPerSide=3: 2×3+1
-_RAY_SENSOR_N_RAYS_CURRENT = 9          # raysPerSide=4: 2×4+1 (current binary)
+
+# Backward-compat alias — code outside this module that imported _RAY_SENSOR_TAG_REMAP
+# gets the 15-tag remap (the prefab's declared layout).
+_RAY_SENSOR_TAG_REMAP = _RAY_SENSOR_TAG_REMAP_15
+
+_RAY_SENSOR_TAGS_PER_RAY_LEGACY = 13
+_RAY_SENSOR_TAGS_PER_RAY_NEW    = 15
+_RAY_SENSOR_N_RAYS_LEGACY  = 7   # raysPerSide=3
+_RAY_SENSOR_N_RAYS_CURRENT = 9   # raysPerSide=4
 _RAY_SENSOR_LEN_LEGACY  = _RAY_SENSOR_N_RAYS_LEGACY  * (_RAY_SENSOR_TAGS_PER_RAY_LEGACY + 1)  # 98
 _RAY_SENSOR_LEN_CURRENT = _RAY_SENSOR_N_RAYS_CURRENT * (_RAY_SENSOR_TAGS_PER_RAY_LEGACY + 1)  # 126
-_RAY_SENSOR_LEN_NEW     = _RAY_SENSOR_N_RAYS_CURRENT * (_RAY_SENSOR_TAGS_PER_RAY_NEW    + 1)  # 144 ← actual
+_RAY_SENSOR_LEN_NEW     = _RAY_SENSOR_N_RAYS_CURRENT * (_RAY_SENSOR_TAGS_PER_RAY_NEW    + 1)  # 144
 
 # Ray angles per format (AlternatingRayOrder=1, center-first)
 _RAY_ANGLES_7 = [0.0, 23.3, -23.3, 46.6, -46.6, 70.0, -70.0]   # raysPerSide=3, maxDeg=70
@@ -387,27 +423,38 @@ def _parse_raycasts(obs_list: List[Any]) -> List[Dict[str, Any]]:
     _ANGLES_LEGACY = [0.0, 23.3, -23.3, 46.6, -46.6, 70.0, -70.0]
     _ANGLES_NEW    = [0.0, 20.0, -20.0, 40.0, -40.0, 60.0, -60.0, 80.0, -80.0]
 
+    # Pass 1: prefer the 10-float vector obs (fresh raycast injected by CollectObservations).
+    # The 126-float RayPerceptionSensor array can be stale/alternating due to Unity's
+    # sensor double-buffering — always use the 10-float path when it's available.
+    for obs in obs_list:
+        arr = np.asarray(obs, dtype=np.float32)
+        if arr.ndim != 1:
+            continue
+        if len(arr) == _AGENT_OBS_LEN:
+            fraction = float(arr[_AGENT_OBS_RAY_FRACTION_IDX])
+            tag = _RAY_TAG_INDEX_MAP.get(round(float(arr[_AGENT_OBS_RAY_TAG_IDX])), None)
+            return [{"hit_tag": tag, "distance": fraction, "angle_deg": 0.0}]
+
+    # Pass 2: fall back to full ray array (98/126/144 floats) when 10-float obs absent.
     for obs in obs_list:
         arr = np.asarray(obs, dtype=np.float32)
         if arr.ndim != 1:
             continue
         n = len(arr)
 
-        # Post-rebuild: forward ray embedded in 10-float vector obs
-        if n == _AGENT_OBS_LEN:
-            fraction = float(arr[_AGENT_OBS_RAY_FRACTION_IDX])
-            tag = _RAY_TAG_INDEX_MAP.get(round(float(arr[_AGENT_OBS_RAY_TAG_IDX])), None)
-            return [{"hit_tag": tag, "distance": fraction, "angle_deg": 0.0}]
-
-        # Full ray array: parse every ray
+        # Full ray array: parse every ray.
+        # Select remap and food indices based on tag count (array size determines layout):
+        #   98/126 floats → 13-tag layout: goodGoal at index 3
+        #   144 floats    → 15-tag layout: goodGoal at index 4
         if n in (_RAY_SENSOR_LEN_LEGACY, _RAY_SENSOR_LEN_CURRENT, _RAY_SENSOR_LEN_NEW):
-            is_legacy  = (n == _RAY_SENSOR_LEN_LEGACY)
-            is_current = (n == _RAY_SENSOR_LEN_CURRENT)
+            is_legacy   = (n == _RAY_SENSOR_LEN_LEGACY)
+            use_13_tags = (n in (_RAY_SENSOR_LEN_LEGACY, _RAY_SENSOR_LEN_CURRENT))
 
-            n_tags = (_RAY_SENSOR_TAGS_PER_RAY_LEGACY if (is_legacy or is_current)
-                      else _RAY_SENSOR_TAGS_PER_RAY_NEW)
-            n_rays = (_RAY_SENSOR_N_RAYS_LEGACY if is_legacy else _RAY_SENSOR_N_RAYS_CURRENT)
-            angles = (_RAY_ANGLES_7 if is_legacy else _RAY_ANGLES_9)
+            n_tags = _RAY_SENSOR_TAGS_PER_RAY_LEGACY if use_13_tags else _RAY_SENSOR_TAGS_PER_RAY_NEW
+            n_rays = _RAY_SENSOR_N_RAYS_LEGACY if is_legacy else _RAY_SENSOR_N_RAYS_CURRENT
+            angles = _RAY_ANGLES_7 if is_legacy else _RAY_ANGLES_9
+            remap  = _RAY_SENSOR_TAG_REMAP_13 if use_13_tags else _RAY_SENSOR_TAG_REMAP_15
+            food_indices = (1, 2) if use_13_tags else (4, 5)
 
             floats_per_ray = n_tags + 1
             rays = []
@@ -416,16 +463,15 @@ def _parse_raycasts(obs_list: List[Any]) -> List[Dict[str, Any]]:
                 one_hot = arr[offset:offset + n_tags]
                 fraction = float(arr[offset + n_tags])
 
-                # Priority-check food indices before falling back to argmax:
-                # indices 4=goodGoal, 5=goodGoalMulti in the actual prefab tag order.
+                # Priority-check food indices before falling back to argmax.
                 ray_tag: Optional[str] = None
-                for fi in (4, 5):
+                for fi in food_indices:
                     if fi < len(one_hot) and float(one_hot[fi]) > 0.08:
-                        ray_tag = _RAY_SENSOR_TAG_REMAP.get(fi)
+                        ray_tag = remap.get(fi)
                         break
                 if ray_tag is None:
                     best_idx = int(np.argmax(one_hot))
-                    ray_tag = (_RAY_SENSOR_TAG_REMAP.get(best_idx)
+                    ray_tag = (remap.get(best_idx)
                                if float(one_hot[best_idx]) > 0.15 else None)
 
                 rays.append({"hit_tag": ray_tag, "distance": fraction,

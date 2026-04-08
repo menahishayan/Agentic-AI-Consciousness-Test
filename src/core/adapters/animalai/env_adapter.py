@@ -146,6 +146,10 @@ class AnimalAIAdapter(AbstractEnvironmentAdapter):
         self._prev_wx: Optional[float] = None
         self._prev_wz: Optional[float] = None
 
+        # Buffer holding last step's raw obs_list so [FOOD_COLLECT] can dump the
+        # array from the step *immediately before* a positive reward arrives.
+        self._prev_obs_list: List[Any] = []
+
     # ------------------------------------------------------------------
     # AbstractEnvironmentAdapter interface
     # ------------------------------------------------------------------
@@ -158,6 +162,7 @@ class AnimalAIAdapter(AbstractEnvironmentAdapter):
         self._stuck_adapter_count = 0
         self._prev_wx = None
         self._prev_wz = None
+        self._prev_obs_list = []
 
         env = self._get_or_create_env()
         env.reset()
@@ -197,6 +202,16 @@ class AnimalAIAdapter(AbstractEnvironmentAdapter):
         obs, info = self._get_obs()
         raw_reward = float(info.get("raw_reward", 0.0))
         env_done = bool(info.get("env_done", False))
+
+        # Dump the 126-float array from the step immediately before a positive reward.
+        # self._prev_obs_list holds last step's raw obs; current step's reward tells us
+        # food was collected, so the prior array is the one to inspect.
+        if DEBUG and raw_reward > 0 and self._prev_obs_list:
+            for _obs in self._prev_obs_list:
+                _arr = np.asarray(_obs, dtype=np.float32)
+                if _arr.ndim == 1 and len(_arr) == 126:
+                    _dbg(f"[FOOD_COLLECT] step={self._step_count}  raw_reward={raw_reward:.4f}  "
+                         f"full 126-float array (pre-reward step): {_arr.tolist()}")
 
         # Integrate heading from turn actions (dead-reckoning)
         if action_id == "turn_left":
@@ -253,7 +268,8 @@ class AnimalAIAdapter(AbstractEnvironmentAdapter):
         if action_id in ("turn_left", "turn_right", "idle"):
             motor_efficiency = 1.0
             position_delta_norm = 0.0
-            self._stuck_adapter_count = 0
+            # Do NOT reset stuck_adapter_count here.
+            # Idling or turning while against a wall is still stuck.
         else:
             if self._prev_wx is not None and self._prev_wz is not None:
                 dx = curr_wx - self._prev_wx
@@ -313,6 +329,9 @@ class AnimalAIAdapter(AbstractEnvironmentAdapter):
         unity_health = _extract_unity_health(_raw_obs_list)
         if unity_health is not None:
             self._homeostatic.sync_health(unity_health)
+
+        # Advance the pre-reward buffer to this step's obs.
+        self._prev_obs_list = _raw_obs_list
 
         state = map_obs(obs, info, self._homeostatic, self._step_count, self._position_tracker)
 
@@ -454,6 +473,9 @@ class AnimalAIAdapter(AbstractEnvironmentAdapter):
             raise RuntimeError("Animal AI returned no behavior specs.")
         self._behavior_name = next(iter(specs))
         log.info("Behavior name: %s", self._behavior_name)
+        spec = env.behavior_specs[self._behavior_name]
+        for obs_spec in spec.observation_specs:
+            log.info("ObsSpec: name=%s shape=%s", obs_spec.name, obs_spec.shape)
         return env
 
     def _get_obs(self) -> Tuple[Optional[np.ndarray], Dict[str, Any]]:

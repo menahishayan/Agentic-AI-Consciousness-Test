@@ -239,6 +239,42 @@
     border: 1px solid var(--border);
     border-radius: 10px;
     padding: 12px 14px;
+    margin-top: 72px;
+  }
+
+  /* ── Episode stats (big-number card) ─────────────────── */
+  .ep-stats-card {
+    background: var(--surface2);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 16px 12px;
+    margin-bottom: 14px;
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 12px;
+  }
+
+  .ep-stat-item {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 5px;
+  }
+
+  .ep-stat-value {
+    font-size: 30px;
+    font-weight: 800;
+    font-variant-numeric: tabular-nums;
+    line-height: 1;
+    letter-spacing: -0.02em;
+  }
+
+  .ep-stat-label {
+    font-size: 10px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.07em;
+    color: var(--muted);
   }
 
   #events-title {
@@ -810,7 +846,7 @@ function ingestEvent(row) {
 }
 
 function ingestRunComplete(payload) {
-  ingestEvent({ event: 'episode_complete', step: payload.steps_run, payload });
+  renderEpisodeStats(payload);
   // Update sidebar badge
   const card = document.querySelector(`.run-card[data-id="${state.activeRunId}"]`);
   if (card) {
@@ -821,6 +857,47 @@ function ingestRunComplete(payload) {
     }
   }
 }
+
+        function renderEpisodeStats(payload) {
+          const log = document.getElementById('events-log');
+          if (!log) return;
+          // Remove placeholder text
+          const placeholder = log.querySelector('div[style]');
+          if (placeholder) placeholder.remove();
+
+          const stepsRun = payload.steps_run ?? '—';
+          const doneReason = (payload.done_reason || 'unknown').replace(/_/g, ' ');
+          const health = payload.final_health != null ? (payload.final_health * 100).toFixed(1) + '%' : '—';
+          const saturation = payload.final_saturation != null ? (payload.final_saturation * 100).toFixed(1) + '%' : '—';
+
+          const reasonColor = payload.done_reason === 'episode_done'
+            ? 'var(--accent2)'
+            : payload.done_reason === 'error'
+              ? 'var(--danger)'
+              : 'var(--warn)';
+
+          const card = document.createElement('div');
+          card.className = 'ep-stats-card';
+          card.innerHTML = `
+    <div class="ep-stat-item">
+      <div class="ep-stat-value" style="color:var(--accent)">${stepsRun}</div>
+      <div class="ep-stat-label">Steps Run</div>
+    </div>
+    <div class="ep-stat-item">
+      <div class="ep-stat-value" style="color:${reasonColor};font-size:14px;font-weight:700;padding-top:6px;">${doneReason}</div>
+      <div class="ep-stat-label">Done Reason</div>
+    </div>
+    <div class="ep-stat-item">
+      <div class="ep-stat-value" style="color:var(--live)">${health}</div>
+      <div class="ep-stat-label">Final Health</div>
+    </div>
+    <div class="ep-stat-item">
+      <div class="ep-stat-value" style="color:var(--accent2)">${saturation}</div>
+      <div class="ep-stat-label">Final Saturation</div>
+    </div>
+  `;
+          log.insertBefore(card, log.firstChild);
+        }
 
 // ─── LLM reasoning feed ──────────────────────────────────────────
 
