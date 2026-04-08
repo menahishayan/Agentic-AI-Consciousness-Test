@@ -151,12 +151,17 @@ class AllostaticController:
         # Component 2: threshold proximity
         if current <= channel.critical_threshold:
             threshold_urgency = 1.0
+        elif current >= channel.setpoint:
+            # Above setpoint — no urgency from threshold proximity.
+            # Without this guard, below_setpoint = setpoint - current is negative
+            # and leaks a negative threshold_urgency into the raw sum.
+            threshold_urgency = 0.0
         else:
             range_above = channel.setpoint - channel.critical_threshold
             if range_above <= 0:
                 threshold_urgency = 0.0
             else:
-                below_setpoint = channel.setpoint - current
+                below_setpoint = channel.setpoint - current  # positive: current < setpoint
                 threshold_urgency = min(1.0, below_setpoint / range_above)
 
         # Component 3: predictive rate component

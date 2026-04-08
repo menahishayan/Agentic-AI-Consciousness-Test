@@ -184,10 +184,10 @@ class FreeEnergyMinimizer:
                 effective_novelty = max(0.15, area_novelty)  # floor: idle never fully wins
                 epistemic_sat  = 1.0 - effective_novelty
                 score = allostatic_sat * epistemic_sat
+                # Urgency penalty: fire whenever drives are above zero, not just at
+                # extreme urgency. At urgency=0.20 with penalty=2.0: -0.40.
                 score -= max(0.0, max_urgency) * self._idle_urgency_penalty
-                # Food visible anywhere in the ray fan → idling is never appropriate.
-                # Penalty pushes idle below move_forward's foraging baseline (~0.39)
-                # so the agent acts on food sightings rather than waiting them out.
+                # Food visible → idling is never appropriate regardless of urgency level.
                 if food_ray is not None:
                     score -= 0.6
                 scores[pid] = float(max(0.0, min(1.0, score)))
@@ -253,7 +253,16 @@ class FreeEnergyMinimizer:
             # Motor failure penalty: soften EFE of the last action if it was blocked
             # for at least 2 consecutive steps (streak guard stops spurious first-obs firing).
             # motor_eff=0.0 → combined*0.30; motor_eff=0.29 → combined*0.50.
-            if pid == last_action and motor_eff < 0.3 and self._motor_fail_streak >= 2:
+            #
+            # EXEMPTION: do not penalise move_forward when food is adjacent (dist < 0.15).
+            # The food item itself causes the motor stall — penalising move_forward in this
+            # state causes the agent to retreat from food it is already touching.
+            food_adj = (food_ray is not None
+                        and float(food_ray.get("distance", 1.0)) < 0.15)
+            if (pid == last_action
+                    and motor_eff < 0.3
+                    and self._motor_fail_streak >= 2
+                    and not (pid == "move_forward" and food_adj)):
                 combined = combined * (0.3 + 0.7 * motor_eff)
 
             scores[pid] = float(max(0.0, min(1.0, combined)))
