@@ -89,41 +89,38 @@ _RAY_TAG_INDEX_MAP: Dict[float, Optional[str]] = {
 # shape (98,) = 7 rays × 14 floats, format [one_hot(13), hit_fraction]
 # ML-Agents 1.1.0 uses N+1 per ray (no separate hit_bool).
 #
-# Tag order matches the 13-tag detectable list compiled into the binary prefab.
-# Index mapping (same order as m_DetectableTags, binary predates DecoyGoalBounce):
-#   0=arena, 1=Immovable, 2=Movable, 3=goodGoal, 4=goodGoalMulti, 5=badGoal,
-#   6=GoalSpawner, 7=DeathZone, 8=HotZone, 9=Ramp, 10=PillarButton,
-#   11=SignPoster, 12=DecoyGoal
+# Tag order matches m_DetectableTags in AAI3Agent.prefab (current binary, 15 tags):
+#   0=arena, 1=OuterWall, 2=Immovable, 3=Movable, 4=goodGoal, 5=goodGoalMulti,
+#   6=badGoal, 7=GoalSpawner, 8=DeathZone, 9=HotZone, 10=Ramp, 11=PillarButton,
+#   12=SignPoster, 13=DecoyGoal, 14=DecoyGoalBounce
 #
-# After rebuild (15 tags + OuterWall): shape becomes (112,) = 7 × (15+1).
-# The 10-float vector obs path supersedes this once rebuilt, but this path
-# provides working ray detection in the interim.
+# IMPORTANT: OuterWall is at index 1 (not index 13 as in old assumptions).
+# goodGoal is at index 4, goodGoalMulti at index 5 — shifted by 1 vs legacy map.
 # ---------------------------------------------------------------------------
 _RAY_SENSOR_TAG_REMAP: Dict[int, Optional[str]] = {
-    0:  "arena",        # floor/ceiling
-    1:  "wall",         # Immovable (obstacle walls)
-    2:  None,           # Movable — not relevant for nav
-    3:  "GoodGoal",
-    4:  "GoodGoalMulti",
-    5:  "BadGoal",
-    6:  None,           # GoalSpawner
-    7:  None,           # DeathZone
-    8:  None,           # HotZone
-    9:  None,           # Ramp
-    10: None,           # PillarButton
-    11: None,           # SignPoster
-    12: None,           # DecoyGoal
-    # After rebuild: 13=DecoyGoalBounce, 14=OuterWall (→ "wall")
-    14: "wall",         # OuterWall (post-rebuild binary)
+    0:  "arena",          # floor/ceiling
+    1:  "wall",           # OuterWall
+    2:  "wall",           # Immovable (obstacle walls)
+    3:  None,             # Movable — not relevant for nav
+    4:  "GoodGoal",       # goodGoal
+    5:  "GoodGoalMulti",  # goodGoalMulti
+    6:  "BadGoal",        # badGoal
+    7:  None,             # GoalSpawner
+    8:  None,             # DeathZone
+    9:  None,             # HotZone
+    10: None,             # Ramp
+    11: None,             # PillarButton
+    12: None,             # SignPoster
+    13: None,             # DecoyGoal
+    14: None,             # DecoyGoalBounce
 }
-_RAY_SENSOR_TAGS_PER_RAY_LEGACY = 13    # binary compiled with 13 tags
-_RAY_SENSOR_TAGS_PER_RAY_NEW    = 15    # future binary with 15 tags (OuterWall + DecoyGoalBounce added)
+_RAY_SENSOR_TAGS_PER_RAY_LEGACY = 13    # old binary: 13 tags (no OuterWall at index 1)
+_RAY_SENSOR_TAGS_PER_RAY_NEW    = 15    # current binary: 15 tags (matches prefab m_DetectableTags)
 _RAY_SENSOR_N_RAYS_LEGACY = 7           # raysPerSide=3: 2×3+1
-_RAY_SENSOR_N_RAYS_CURRENT = 9          # raysPerSide=4: 2×4+1 (current rebuild, still 13 compiled tags)
-_RAY_SENSOR_N_RAYS_NEW    = 9           # raysPerSide=4: 2×4+1 (future rebuild with 15 tags)
+_RAY_SENSOR_N_RAYS_CURRENT = 9          # raysPerSide=4: 2×4+1 (current binary)
 _RAY_SENSOR_LEN_LEGACY  = _RAY_SENSOR_N_RAYS_LEGACY  * (_RAY_SENSOR_TAGS_PER_RAY_LEGACY + 1)  # 98
 _RAY_SENSOR_LEN_CURRENT = _RAY_SENSOR_N_RAYS_CURRENT * (_RAY_SENSOR_TAGS_PER_RAY_LEGACY + 1)  # 126
-_RAY_SENSOR_LEN_NEW     = _RAY_SENSOR_N_RAYS_NEW     * (_RAY_SENSOR_TAGS_PER_RAY_NEW    + 1)  # 144
+_RAY_SENSOR_LEN_NEW     = _RAY_SENSOR_N_RAYS_CURRENT * (_RAY_SENSOR_TAGS_PER_RAY_NEW    + 1)  # 144 ← actual
 
 # Ray angles per format (AlternatingRayOrder=1, center-first)
 _RAY_ANGLES_7 = [0.0, 23.3, -23.3, 46.6, -46.6, 70.0, -70.0]   # raysPerSide=3, maxDeg=70
@@ -420,9 +417,9 @@ def _parse_raycasts(obs_list: List[Any]) -> List[Dict[str, Any]]:
                 fraction = float(arr[offset + n_tags])
 
                 # Priority-check food indices before falling back to argmax:
-                # indices 3=goodGoal, 4=goodGoalMulti in the 13-tag compiled mapping.
+                # indices 4=goodGoal, 5=goodGoalMulti in the actual prefab tag order.
                 ray_tag: Optional[str] = None
-                for fi in (3, 4):
+                for fi in (4, 5):
                     if fi < len(one_hot) and float(one_hot[fi]) > 0.08:
                         ray_tag = _RAY_SENSOR_TAG_REMAP.get(fi)
                         break

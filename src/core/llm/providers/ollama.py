@@ -83,17 +83,8 @@ class OllamaClient(AbstractLLMClient):
             raw=response,
         )
 
-        if self._run_logger is not None:
-            try:
-                self._run_logger.llm(
-                    prompt=messages[-1]["content"] if messages else "",
-                    response=content,
-                    model=model,
-                    latency_ms=latency_ms,
-                    input_tokens=llm_response.input_tokens,
-                    output_tokens=llm_response.output_tokens,
-                )
-            except Exception:
-                pass
+        # Note: LLM logging is handled by PolicyGenerator's _llm_log_cb,
+        # which has full context (step, trigger_reason, selected action).
+        # Do not log here to avoid duplicate entries in llm.jsonl.
 
         return llm_response

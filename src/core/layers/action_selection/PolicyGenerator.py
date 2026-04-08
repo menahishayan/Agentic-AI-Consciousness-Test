@@ -165,6 +165,18 @@ class PolicyGenerator:
         self._update_pe_streak(context)
 
         fe_scores: Dict[str, float] = context.get("free_energy_scores", {})
+
+        # EFE bypass: skip LLM when one action is unambiguous.
+        # Fires when top score >= 0.95 OR the gap to second place >= 0.4.
+        # At food approach (move_forward=1.0 vs next=0.46, gap=0.54) this
+        # always bypasses the LLM — deliberation only adds latency, not value.
+        if fe_scores and len(fe_scores) >= 2:
+            sorted_scores = sorted(fe_scores.values(), reverse=True)
+            top_score = sorted_scores[0]
+            second_score = sorted_scores[1]
+            if top_score >= 0.95 or (top_score - second_score) >= 0.4:
+                return max(fe_scores, key=lambda k: fe_scores[k])
+
         depth, reason = self._depth(context)
 
         selected = self._call_llm_sync(policies, goals, context, step, depth=depth, trigger_reason=reason)
@@ -384,7 +396,7 @@ class PolicyGenerator:
         stuck_line = (
             f"STUCK: move_forward blocked for {stuck_steps} consecutive steps. "
             f"Turning is required.\n"
-            if motor_eff < 0.3 else ""
+            if motor_eff < 0.3 and stuck_steps >= 5 else ""
         )
 
         return (
@@ -569,7 +581,7 @@ Valid policy_ids: {valid_ids}
 
 ══ STEP 6 — ALLOSTATIC RESOLUTION ══
   Select the action with the highest EFE score that is consistent with the perceptual evidence above.
-  If food is visible in raycasts, move_forward has first-order pragmatic value.{affect_note}{f"{chr(10)}  ⚠ STUCK: move_forward blocked for {context.get('stuck_steps', 0)} steps. You MUST turn." if motor_eff < 0.3 else ""}
+  If food is visible in raycasts, move_forward has first-order pragmatic value.{affect_note}{f"{chr(10)}  ⚠ STUCK: move_forward blocked for {context.get('stuck_steps', 0)} steps. You MUST turn." if motor_eff < 0.3 and context.get('stuck_steps', 0) >= 5 else ""}
 
 REASON: """
 
