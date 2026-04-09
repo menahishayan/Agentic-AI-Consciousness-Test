@@ -239,7 +239,6 @@
     border: 1px solid var(--border);
     border-radius: 10px;
     padding: 12px 14px;
-    margin-top: 72px;
   }
 
   /* ── Episode stats (big-number card) ─────────────────── */
@@ -326,6 +325,7 @@
 
   #llm-feed {
     overflow-y: auto;
+    overflow-x: hidden;
     max-height: 320px;
     display: flex;
     flex-direction: column;
@@ -333,17 +333,27 @@
   }
 
   .llm-feed-row {
-    display: grid;
-    grid-template-columns: 70px 90px 130px 90px;
-    align-items: baseline;
-    gap: 8px;
-    padding: 5px 8px;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    padding: 12px 8px;
     border-radius: 5px;
     font-size: 12px;
     border-left: 2px solid transparent;
+    flex-shrink: 0;
+    min-width: 0;
+    max-width: 100%;
   }
 
   .llm-feed-row:hover { background: var(--surface2); }
+
+  .llm-feed-row .fr-meta {
+    display: grid;
+    grid-template-columns: 58px 80px 85px 1fr;
+    align-items: baseline;
+    gap: 6px;
+    min-width: 0;
+  }
 
   .llm-feed-row .fr-step {
     font-family: monospace;
@@ -373,6 +383,18 @@
     color: var(--accent);
     text-align: right;
     white-space: nowrap;
+  }
+
+  .llm-feed-row .fr-reason {
+    font-family: monospace;
+    font-size: 10px;
+    color: var(--muted);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    padding-left: 6px;
+    border-left: 1px solid var(--border);
+    margin-left: 2px;
   }
 
   .ep-divider {
@@ -477,6 +499,7 @@ const state = {
   llmLastStep: -1,      // last seen step, used to detect episode boundaries
   selectedLlmIdx: null,
   stepAffect: {},       // step -> affect_state string for policy scatter tooltip
+  avHistory: [],        // {x: valence, y: arousal} ring buffer for phase portrait
 };
 
 const POLICY_PALETTE = [
@@ -638,7 +661,7 @@ function buildChartGrid() {
       <div class="chart-wrap"><canvas id="ch-outcome"></canvas></div>
     </div>
     <div class="chart-card">
-      <div class="chart-title">Step Timing (ms) — spikes = LLM calls<span id="timing-avg-label" style="margin-left:10px;font-weight:400;color:var(--muted);"></span></div>
+      <div class="chart-title">Step Timing (ms)<span id="timing-avg-label" style="margin-left:10px;font-weight:400;color:var(--muted);"></span></div>
       <div class="chart-wrap"><canvas id="ch-timing"></canvas></div>
     </div>
 
@@ -648,22 +671,28 @@ function buildChartGrid() {
       <div class="chart-wrap"><canvas id="ch-policy"></canvas></div>
     </div>
 
-    <!-- Row 5 - position + LLM feed side by side -->
+    <!-- Row 5 - position + AV quadrant -->
     <div style="grid-column:span 2;display:grid;grid-template-columns:1fr 1fr;gap:16px;min-height:320px;">
       <div class="chart-card" style="margin:0;">
         <div class="chart-title">Position Trajectory (X / Z)</div>
         <div class="chart-wrap"><canvas id="ch-position"></canvas></div>
       </div>
-      <div id="llm-card" style="grid-column:unset;">
-        <div id="llm-title">LLM Reasoning Feed &nbsp;<span id="timing-avg-label" style="font-weight:400;color:var(--muted);text-transform:none;letter-spacing:0;"></span></div>
-        <div style="display:grid;grid-template-columns:70px 90px 130px 90px;gap:8px;padding:0 8px 4px;border-bottom:1px solid var(--border);flex-shrink:0;">
-          <span style="font-size:10px;color:var(--muted);font-weight:700;text-transform:uppercase;">Step</span>
-          <span style="font-size:10px;color:var(--muted);font-weight:700;text-transform:uppercase;">Trigger</span>
-          <span style="font-size:10px;color:var(--muted);font-weight:700;text-transform:uppercase;">Affect</span>
-          <span style="font-size:10px;color:var(--muted);font-weight:700;text-transform:uppercase;text-align:right;">Action</span>
-        </div>
-        <div id="llm-feed"><div data-placeholder style="color:var(--muted);font-size:12px;padding:8px;">No LLM calls yet.</div></div>
+      <div class="chart-card" style="margin:0;">
+        <div class="chart-title">Affect Phase (Arousal / Valence)</div>
+        <div class="chart-wrap"><canvas id="ch-av-quad"></canvas></div>
       </div>
+    </div>
+
+    <!-- Row 6 - LLM reasoning feed full width -->
+    <div id="llm-card" style="grid-column:span 2;">
+      <div id="llm-title">LLM Reasoning Feed &nbsp;<span id="timing-avg-label" style="font-weight:400;color:var(--muted);text-transform:none;letter-spacing:0;"></span></div>
+      <div style="display:grid;grid-template-columns:58px 80px 85px 1fr;gap:6px;padding:0 8px 4px;border-bottom:1px solid var(--border);flex-shrink:0;">
+        <span style="font-size:10px;color:var(--muted);font-weight:700;text-transform:uppercase;">Step</span>
+        <span style="font-size:10px;color:var(--muted);font-weight:700;text-transform:uppercase;">Trigger</span>
+        <span style="font-size:10px;color:var(--muted);font-weight:700;text-transform:uppercase;">Affect</span>
+        <span style="font-size:10px;color:var(--muted);font-weight:700;text-transform:uppercase;text-align:right;">Action</span>
+      </div>
+      <div id="llm-feed"><div data-placeholder style="color:var(--muted);font-size:12px;padding:8px;">No LLM calls yet.</div></div>
     </div>
 
     <!-- Events -->
@@ -734,6 +763,79 @@ function initCharts() {
 
   // Position scatter
   state.charts.position = makeScatterChart('ch-position', 'Path', '#7c8cf8');
+
+  // Arousal-Valence phase portrait (Russell circumplex)
+  const avCanvas = document.getElementById('ch-av-quad');
+  if (avCanvas) {
+    state.charts.avQuad = new Chart(avCanvas, {
+      type: 'scatter',
+      data: {
+        datasets: [
+          {
+            label: 'Trail',
+            data: [],
+            backgroundColor: 'rgba(124,140,248,0.22)',
+            pointRadius: 3,
+            pointHoverRadius: 3,
+            order: 2,
+          },
+          {
+            label: 'Now',
+            data: [],
+            backgroundColor: '#ff79c6',
+            borderColor: '#1a1d27',
+            borderWidth: 2,
+            pointRadius: 8,
+            pointHoverRadius: 10,
+            order: 1,
+          },
+        ],
+      },
+      options: {
+        animation: false,
+        responsive: true,
+        maintainAspectRatio: false,
+        scales: {
+          x: {
+            min: -1, max: 1,
+            title: { display: true, text: 'Valence →', color: '#6b7280', font: { size: 10 } },
+            ticks: { color: '#6b7280', font: { size: 9 }, stepSize: 0.5 },
+            grid: { color: 'rgba(45,50,80,0.6)' },
+            border: { color: '#2d3250' },
+          },
+          y: {
+            min: 0, max: 1,
+            title: { display: true, text: 'Arousal →', color: '#6b7280', font: { size: 10 } },
+            ticks: { color: '#6b7280', font: { size: 9 }, stepSize: 0.5 },
+            grid: { color: 'rgba(45,50,80,0.6)' },
+            border: { color: '#2d3250' },
+          },
+        },
+        plugins: {
+          legend: { display: false },
+          annotation: {
+            annotations: {
+              qTL: { type: 'box', xMin: -1, xMax: 0, yMin: 0.5, yMax: 1, backgroundColor: 'rgba(248,113,113,0.07)', borderWidth: 0 },
+              qTR: { type: 'box', xMin: 0, xMax: 1, yMin: 0.5, yMax: 1, backgroundColor: 'rgba(124,140,248,0.07)', borderWidth: 0 },
+              qBL: { type: 'box', xMin: -1, xMax: 0, yMin: 0, yMax: 0.5, backgroundColor: 'rgba(107,114,128,0.07)', borderWidth: 0 },
+              qBR: { type: 'box', xMin: 0, xMax: 1, yMin: 0, yMax: 0.5, backgroundColor: 'rgba(80,250,123,0.07)', borderWidth: 0 },
+              vLine: { type: 'line', xMin: 0, xMax: 0, borderColor: 'rgba(45,50,80,0.9)', borderWidth: 1, borderDash: [4, 4] },
+              hLine: { type: 'line', yMin: 0.5, yMax: 0.5, borderColor: 'rgba(45,50,80,0.9)', borderWidth: 1, borderDash: [4, 4] },
+              lTL: { type: 'label', xValue: -0.72, yValue: 0.93, content: 'DISTRESS', color: 'rgba(248,113,113,0.45)', font: { size: 8, weight: '700' } },
+              lTR: { type: 'label', xValue: 0.65, yValue: 0.93, content: 'EXCITEMENT', color: 'rgba(124,140,248,0.45)', font: { size: 8, weight: '700' } },
+              lBL: { type: 'label', xValue: -0.70, yValue: 0.07, content: 'LETHARGY', color: 'rgba(107,114,128,0.45)', font: { size: 8, weight: '700' } },
+              lBR: { type: 'label', xValue: 0.65, yValue: 0.07, content: 'CALM', color: 'rgba(80,250,123,0.45)', font: { size: 8, weight: '700' } },
+            },
+          },
+          tooltip: {
+            callbacks: {
+              label: (ctx) => `A=${ctx.parsed.y.toFixed(2)}  V=${ctx.parsed.x.toFixed(2)}`,
+            },
+          },
+        },
+      },
+    });
+  }
 }
 
 function destroyCharts() {
@@ -776,6 +878,16 @@ function ingestMetric(row) {
 
   // policy scatter
   ingestPolicy(step, row.policy_id, row.affect_state);
+
+  // AV phase portrait
+  if (row.arousal != null && row.valence != null) {
+    state.avHistory.push({ x: row.valence, y: row.arousal });
+    if (state.avHistory.length > 60) state.avHistory.shift();
+    if (state.charts.avQuad) {
+      state.charts.avQuad.data.datasets[0].data = state.avHistory.slice(0, -1);
+      state.charts.avQuad.data.datasets[1].data = state.avHistory.slice(-1);
+    }
+  }
 
   scheduleUpdate();
 }
@@ -938,10 +1050,12 @@ function renderLlmFeedRow(row) {
   // Remove placeholder
   if (feed.querySelector('[data-placeholder]')) feed.innerHTML = '';
 
-  const { reason, action } = extractReasonAction(row.response || '');
+  const action = row.selected || extractReasonAction(row.response || '').action;
   const trigger = row.trigger_reason || 'initial';
   // Affect: prefer value stored from metrics at the same step
   const affect = state.stepAffect[row.step] || '';
+  // reason: new field — attribution line for fast mode, one-sentence for full mode
+  const reasonLine = row.reason || null;
 
   // Episode divider
   const idx = state.llmCalls.length - 1;
@@ -955,10 +1069,13 @@ function renderLlmFeedRow(row) {
   const el = document.createElement('div');
   el.className = 'llm-feed-row';
   el.innerHTML = `
-    <span class="fr-step">Step ${row.step ?? '?'}</span>
-    <span class="fr-trigger">${escHtml(trigger)}</span>
-    <span class="fr-affect">${escHtml(affect)}</span>
-    <span class="fr-action">${escHtml(action)}</span>
+    <div class="fr-meta">
+      <span class="fr-step">Step ${row.step ?? '?'}</span>
+      <span class="fr-trigger">${escHtml(trigger)}</span>
+      <span class="fr-affect">${escHtml(affect)}</span>
+      <span class="fr-action">${escHtml(action)}</span>
+    </div>
+    ${reasonLine ? `<div class="fr-reason">${escHtml(reasonLine)}</div>` : ''}
   `;
   feed.appendChild(el);
   // Keep newest rows visible
@@ -1005,6 +1122,7 @@ async function selectRun(runId) {
   state.llmEpisode = 0;
   state.llmLastStep = -1;
   state.selectedLlmIdx = null;
+  state.avHistory = [];
   state.stepAffect = {};
   const avgLabel = document.getElementById('timing-avg-label');
   if (avgLabel) avgLabel.textContent = '';

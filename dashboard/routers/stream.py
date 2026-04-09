@@ -122,6 +122,8 @@ async def _run_stream(
                     "t": row.get("t"),
                     "model": row.get("model"),
                     "trigger_reason": row.get("trigger_reason", ""),
+                    "selected": row.get("selected"),
+                    "reason": row.get("reason"),
                     "latency_ms": row.get("latency_ms"),
                     "input_tokens": row.get("input_tokens"),
                     "output_tokens": row.get("output_tokens"),
