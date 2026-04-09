@@ -256,12 +256,7 @@ class AgentLoop:
         )
 
         if DEBUG:
-            _motor_pe_dbg = 0.0
-            if pe_batch:
-                for _e in pe_batch.errors:
-                    if _e.channel == "motor":
-                        _motor_pe_dbg = float(_e.magnitude)
-                        break
+            _motor_pe_dbg = pe_batch.motor_pe if pe_batch else 0.0
             self._dbg(f"[DBG STEP {step}] signals →")
             self._dbg(f"  arousal={av.arousal:.4f}  valence={av.valence:.4f}  "
                   f"lr_mod={av.learning_rate_mod:.4f}")
@@ -271,16 +266,11 @@ class AgentLoop:
                 self._dbg(f"    {_s.channel_id}: val={_s.current_value:.4f}  "
                       f"urgency={_s.urgency:.4f}")
             if pe_batch:
-                self._dbg(f"  PE mean={pe_batch.mean_magnitude:.4f}  "
-                      f"max={pe_batch.max_magnitude:.4f}")
-                _me = next((e for e in pe_batch.errors if e.channel == "motor"), None)
-                if _me:
-                    _warn = "  *** always 1.0 = motor_efficiency broken" if _me.magnitude > 0.9 else ""
-                    self._dbg(f"  PE motor: expected={_me.expected:.3f}  "
-                          f"observed={_me.observed:.3f}  "
-                          f"magnitude={_me.magnitude:.4f}{_warn}")
-            self._dbg(f"  lc_ne_motor_pe_contribution≈{min(_motor_pe_dbg, 1.0) * 0.4:.4f}  "
-                  f"(should be ~0 in open space, ~0.4 at wall)")
+                self._dbg(f"  PE mean(perceptual)={pe_batch.mean_magnitude:.4f}  "
+                      f"motor={_motor_pe_dbg:.4f}  max={pe_batch.max_magnitude:.4f}")
+                _warn = "  *** always 1.0 = motor_efficiency broken" if _motor_pe_dbg > 0.9 else ""
+                self._dbg(f"  lc_ne_motor_pe_contribution≈{min(_motor_pe_dbg, 1.0) * 0.4:.4f}"
+                      f"  (should be ~0 in open space, ~0.4 at wall){_warn}")
 
         # --- Layer 4: Metacognitive ---
         context = self._metacognitive.update(self._workspace, [], step)

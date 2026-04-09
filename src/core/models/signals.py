@@ -62,15 +62,31 @@ class PredictionError:
 class PredictionErrorBatch:
     """Published as kind='prediction_error' to GlobalWorkspace."""
     errors: List[PredictionError]
-    mean_magnitude: float = 0.0
     max_magnitude: float = 0.0
     step: int = 0
 
     def __post_init__(self) -> None:
         if self.errors:
-            mags = [e.magnitude for e in self.errors]
-            self.mean_magnitude = sum(mags) / len(mags)
-            self.max_magnitude = max(mags)
+            self.max_magnitude = max(e.magnitude for e in self.errors)
+
+    @property
+    def mean_magnitude(self) -> float:
+        """Mean PE across perceptual channels only — motor efference copy excluded.
+
+        Motor PE (wall collisions, stuck detection) is a proprioceptive signal on
+        a separate LC-NE pathway and should not contaminate perceptual surprise.
+        Consumers that need motor PE should use the motor_pe property.
+        """
+        perceptual = [e.magnitude for e in self.errors if e.channel != "motor"]
+        return sum(perceptual) / len(perceptual) if perceptual else 0.0
+
+    @property
+    def motor_pe(self) -> float:
+        """Motor efference copy PE — dedicated LC-NE pathway signal."""
+        for e in self.errors:
+            if e.channel == "motor":
+                return e.magnitude
+        return 0.0
 
 
 @dataclass

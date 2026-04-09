@@ -373,13 +373,40 @@ class PolicyGenerator:
         else:
             recent_line = ""
 
+        # Food-proximity line: three distinct cases.
+        # Case 1 — dist < 0.02 AND blocked: ambiguous wall/food contact; let history arbitrate.
+        # Case 2 — dist < 0.3 AND not ambiguous: genuine close food; assert PRIORITY directive.
+        # Case 3 — no close food: standard override instruction based on recent failures.
+        food_override_line = ""
+        override_instruction = "If recent shows repeated failures AND no food close, override EFE."
+        raycast_hits = context.get("raycast_hits") or []
+        motor_eff = float(context.get("motor_efficiency", 1.0))
+        close_food = next(
+            (r for r in raycast_hits
+             if r.get("hit_tag") in ("GoodGoal", "GoodGoalMulti")
+             and float(r.get("distance", 1.0)) < 0.3
+             and abs(float(r.get("angle_deg", 90.0))) < 30),
+            None,
+        )
+        if close_food:
+            _dist = float(close_food.get("distance", 0.0))
+            _ambiguous = _dist < 0.02 and motor_eff < 0.3
+            if _ambiguous:
+                # dist=0.00 + blocked = could be wall. Don't override history.
+                food_override_line = f"food_fwd dist={_dist:.2f} | BLOCKED — may be wall, turn or back up\n"
+                override_instruction = "Recent blocked steps suggest wall contact. Consider turn or move_backward."
+            else:
+                food_override_line = f"food_fwd dist={_dist:.2f} → PRIORITY: move_forward to collect\n"
+                override_instruction = "If food close (dist<0.3), always approach regardless of recent history."
+
         valid_ids = " | ".join(p["policy_id"] for p in policies)
         return (
             f"Step {step}. Actions: {valid_ids}\n"
             f"{dominant_drive}={dominant_urgency:.2f} A={arousal:.2f} V={valence:.2f}\n"
+            f"{food_override_line}"
             f"EFE: {top_action}={top_efe:.2f} vs {runner_up}={runner_up_efe:.2f} | key={decisive_signal}\n"
             f"{recent_line}"
-            f"\nIf recent shows repeated failures, override EFE and explain why.\n"
+            f"\n{override_instruction}\n"
             f"Reply on one line: <action>: <reason>\n"
         )
 

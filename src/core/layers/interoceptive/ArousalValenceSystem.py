@@ -169,15 +169,8 @@ class ArousalValenceSystem:
             step:         Current episode step
             raycast_hits: Forward raycast hits (for food proximity anticipation)
         """
-        # Extract motor PE from the efference copy channel (LC-NE input).
-        motor_pe = 0.0
-        pe_mean = 0.0
-        if pe_batch:
-            for err in pe_batch.errors:
-                if err.channel == "motor":
-                    motor_pe = float(err.magnitude)
-                    break
-            pe_mean = pe_batch.mean_magnitude
+        motor_pe = pe_batch.motor_pe if pe_batch else 0.0
+        pe_mean = pe_batch.mean_magnitude if pe_batch else 0.0
 
         current_health = float(vitals.get("health") or 0.0)
         current_sat = float(vitals.get("saturation") or 0.0)

@@ -323,15 +323,19 @@ class FreeEnergyMinimizer:
             # for at least 2 consecutive steps (streak guard stops spurious first-obs firing).
             # motor_eff=0.0 → combined*0.30; motor_eff=0.29 → combined*0.50.
             #
-            # EXEMPTION: do not penalise move_forward when food is adjacent (dist < 0.15).
+            # EXEMPTION: do not penalise move_forward when food is adjacent (dist < 0.015).
             # The food item itself causes the motor stall — penalising move_forward in this
             # state causes the agent to retreat from food it is already touching.
-            food_adj = (food_ray is not None
-                        and float(food_ray.get("distance", 1.0)) < 0.015)
+            # EXCEPTION TO EXEMPTION: after 5+ consecutive blocked steps at dist < 0.02,
+            # the object is almost certainly a wall, not food — withdraw the exemption so
+            # EFE can route to a turn or back-up to escape the terminal loop.
+            food_dist = float(food_ray.get("distance", 1.0)) if food_ray is not None else 1.0
+            food_adj = food_ray is not None and food_dist < 0.015
+            wall_trap = food_adj and self._motor_fail_streak >= 5 and food_dist < 0.02
             if (pid == last_action
                     and motor_eff < 0.3
                     and self._motor_fail_streak >= 2
-                    and not (pid == "move_forward" and food_adj)):
+                    and not (pid == "move_forward" and food_adj and not wall_trap)):
                 combined = combined * (0.3 + 0.7 * motor_eff)
 
             scores[pid] = float(max(0.0, min(1.0, combined)))
@@ -359,10 +363,6 @@ class FreeEnergyMinimizer:
         if len(non_idle) < 2:
             return "single_option"
 
-        # Motor failure streak overrides component analysis — stuck is the signal.
-        if self._motor_fail_streak >= 2:
-            return f"stuck_streak={self._motor_fail_streak}"
-
         sorted_pids = sorted(non_idle, key=lambda p: non_idle[p], reverse=True)
         winner, runner_up = sorted_pids[0], sorted_pids[1]
         w = breakdowns[winner]
@@ -383,11 +383,21 @@ class FreeEnergyMinimizer:
         if decisive == "food_bonus" and food_ray:
             angle = float(food_ray.get("angle_deg", 0.0))
             dist  = float(food_ray.get("distance",  1.0))
-            direction = "fwd" if abs(angle) < 20 else ("left" if angle < 0 else "right")
-            return f"food_{direction}@{dist:.2f}"
+            direction = "AHEAD" if abs(angle) < 20 else ("LEFT" if angle < 0 else "RIGHT")
+            # Directive suffix tells the LLM what to do, not just what was observed.
+            # When food is close and visible, also suppress stuck_streak from the key
+            # — the two signals are contradictory and stuck_streak wins in the LLM.
+            action_directive = "APPROACH" if direction == "AHEAD" else f"TURN_{direction}_THEN_APPROACH"
+            return f"food_{direction}_dist={dist:.2f}_{action_directive}"
         if decisive == "pragmatic" and drive_batch:
+            # Motor failure streak only surfaces when food is NOT the decisive signal,
+            # so it never contradicts a visible food directive.
+            if self._motor_fail_streak >= 2:
+                return f"stuck_streak={self._motor_fail_streak}"
             return f"{drive_batch.dominant_channel}@{drive_batch.max_urgency:.2f}"
         if decisive == "epistemic":
+            if self._motor_fail_streak >= 2:
+                return f"stuck_streak={self._motor_fail_streak}"
             if winner in _EPISTEMIC_ACTIONS:
                 return f"novelty@{area_novelty:.2f}"
             return f"pe@{pe_mean:.3f}"
