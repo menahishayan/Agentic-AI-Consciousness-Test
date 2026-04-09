@@ -95,7 +95,14 @@ class AgentLoop:
         self._policy_gen.set_policy_history_callback(memory.get_ltm_success_rate)
         self._policy_gen.set_episodic_memory_callback(memory.query_similar_traces)
 
-        def _llm_log_cb(prompt: str, resp: Any, reason: str, step: int, selected: Optional[str] = None) -> None:
+        def _llm_log_cb(
+            prompt: str,
+            resp: Any,
+            reason: str,
+            step: int,
+            selected: Optional[str] = None,
+            llm_reason: Optional[str] = None,
+        ) -> None:
             logger.llm(
                 prompt=prompt,
                 response=resp.content,
@@ -105,6 +112,7 @@ class AgentLoop:
                 output_tokens=resp.output_tokens or 0,
                 trigger_reason=reason,
                 selected=selected,
+                reason=llm_reason,
                 step=step,
             )
 
@@ -124,8 +132,11 @@ class AgentLoop:
         self._current_state: Optional[AgentState] = None
         self._last_policy_id: Optional[str] = None
         self._step: int = 0
-        # Rolling action history for LLM context (last 10 actions)
+        # Rolling action history for LLM context (last 10 actions).
+        # _recent_motor_effs is a parallel list: motor_efficiency of next_state
+        # after each action, so the prompt can annotate each step as blocked/ok.
         self._recent_actions: List[str] = []
+        self._recent_motor_effs: List[float] = []
         # Previous step's arousal — passed to PEC so LC-NE precision scaling uses
         # the arousal that was current when the action was taken, not the one computed
         # from its outcome (which isn't available yet at PEC call time).
@@ -283,8 +294,10 @@ class AgentLoop:
         self._last_arousal = av.arousal   # carried into next step's PEC precision
         # Last action — excluded from candidates when arousal is high
         context["last_action"] = self._last_policy_id
-        # Rolling history for LLM prompt — lets the model detect repetition
+        # Rolling history for LLM prompt — lets the model detect repetition.
+        # recent_motor_effs is parallel: outcome efficiency of each past action.
         context["recent_actions"] = list(self._recent_actions)
+        context["recent_motor_effs"] = list(self._recent_motor_effs)
         # Raycast hits from perception — directional food/threat bearing for LLM.
         # Use `or []` so context always holds a list; downstream consumers (FEA,
         # PolicyGenerator) iterate directly without their own None-guards.
@@ -309,6 +322,7 @@ class AgentLoop:
             context=context,
         )
         context["free_energy_scores"] = fe_scores
+        context["decisive_signal"] = self._free_energy.last_decisive_signal
 
         # --- Layer 3: Policy selection ---
         selected_id = self._policy_gen.propose_action(
@@ -327,10 +341,14 @@ class AgentLoop:
         next_state, done = self._motor.execute(selected_id)
         self._last_policy_id = selected_id
         self._current_state = next_state
-        # Maintain rolling action history (last 10 steps)
+        # Maintain rolling action history (last 10 steps).
+        # Parallel list records the motor outcome so prompts can show blocked/ok.
         self._recent_actions.append(selected_id)
         if len(self._recent_actions) > 10:
             self._recent_actions.pop(0)
+        self._recent_motor_effs.append(float(next_state.raw_metadata.get("motor_efficiency", 1.0)))
+        if len(self._recent_motor_effs) > 10:
+            self._recent_motor_effs.pop(0)
 
         # --- Layer 2: World model learning ---
         self._world_model.update(
@@ -346,65 +364,84 @@ class AgentLoop:
         self._memory.update_state_outcome(next_state)
         self._memory.record_prediction_error(next_state, pe_batch, action=selected_id)
 
-        # Outcome score: drive-relief based.
+        # Outcome score: causal action effectiveness.
         #
-        # Measures whether this action reduced allostatic urgency, not whether
-        # urgency is currently low. An agent at low urgency scoring high for
-        # every action (including wall hits) would give the LTM no useful signal.
-        #
-        # relief > 0 → action reduced urgency (good)
-        # relief < 0 → action increased urgency (bad, e.g. depletion tick with no progress)
-        #
-        # Per-step urgency change is tiny (~0.001–0.002); scale=5 spreads the
-        # signal so ±0.1 relief maps to ±0.5 around the neutral midpoint of 0.5.
-        # A food collection (~0.18 urgency relief) saturates to 1.0.
-        #
-        # Motor efficiency is a necessary second component: without it, move_forward
-        # into a wall and turn_right produce the same drive urgency delta in most
-        # steps, so the LTM can't differentiate them. motor_eff=0 (wall-blocked)
-        # pulls the score down regardless of urgency change.
+        # Four components measuring orthogonal consequence types so the LTM
+        # receives a gradient that differentiates actions with identical
+        # homeostatic outcomes but different strategic values.
         next_vitals = self._vital_monitor.read(next_state)
-        prev_urgency = drive_batch.max_urgency
-        next_urgency = self._allostatic.peek_max_urgency(next_vitals)
-        relief = prev_urgency - next_urgency
-        relief_score = max(0.0, min(1.0, 0.5 + relief * 5.0))
-
-        # Homeostatic delta: direct physiological improvement this step.
-        # Replaces motor_eff * 0.3, which was always 0.0 when the proprioceptive
-        # obs wasn't available and added no signal. A positive health+saturation
-        # delta is the ground-truth consequence of successful foraging.
         prev_health = float(prev_state.homeostasis.health or 0.0)
         prev_sat = float(prev_state.homeostasis.saturation or 0.0)
         next_health = float(next_state.homeostasis.health or 0.0)
         next_sat = float(next_state.homeostasis.saturation or 0.0)
-        homeo_delta = max(0.0, (next_health - prev_health) + (next_sat - prev_sat))
+        prev_rc = prev_state.perception.raycast_hits or []
+        next_rc = next_state.perception.raycast_hits or []
+        prev_threat_v = float(vitals.get("threat_proximity") or 0.0)
+        next_threat_v = float(next_vitals.get("threat_proximity") or 0.0)
 
-        # Exteroceptive component: did food distance change as the world model expected?
-        # Only computed when move_forward was executed with food visible.
-        # Differentiates "moving toward food" from "blocked facing food" — two outcomes
-        # that produce identical drive relief but opposite exteroceptive consequences.
-        extero_match = 1.0
+        # 1. Homeostatic RPE: actual delta minus expected passive loss, centred at 0.5.
+        #    Single signal replacing the correlated (relief_score, homeo_delta) pair.
+        #    ~0 on a passive depletion tick; ~0.9 on food collection.
+        _homeo_cfg = self._config.get("adapter_config", {}).get("homeostatic", {})
+        _expected_delta = -(
+            float(_homeo_cfg.get("health_depletion_rate", 0.002))
+            + float(_homeo_cfg.get("saturation_depletion_rate", 0.002))
+        )
+        _actual_delta = (next_health - prev_health) + (next_sat - prev_sat)
+        homeo_score = max(0.0, min(1.0, 0.5 + (_actual_delta - _expected_delta) * 3.0))
+
+        # 2. Motor alignment: perceptual consequence matches action's causal expectation.
+        #    Extends the former move_forward-only extero_match to all action types so
+        #    "turned toward food" and "turned away from food" receive different scores
+        #    even when their homeostatic outcomes are identical.
+        #    Idle → neutral (no expected perceptual change).
+        motor_align = 0.5
         if selected_id == "move_forward":
-            prev_rc = prev_state.perception.raycast_hits
-            next_rc = next_state.perception.raycast_hits
-            if prev_rc and next_rc:
-                p_food = next(
-                    (r for r in prev_rc if r.get("hit_tag") in ("GoodGoal", "GoodGoalMulti")), None
-                )
-                n_food = next(
-                    (r for r in next_rc if r.get("hit_tag") in ("GoodGoal", "GoodGoalMulti")), None
-                )
-                if p_food:
-                    prev_dist = float(p_food.get("distance", 1.0))
-                    next_dist = float(n_food.get("distance", prev_dist)) if n_food else prev_dist
-                    actual_delta = next_dist - prev_dist   # negative = approached
-                    heading_deg = float(prev_state.position.heading or 0.0)
-                    expected_delta = self._world_model.get_expected_delta(
-                        "move_forward", "food_distance", heading_deg
-                    )
-                    extero_match = max(0.0, min(1.0, 1.0 - abs(expected_delta - actual_delta)))
+            p_food = next((r for r in prev_rc if r.get("hit_tag") in ("GoodGoal", "GoodGoalMulti")), None)
+            n_food = next((r for r in next_rc if r.get("hit_tag") in ("GoodGoal", "GoodGoalMulti")), None)
+            if p_food:
+                prev_dist = float(p_food.get("distance", 1.0))
+                next_dist = float(n_food.get("distance", prev_dist)) if n_food else prev_dist
+                motor_align = max(0.0, min(1.0, 0.5 + (prev_dist - next_dist) * 5.0))
+        elif selected_id in ("turn_left", "turn_right"):
+            # |angle_deg| decreased → food moved toward center → good turn.
+            # Scaled by sensor range (80°): 10° improvement → motor_align ≈ 0.625.
+            p_food = next((r for r in prev_rc if r.get("hit_tag") in ("GoodGoal", "GoodGoalMulti")), None)
+            n_food = next((r for r in next_rc if r.get("hit_tag") in ("GoodGoal", "GoodGoalMulti")), None)
+            if p_food and n_food:
+                p_angle = abs(float(p_food.get("angle_deg", 0.0)))
+                n_angle = abs(float(n_food.get("angle_deg", 0.0)))
+                motor_align = max(0.0, min(1.0, 0.5 + (p_angle - n_angle) / 80.0))
+        elif selected_id == "move_backward":
+            # Backing away from threat → threat distance increased.
+            motor_align = max(0.0, min(1.0, 0.5 + (prev_threat_v - next_threat_v) * 5.0))
 
-        outcome_score = float(max(0.0, min(1.0, relief_score * 0.5 + homeo_delta * 0.3 + extero_match * 0.2)))
+        # 3. Threat outcome: did threat recede this step, regardless of homeostasis?
+        #    Applies to all actions; escaping danger is a success on its own axis.
+        threat_score = max(0.0, min(1.0, 0.5 + (prev_threat_v - next_threat_v) * 5.0))
+
+        # 4. Epistemic yield: novelty gain during low-urgency exploratory steps.
+        #    Active only when no food visible and urgency < 0.4; neutral (0.5) otherwise.
+        #    Moving to a less-familiar area is epistemically valuable even if it
+        #    produces no immediate homeostatic benefit.
+        epistemic_score = 0.5
+        _food_visible_prev = any(
+            r.get("hit_tag") in ("GoodGoal", "GoodGoalMulti") for r in prev_rc
+        )
+        if not _food_visible_prev and drive_batch.max_urgency < 0.4:
+            _next_area = next_state.perception.area_id or "unknown"
+            _next_familiarity = self._memory.get_area_familiarity(_next_area)
+            # familiarity = pre-action familiarity of current area (computed above).
+            # Moving to a less-familiar area → positive delta → score > 0.5.
+            _novelty_delta = familiarity - _next_familiarity
+            epistemic_score = max(0.0, min(1.0, 0.5 + _novelty_delta * 5.0))
+
+        outcome_score = float(max(0.0, min(1.0,
+            homeo_score     * 0.35
+            + motor_align   * 0.30
+            + threat_score  * 0.20
+            + epistemic_score * 0.15
+        )))
 
         # Situation note for episodic memory — encodes perceptual context + causal
         # consequence so the LLM can read "GoodGoal at 1.32, health_delta=+0.300" and

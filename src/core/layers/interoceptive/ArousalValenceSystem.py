@@ -97,7 +97,10 @@ class ArousalValenceSystem:
         # already raises arousal (LC-NE); this completes the state by adding
         # negative valence so high-arousal + negative-valence = frustration.
         self._frustration_weight: float = float(av.get("frustration_weight", 0.30))
-        self._frustration_pe_threshold: float = float(av.get("frustration_pe_threshold", 0.30))
+        # Raised from 0.30 → 0.50: routine blocked turns produce motor PE ~0.3–0.4,
+        # which was triggering frustration (high arousal + negative valence) on nearly
+        # every step during stuck sequences, causing anti-correlated AV signals.
+        self._frustration_pe_threshold: float = float(av.get("frustration_pe_threshold", 0.50))
 
         # ── Contentment: quiescent regulatory success ────────────────────
         # Seth (2021): low urgency across all drives = interoceptive target met.
@@ -108,7 +111,7 @@ class ArousalValenceSystem:
         # ── Anxiety: high PE without locatable source ────────────────────
         # Davis & Whalen (2001): amygdala CeA → anxious state without explicit
         # conditioned stimulus. Distinct from fear: no proximal threat detected.
-        self._anxiety_pe_threshold: float = float(av.get("anxiety_pe_threshold", 0.25))
+        self._anxiety_pe_threshold: float = float(av.get("anxiety_pe_threshold", 0.40))
         self._anxiety_threat_ceiling: float = float(av.get("anxiety_threat_ceiling", 0.15))
         self._anxiety_weight: float = float(av.get("anxiety_weight", 0.20))
 
@@ -129,6 +132,15 @@ class ArousalValenceSystem:
         self._stress_arousal_weight: float = float(av.get("stress_arousal_weight", 0.15))
         self._stress_valence_weight: float = float(av.get("stress_valence_weight", 0.20))
         self._stress_ema: float = 0.0
+
+        # ── Arousal temporal smoothing ───────────────────────────────────
+        # Arousal EMA decay. 0.50 = ~1-step half-life, so routine per-step PE
+        # dissipates quickly and doesn't accumulate into a tonic floor that
+        # chronically inflates the epistemic weight in FEM.
+        # 0.85 was too slow: arousal sat at 0.25–0.29 all run, biasing EFE
+        # toward turns (high epistemic) over move_forward (high pragmatic).
+        self._arousal_decay: float = float(av.get("arousal_decay", 0.50))
+        self._prev_arousal: float = 0.0
 
         # ── Persisted state ──────────────────────────────────────────────
         self._prev_threat: float = 0.0
@@ -189,7 +201,6 @@ class ArousalValenceSystem:
             raycast_hits=raycast_hits,
             motor_pe=motor_pe,
             drive_batch=drive_batch,
-            pe_batch=pe_batch,
             stress_ema=self._stress_ema,
         )
 
@@ -275,7 +286,12 @@ class ArousalValenceSystem:
                 and motor_pe > self._fatigue_motor_threshold):
             raw -= self._fatigue_arousal_suppression * min(energy_urgency, 1.0)
 
-        return float(min(1.0, max(0.0, raw)))
+        # Temporal smoothing: sympathetic arousal rises fast, decays slowly.
+        # EMA with high decay keeps the signal as a sustained envelope rather
+        # than a step-wise mirror of instantaneous PE.
+        smoothed = self._prev_arousal * self._arousal_decay + raw * (1.0 - self._arousal_decay)
+        self._prev_arousal = smoothed
+        return float(min(1.0, max(0.0, smoothed)))
 
     def _compute_valence(
         self,
@@ -285,7 +301,6 @@ class ArousalValenceSystem:
         raycast_hits: Optional[List] = None,
         motor_pe: float = 0.0,
         drive_batch: Optional[DriveSignalBatch] = None,
-        pe_batch: Optional[PredictionErrorBatch] = None,
         stress_ema: float = 0.0,
     ) -> float:
         """
@@ -360,18 +375,18 @@ class ArousalValenceSystem:
         if drive_batch and max_urgency < self._contentment_floor:
             contentment = self._contentment_baseline
 
-        # Anxiety: high PE without locatable source → diffuse dread.
-        # Distinct from fear (proximal threat) and curiosity (same arousal, no
-        # negative valence). Fires only when all three conditions hold:
-        #   - mean PE is elevated (unexplained prediction errors)
-        #   - no proximal threat (otherwise this is fear)
-        #   - no food visible (otherwise positive-valence explanation exists)
+        # Anxiety: sustained unexplained PE → diffuse dread.
+        # Uses _stress_ema (tonic, ~20-step window) not instantaneous pe_mean,
+        # so anxiety accumulates over time rather than firing/un-firing every
+        # step in sync with PE oscillations. Fires only when all three hold:
+        #   - tonic stress is elevated (unexplained PE persisting over time)
+        #   - no proximal threat (otherwise this is fear, not anxiety)
+        #   - no food visible (otherwise a positive-valence explanation exists)
         anxiety = 0.0
-        pe_mean = pe_batch.mean_magnitude if pe_batch else 0.0
-        if (pe_mean > self._anxiety_pe_threshold
+        if (stress_ema > self._anxiety_pe_threshold
                 and threat < self._anxiety_threat_ceiling
                 and not food_detected):
-            excess = min((pe_mean - self._anxiety_pe_threshold)
+            excess = min((stress_ema - self._anxiety_pe_threshold)
                          / max(1.0 - self._anxiety_pe_threshold, 1e-6), 1.0)
             anxiety = -self._anxiety_weight * excess
 

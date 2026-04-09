@@ -98,6 +98,9 @@ class FreeEnergyMinimizer:
         # — the agent is spinning next to food it can't reach via turning alone.
         self._stuck_turn_angle: Optional[float] = None
         self._stuck_turn_streak: int = 0
+        # Set after every score() call — whichever EFE component drove the gap
+        # between winner and runner-up. Read by PolicyGenerator for the fast prompt.
+        self.last_decisive_signal: str = ""
 
     def _food_bonus_for_action(
         self,
@@ -148,6 +151,8 @@ class FreeEnergyMinimizer:
         """
         area_novelty = 1.0 - float(area_familiarity)
         scores: Dict[str, float] = {}
+        # Per-action EFE component breakdown — used to identify decisive_signal.
+        breakdowns: Dict[str, Dict[str, float]] = {}
 
         max_urgency = drive_batch.max_urgency if drive_batch else 0.0
         pe_mean = pe_batch.mean_magnitude if pe_batch else 0.0
@@ -155,11 +160,12 @@ class FreeEnergyMinimizer:
         # Valence precision scaler on the pragmatic term.
         # Negative valence (threat/deprivation) → drive relief is more valuable → amplify.
         # Positive valence (satiated/safe) → epistemic foraging can dominate → suppress.
-        # Scale is centered at 1.0 and moves ±0.3 across the [-1, 1] valence range:
-        #   valence=-1.0 → ×1.3  |  valence=0.0 → ×1.0  |  valence=+1.0 → ×0.7
-        # Seth (2021): valence modulates the precision of interoceptive predictions.
+        # Positive valence amplifies pragmatic drive; negative suppresses it.
+        # Corrected direction: valence=+1.0 → ×1.3 (food visible, approach rewarded),
+        #                      valence=-1.0 → ×0.7 (threat/frustration, caution).
+        # Previous formula was inverted: food proximity was dampening move_forward.
         valence = float(context.get("valence", 0.0)) if context else 0.0
-        valence_precision = max(0.7, min(1.3, 1.0 - 0.3 * valence))
+        valence_precision = max(0.7, min(1.3, 1.0 + 0.3 * valence))
 
         # LC-NE gain: arousal scales epistemic weight (Aston-Jones & Cohen 2005).
         # High arousal = tonic LC → shift exploitation→exploration.
@@ -282,8 +288,8 @@ class FreeEnergyMinimizer:
             # Recency penalty: suppress recently-repeated actions.
             # Threshold=2: fires after the action appears twice in the last 4 steps.
             # 0.25 penalty is large enough to flip a marginal EFE winner.
-            if _recent_window.count(pid) >= 2:
-                combined -= 0.25
+            _recency_penalty = 0.25 if _recent_window.count(pid) >= 2 else 0.0
+            combined -= _recency_penalty
 
             # Food-proximity bonus via window-based per-action method.
             # Close food (dist < 0.10): alignment irrelevant — just move.
@@ -291,16 +297,27 @@ class FreeEnergyMinimizer:
             #   adjacent food is counterproductive).
             # Far food (dist ≥ 0.10): delegate to _food_bonus_for_action which
             #   checks each action's angular window against all food rays.
+            _food_bonus = 0.0
             if food_candidates:
                 food_dist_min = min(r.get("distance", 1.0) for r in food_candidates)
                 if food_dist_min < 0.01:
                     if pid == "move_forward":
-                        combined += (1.0 - food_dist_min) * self._food_proximity_bonus * 1.5
+                        _food_bonus = (1.0 - food_dist_min) * self._food_proximity_bonus * 1.5
                     # No turn bonus when food is adjacent.
                 else:
-                    combined += self._food_bonus_for_action(
+                    _food_bonus = self._food_bonus_for_action(
                         food_candidates, pid, _turn_bonus_scale
                     )
+            combined += _food_bonus
+
+            # Track per-component breakdown for decisive_signal (read after loop).
+            breakdowns[pid] = {
+                "pragmatic": pragmatic * self._w_pragmatic * valence_precision,
+                "epistemic": epistemic * w_epistemic_eff,
+                "motor_cost": motor_cost * self._w_motor_cost,
+                "food_bonus": _food_bonus,
+                "recency": _recency_penalty,
+            }
 
             # Motor failure penalty: soften EFE of the last action if it was blocked
             # for at least 2 consecutive steps (streak guard stops spurious first-obs firing).
@@ -319,4 +336,63 @@ class FreeEnergyMinimizer:
 
             scores[pid] = float(max(0.0, min(1.0, combined)))
 
+        self.last_decisive_signal = self._compute_decisive_signal(
+            breakdowns, scores, drive_batch, food_ray, area_novelty, pe_mean
+        )
         return scores
+
+    def _compute_decisive_signal(
+        self,
+        breakdowns: Dict[str, Dict[str, float]],
+        scores: Dict[str, float],
+        drive_batch: Optional[DriveSignalBatch],
+        food_ray: Optional[Dict[str, Any]],
+        area_novelty: float,
+        pe_mean: float,
+    ) -> str:
+        """Return a signal string identifying what drove the EFE gap between winner and runner-up.
+
+        Computes per-component deltas between winner and runner-up (excluding idle).
+        The component with the largest positive delta names the decisive signal.
+        """
+        non_idle = {pid: s for pid, s in scores.items() if pid != "idle" and pid in breakdowns}
+        if len(non_idle) < 2:
+            return "single_option"
+
+        # Motor failure streak overrides component analysis — stuck is the signal.
+        if self._motor_fail_streak >= 2:
+            return f"stuck_streak={self._motor_fail_streak}"
+
+        sorted_pids = sorted(non_idle, key=lambda p: non_idle[p], reverse=True)
+        winner, runner_up = sorted_pids[0], sorted_pids[1]
+        w = breakdowns[winner]
+        r = breakdowns[runner_up]
+
+        # Delta = winner's advantage per component.
+        # Additive terms (pragmatic, epistemic, food_bonus): w - r
+        # Subtractive terms (motor_cost, recency): runner-up penalised more = gap widens
+        deltas = {
+            "food_bonus": w.get("food_bonus", 0.0) - r.get("food_bonus", 0.0),
+            "pragmatic":  w.get("pragmatic",  0.0) - r.get("pragmatic",  0.0),
+            "epistemic":  w.get("epistemic",  0.0) - r.get("epistemic",  0.0),
+            "motor_cost": r.get("motor_cost", 0.0) - w.get("motor_cost", 0.0),
+            "recency":    r.get("recency",    0.0) - w.get("recency",    0.0),
+        }
+        decisive = max(deltas, key=lambda c: deltas[c])
+
+        if decisive == "food_bonus" and food_ray:
+            angle = float(food_ray.get("angle_deg", 0.0))
+            dist  = float(food_ray.get("distance",  1.0))
+            direction = "fwd" if abs(angle) < 20 else ("left" if angle < 0 else "right")
+            return f"food_{direction}@{dist:.2f}"
+        if decisive == "pragmatic" and drive_batch:
+            return f"{drive_batch.dominant_channel}@{drive_batch.max_urgency:.2f}"
+        if decisive == "epistemic":
+            if winner in _EPISTEMIC_ACTIONS:
+                return f"novelty@{area_novelty:.2f}"
+            return f"pe@{pe_mean:.3f}"
+        if decisive == "motor_cost":
+            return "motor_cost"
+        if decisive == "recency":
+            return "recency_penalty"
+        return decisive

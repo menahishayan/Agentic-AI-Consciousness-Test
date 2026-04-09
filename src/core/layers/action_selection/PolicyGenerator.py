@@ -171,7 +171,8 @@ class PolicyGenerator:
 
         depth, reason = self._depth(context)
 
-        selected = self._call_llm_sync(policies, goals, context, step, depth=depth, trigger_reason=reason)
+        result = self._call_llm_sync(policies, goals, context, step, depth=depth, trigger_reason=reason)
+        selected = result[0] if result is not None else None
 
         # Timeout / error fallback: pure EFE argmax, not tag matching.
         # The generative model's own score is the best available signal when
@@ -278,7 +279,7 @@ class PolicyGenerator:
                 max_tokens = 200
             else:
                 prompt = self._build_fast_prompt(policies, context, step)
-                max_tokens = 20  # only "ACTION: <id>" needed
+                max_tokens = 30  # "action: why in ≤6 words"
 
             # Full CoT: temperature=0.1 allows mild sampling diversity under deliberation.
             # Fast prompt: temperature=0.0 — exploit the confident prior.
@@ -302,18 +303,20 @@ class PolicyGenerator:
                 )
                 return None
 
-            selected = self._parse_llm_response(
+            selected, llm_reason = self._parse_llm_response(
                 response.content, policies,
                 fe_scores=context.get("free_energy_scores"),
             )
 
             if self._llm_log_cb is not None:
                 try:
-                    self._llm_log_cb(prompt, response, trigger_reason, step, selected)
+                    self._llm_log_cb(prompt, response, trigger_reason, step, selected, llm_reason)
                 except Exception as log_exc:
                     log.debug("LLM log callback failed: %s", log_exc)
 
-            return selected
+            if selected is None:
+                return None
+            return (selected, llm_reason)
 
         except Exception as exc:
             log.warning("LLM call failed: %s", exc)
@@ -330,98 +333,54 @@ class PolicyGenerator:
         step: int,
     ) -> str:
         """
-        Compact 2-section prompt for low-arousal steps (~100 tokens).
+        Compact action-selection prompt for low-arousal steps (~65 tokens in, ~12 out).
 
-        Sections: interoceptive state + EFE scores.
-        Output: ACTION: <policy_id> only — no reasoning required.
+        Shows the EFE winner, decisive factor, and a recent-action sequence annotated
+        with blocked/ok so the model can override EFE when recent history shows failure.
+        The reply template does not pre-suggest an action — the model must choose.
+
+        Output: <action_id>: <why in ≤6 words>
         """
         drive_batch: Optional[DriveSignalBatch] = context.get("drive_batch")
         fe_scores: Dict[str, float] = context.get("free_energy_scores", {})
         av: Optional[ArousalValence] = context.get("arousal_valence")
 
-        # Compact drive summary — just urgency values, sorted descending
-        if drive_batch and drive_batch.signals:
-            top = sorted(drive_batch.signals, key=lambda s: s.urgency, reverse=True)[:3]
-            drives_compact = "  " + "  ".join(
-                f"{s.channel_id}={s.urgency:.2f}" for s in top
-            )
-        else:
-            drives_compact = "  (none)"
-
         arousal = av.arousal if av else 0.0
         valence = av.valence if av else 0.0
+        dominant_drive = drive_batch.dominant_channel if drive_batch else "drive"
+        dominant_urgency = drive_batch.max_urgency if drive_batch else 0.0
 
-        # Directional raycast summary — shows all food directions simultaneously.
-        raycast_hits = context.get("raycast_hits") or []
-        food_ray_dicts = [
-            r for r in raycast_hits
-            if r.get("hit_tag") in ("GoodGoal", "GoodGoalMulti")
-        ]
-        food_rays = [(r["angle_deg"], r["distance"]) for r in food_ray_dicts]
-        wall_rays = [
-            r["distance"]
-            for r in raycast_hits
-            if r.get("hit_tag") == "wall" and r.get("distance", 1.0) < 0.2
-        ]
-        hazard_rays = [
-            r["distance"]
-            for r in raycast_hits
-            if r.get("hit_tag") in ("BadGoal", "BadGoalMulti")
-        ]
-        if food_rays:
-            left_food  = min(
-                ((a, d) for a, d in food_rays if a < -10),
-                key=lambda x: x[1], default=None,
-            )
-            fwd_food   = min(
-                ((a, d) for a, d in food_rays if -20 <= a <= 20),
-                key=lambda x: x[1], default=None,
-            )
-            right_food = min(
-                ((a, d) for a, d in food_rays if a > 10),
-                key=lambda x: x[1], default=None,
-            )
-            parts = []
-            if left_food:
-                parts.append(f"L({left_food[0]:+.0f}°,{left_food[1]:.2f})")
-            if fwd_food:
-                parts.append(f"fwd({fwd_food[0]:+.0f}°,{fwd_food[1]:.2f})")
-            if right_food:
-                parts.append(f"R({right_food[0]:+.0f}°,{right_food[1]:.2f})")
-            raycast_line = "food " + " ".join(parts)
-        elif hazard_rays:
-            raycast_line = f"hazard at {min(hazard_rays):.2f}"
-        elif wall_rays:
-            raycast_line = f"wall at {min(wall_rays):.2f}"
-        elif raycast_hits:
-            raycast_line = "clear"
-        else:
-            raycast_line = "no data"
+        decisive_signal = context.get("decisive_signal") or "efe_gap"
 
-        # EFE scores — sorted descending so the top action is obvious
         fe_sorted = sorted(fe_scores.items(), key=lambda x: x[1], reverse=True)
-        fe_line = "  " + "  ".join(f"{pid}={score:.3f}" for pid, score in fe_sorted)
+        top_action, top_efe = fe_sorted[0] if fe_sorted else ("idle", 0.0)
+        runner_up, runner_up_efe = fe_sorted[1] if len(fe_sorted) > 1 else ("idle", 0.0)
 
-        valid_ids = ", ".join(p["policy_id"] for p in policies)
-
-        motor_eff = float(context.get("motor_efficiency", 1.0))
-        stuck_steps = int(context.get("stuck_steps", 0))
-        if motor_eff < 0.3 and stuck_steps >= 5:
-            turn_scores = {k: v for k, v in fe_scores.items() if k in ("turn_left", "turn_right")}
-            preferred_turn = max(turn_scores, key=turn_scores.get) if turn_scores else "turn_right"
-            stuck_line = f"STUCK: Agent not moving. EFE favours {preferred_turn} — choose it.\n"
+        # Recent sequence: last 5 steps annotated with blocked/ok.
+        # motor_efficiency < 0.3 = movement was physically blocked this step.
+        recent_actions = context.get("recent_actions", [])[-5:]
+        recent_effs = context.get("recent_motor_effs", [])
+        recent_effs = recent_effs[-len(recent_actions):] if recent_actions else []
+        # Pad with 1.0 (ok) for steps before tracking began
+        while len(recent_effs) < len(recent_actions):
+            recent_effs.insert(0, 1.0)
+        if recent_actions:
+            parts = [
+                f"{a}({'blocked' if e < 0.3 else 'ok'})"
+                for a, e in zip(recent_actions, recent_effs)
+            ]
+            recent_line = f"Recent: {' → '.join(parts)}\n"
         else:
-            stuck_line = ""
+            recent_line = ""
 
+        valid_ids = " | ".join(p["policy_id"] for p in policies)
         return (
-            f"Step {step}. Output exactly one line: ACTION: <policy_id>\n"
-            f"Valid: {valid_ids}\n\n"
-            f"DRIVES (urgency): {drives_compact}\n"
-            f"  arousal={arousal:.2f}  valence={valence:.2f}\n"
-            f"RAYCAST: {raycast_line}\n"
-            f"{stuck_line}"
-            f"EFE (higher=prefer): {fe_line}\n\n"
-            f"ACTION: "
+            f"Step {step}. Actions: {valid_ids}\n"
+            f"{dominant_drive}={dominant_urgency:.2f} A={arousal:.2f} V={valence:.2f}\n"
+            f"EFE: {top_action}={top_efe:.2f} vs {runner_up}={runner_up_efe:.2f} | key={decisive_signal}\n"
+            f"{recent_line}"
+            f"\nIf recent shows repeated failures, override EFE and explain why.\n"
+            f"Reply on one line: <action>: <reason>\n"
         )
 
     def _build_prompt(
@@ -470,22 +429,29 @@ class PolicyGenerator:
         ))
         affect_state = _affect_label(arousal, valence, dominant_channel, food_visible)
 
-        # --- Step 2: recent action history ---
+        # --- Step 2: recent action history with blocked/ok annotation ---
         recent = context.get("recent_actions", [])
+        recent_effs = context.get("recent_motor_effs", [])
         if recent:
+            # Align effs to actions (pad older steps with 1.0 if tracking just started)
+            aligned_effs = list(recent_effs[-len(recent):])
+            while len(aligned_effs) < len(recent):
+                aligned_effs.insert(0, 1.0)
+            annotated = [
+                f"{a}({'blocked' if e < 0.3 else 'ok'})"
+                for a, e in zip(recent, aligned_effs)
+            ]
+            # Run-length compress consecutive identical action+status pairs
             compressed = []
             i = 0
-            while i < len(recent):
-                action = recent[i]
+            while i < len(annotated):
+                token = annotated[i]
                 count = 1
-                while i + count < len(recent) and recent[i + count] == action:
+                while i + count < len(annotated) and annotated[i + count] == token:
                     count += 1
-                compressed.append(f"{action}×{count}" if count > 1 else action)
+                compressed.append(f"{token}×{count}" if count > 1 else token)
                 i += count
-            recent_text = ", ".join(compressed)
-            if len(recent) >= 4 and len(set(recent[-4:])) == 1:
-                reps = recent[-4:].count(recent[-1])
-                recent_text += f"\n  [NOTE: '{recent[-1]}' repeated {reps}× — consider alternatives]"
+            recent_text = " → ".join(compressed)
         else:
             recent_text = "(none yet)"
 
@@ -618,35 +584,73 @@ REASON: """
         response: str,
         policies: List[Dict],
         fe_scores: Optional[Dict[str, float]] = None,
-    ) -> Optional[str]:
-        """Extract policy_id from LLM response text.
+    ) -> Tuple[Optional[str], Optional[str]]:
+        """Extract (policy_id, reason) from LLM response text.
 
-        Primary: look for the explicit ACTION: line.
-        Fallback 1: scan full response for any valid policy_id substring.
+        Handles two formats:
+          Fast: [STATE: ...] [SIGNAL: ...] → action: 5-word reason
+          Full: REASON: <sentence>\\nACTION: <policy_id>
+
+        Fallback 1: any valid policy_id substring in response.
         Fallback 2: argmax(EFE scores) — never discard a computed answer on a
                     malformed LLM response.
+        Returns (action_id, reason_string); either may be None.
         """
         policy_ids = {p["policy_id"] for p in policies}
+        reason: Optional[str] = None
 
+        # Primary: "action: reason" format (fast mode)
+        # Pass 1 — policy_id is the first token before ":".
+        # Pass 2 — policy_id appears anywhere in the line (handles "<action>: turn_left - reason").
+        for strict in (True, False):
+            for line in response.splitlines():
+                stripped = line.strip()
+                lower = stripped.lower()
+                if strict:
+                    if ":" not in stripped:
+                        continue
+                    colon_idx = stripped.index(":")
+                    candidate = stripped[:colon_idx].strip().lower()
+                    first_word = candidate.split()[0].rstrip(".,;") if candidate else ""
+                    if first_word in policy_ids:
+                        return first_word, stripped[colon_idx + 1:].strip() or None
+                else:
+                    # Scan for policy_id followed by ":" or " -" and grab trailing text as reason
+                    for pid in sorted(policy_ids, key=len, reverse=True):
+                        idx = lower.find(pid)
+                        if idx == -1:
+                            continue
+                        after = stripped[idx + len(pid):].strip()
+                        if after.startswith(":"):
+                            return pid, after[1:].strip() or None
+                        if after.startswith("-"):
+                            return pid, after[1:].strip() or None
+
+        # Secondary: ACTION: / REASON: format (full CoT)
+        action_id: Optional[str] = None
         for line in response.splitlines():
             stripped = line.strip()
-            if stripped.upper().startswith("ACTION:"):
+            if stripped.upper().startswith("REASON:"):
+                reason = stripped.split(":", 1)[1].strip() if ":" in stripped else None
+            elif stripped.upper().startswith("ACTION:"):
                 candidate = stripped.split(":", 1)[1].strip().lower()
                 first_word = candidate.split()[0].rstrip(".,;") if candidate else ""
                 if first_word in policy_ids:
-                    return first_word
+                    action_id = first_word
+        if action_id is not None:
+            return action_id, reason
 
         # Fallback 1: first policy_id substring in response
         lower = response.lower()
         for pid in policy_ids:
             if pid in lower:
-                return pid
+                return pid, reason
 
-        # Fallback 2: EFE argmax — response was malformed, but EFE already has the answer
+        # Fallback 2: EFE argmax — response was malformed, EFE is still valid
         if fe_scores:
-            return max(fe_scores, key=lambda k: fe_scores[k])
+            return max(fe_scores, key=lambda k: fe_scores[k]), reason
 
-        return None
+        return None, None
 
     # ------------------------------------------------------------------
     # Helpers
