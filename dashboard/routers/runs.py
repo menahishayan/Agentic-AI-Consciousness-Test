@@ -23,9 +23,11 @@ async def list_runs(request: Request):
             "adapter": r.metadata.get("adapter", "unknown"),
             "llm_provider": r.metadata.get("llm_provider", "unknown"),
             "llm_model": r.metadata.get("llm_model", "unknown"),
+            "ablation_mode": r.metadata.get("ablation_mode", "full"),
             "start_time": r.metadata.get("start_time"),
             "start_time_str": r.metadata.get("start_time_str", r.run_id[:15]),
             "is_complete": r.is_complete,
+            "is_cancelled": r.is_cancelled,
             "step_count": r.step_count,
         }
         for r in runs
@@ -93,11 +95,14 @@ async def get_bulk(run_id: str, request: Request):
         for row in raw_llm
     ]
 
-    # Extract run_complete payload from the episode_complete event if present
+    # Extract terminal event payloads from events list
     run_complete = None
+    run_cancelled = None
     for row in events:
         if row.get("event") == "episode_complete":
             run_complete = row.get("payload", {})
+        elif row.get("event") == "episode_cancelled":
+            run_cancelled = row.get("payload", {})
 
     return {
         "metrics": metrics,
@@ -105,4 +110,5 @@ async def get_bulk(run_id: str, request: Request):
         "positions": positions,
         "llm_calls": llm_calls,
         "run_complete": run_complete,
+        "run_cancelled": run_cancelled,
     }

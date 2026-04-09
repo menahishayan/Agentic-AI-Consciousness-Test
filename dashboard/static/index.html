@@ -20,6 +20,7 @@
     --muted: #6b7280;
     --live: #22c55e;
     --complete: #64748b;
+    --cancelled: #f97316;
     --danger: #f87171;
     --warn: #fbbf24;
   }
@@ -129,6 +130,11 @@
   .badge.complete {
     background: rgba(100,116,139,0.15);
     color: var(--complete);
+  }
+
+  .badge.cancelled {
+    background: rgba(249,115,22,0.15);
+    color: var(--cancelled);
   }
 
   .badge.live::before {
@@ -970,6 +976,21 @@ function ingestRunComplete(payload) {
   }
 }
 
+function ingestRunCancelled(payload) {
+  renderEpisodeStats({ ...payload, done_reason: 'cancelled' });
+  // Log a cancelled event row in the episode events panel
+  ingestEvent({ event: 'episode_cancelled', step: payload.steps_run ?? '?', payload });
+  // Update sidebar badge
+  const card = document.querySelector(`.run-card[data-id="${state.activeRunId}"]`);
+  if (card) {
+    const badge = card.querySelector('.badge');
+    if (badge) {
+      badge.className = 'badge cancelled';
+      badge.textContent = 'Cancelled';
+    }
+  }
+}
+
         function renderEpisodeStats(payload) {
           const log = document.getElementById('events-log');
           if (!log) return;
@@ -986,7 +1007,9 @@ function ingestRunComplete(payload) {
             ? 'var(--accent2)'
             : payload.done_reason === 'error'
               ? 'var(--danger)'
-              : 'var(--warn)';
+              : payload.done_reason === 'cancelled'
+                ? 'var(--cancelled)'
+                : 'var(--warn)';
 
           const card = document.createElement('div');
           card.className = 'ep-stats-card';
@@ -1096,6 +1119,7 @@ function loadBulkData(data) {
   for (const row of data.positions || []) ingestPosition(row);
   for (const row of data.llm_calls || []) ingestLlmCall(row, false);
   if (data.run_complete) renderEpisodeStats(data.run_complete);
+  if (data.run_cancelled) ingestRunCancelled(data.run_cancelled);
   // Force update all charts
   for (const chart of Object.values(state.charts)) {
     if (chart) chart.update('none');
@@ -1137,10 +1161,12 @@ async function selectRun(runId) {
   document.getElementById('run-title').textContent = runId;
   const pills = document.getElementById('meta-pills');
   if (run) {
+    const ablation = run.ablation_mode || 'full';
     pills.innerHTML = `
       <div class="pill">Adapter: <span>${run.adapter}</span></div>
       <div class="pill">Provider: <span>${run.llm_provider}</span></div>
       <div class="pill">Model: <span>${run.llm_model}</span></div>
+      <div class="pill">Ablation: <span style="color:${ablation !== 'full' ? 'var(--warn)' : 'inherit'}">${ablation}</span></div>
       <div class="pill">Started: <span>${formatRunTime(run)}</span></div>
     `;
   }
@@ -1160,8 +1186,8 @@ async function selectRun(runId) {
     console.warn('Bulk fetch failed:', e);
   }
 
-  // Open SSE stream for live runs
-  if (!run || !run.is_complete) {
+  // Open SSE stream for live runs (not for completed or cancelled runs)
+  if (!run || (!run.is_complete && !run.is_cancelled)) {
     openRunStream(runId);
   }
 }
@@ -1186,6 +1212,11 @@ function openRunStream(runId) {
 
   src.addEventListener('run_complete', e => {
     ingestRunComplete(JSON.parse(e.data));
+    src.close();
+  });
+
+  src.addEventListener('run_cancelled', e => {
+    ingestRunCancelled(JSON.parse(e.data));
     src.close();
   });
 
@@ -1217,6 +1248,9 @@ function renderRunCard(run, prepend = false) {
   const card = existing || document.createElement('div');
   card.className = 'run-card' + (state.activeRunId === run.run_id ? ' active' : '');
   card.dataset.id = run.run_id;
+  const badgeClass = run.is_cancelled ? 'cancelled' : (run.is_complete ? 'complete' : 'live');
+  const badgeText = run.is_cancelled ? 'Cancelled' : (run.is_complete ? 'Complete' : 'Live');
+  const ablation = run.ablation_mode && run.ablation_mode !== 'full' ? run.ablation_mode : '';
   card.innerHTML = `
     <div class="run-time">${formatRunTime(run)}</div>
     <div class="run-id">${run.run_id}</div>
@@ -1224,10 +1258,9 @@ function renderRunCard(run, prepend = false) {
       <span>${run.adapter}</span>
       <span>${run.llm_model}</span>
       <span>${run.step_count} steps</span>
+      ${ablation ? `<span style="color:var(--warn);font-weight:600;">${ablation}</span>` : ''}
     </div>
-    <span class="badge ${run.is_complete ? 'complete' : 'live'}">
-      ${run.is_complete ? 'Complete' : 'Live'}
-    </span>
+    <span class="badge ${badgeClass}">${badgeText}</span>
   `;
   card.onclick = () => selectRun(run.run_id);
 

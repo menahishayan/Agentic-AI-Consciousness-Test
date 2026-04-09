@@ -191,20 +191,25 @@ class AgentLoop:
             "final_saturation": 0.0,
         }
 
-        for step in range(max_steps):
-            self._step = step
-            try:
-                done = self._run_step()
-                episode_stats["steps_run"] = step + 1
-            except Exception as exc:
-                self._logger.traceback(exc, context="AgentLoop.run_step", step=step)
-                log.error("Step %d failed: %s", step, exc)
-                episode_stats["done_reason"] = "error"
-                break
+        cancelled = False
+        try:
+            for step in range(max_steps):
+                self._step = step
+                try:
+                    done = self._run_step()
+                    episode_stats["steps_run"] = step + 1
+                except Exception as exc:
+                    self._logger.traceback(exc, context="AgentLoop.run_step", step=step)
+                    log.error("Step %d failed: %s", step, exc)
+                    episode_stats["done_reason"] = "error"
+                    break
 
-            if done:
-                episode_stats["done_reason"] = "episode_done"
-                break
+                if done:
+                    episode_stats["done_reason"] = "episode_done"
+                    break
+        except KeyboardInterrupt:
+            cancelled = True
+            episode_stats["done_reason"] = "cancelled"
 
         # Final stats
         if self._current_state:
@@ -213,8 +218,15 @@ class AgentLoop:
 
         self._memory.save_faiss_stores()
         self._memory.log_summary()
-        log.info("Episode complete: %s", episode_stats)
-        self._logger.event("episode_complete", episode_stats, step=self._step)
+
+        if cancelled:
+            log.info("Episode cancelled at step %d: %s", self._step, episode_stats)
+            self._logger.event("episode_cancelled", episode_stats, step=self._step)
+            raise KeyboardInterrupt
+        else:
+            log.info("Episode complete: %s", episode_stats)
+            self._logger.event("episode_complete", episode_stats, step=self._step)
+
         return episode_stats
 
     def run_step(self) -> bool:

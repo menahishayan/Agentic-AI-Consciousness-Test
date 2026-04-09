@@ -20,7 +20,7 @@
     "worker_id": 1,
     "base_port": 5005,
     "physics_fps": 30.0,
-    "decision_period": 5.0,
+    "decision_period": 3,
     "file_name": "./animal-ai-unity/AnimalAI.app",
     "additional_args": [
       "-screen-width",

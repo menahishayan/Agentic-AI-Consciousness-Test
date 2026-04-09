@@ -92,6 +92,9 @@ async def _run_stream(
                 if event_type == "episode_complete":
                     yield _sse("run_complete", row.get("payload", {}))
                     complete_seen = True
+                elif event_type == "episode_cancelled":
+                    yield _sse("run_cancelled", row.get("payload", {}))
+                    complete_seen = True
                 else:
                     yield _sse("agent_event", row)
                 had_data = True
@@ -167,9 +170,11 @@ async def _new_runs_stream(registry) -> AsyncIterator[str]:
             "adapter": info.metadata.get("adapter", "unknown"),
             "llm_provider": info.metadata.get("llm_provider", "unknown"),
             "llm_model": info.metadata.get("llm_model", "unknown"),
+            "ablation_mode": info.metadata.get("ablation_mode", "full"),
             "start_time": info.metadata.get("start_time"),
             "start_time_str": info.metadata.get("start_time_str", info.run_id[:15]),
             "is_complete": info.is_complete,
+            "is_cancelled": info.is_cancelled,
             "step_count": info.step_count,
         })
 
@@ -188,9 +193,11 @@ async def _new_runs_stream(registry) -> AsyncIterator[str]:
                         "adapter": info.metadata.get("adapter", "unknown"),
                         "llm_provider": info.metadata.get("llm_provider", "unknown"),
                         "llm_model": info.metadata.get("llm_model", "unknown"),
+                        "ablation_mode": info.metadata.get("ablation_mode", "full"),
                         "start_time": info.metadata.get("start_time"),
                         "start_time_str": info.metadata.get("start_time_str", run_id[:15]),
                         "is_complete": info.is_complete,
+                        "is_cancelled": info.is_cancelled,
                         "step_count": info.step_count,
                     })
     except asyncio.CancelledError:

@@ -78,13 +78,13 @@ def _patch_config(
         patched["ablation"]["drive_injection_step"] = injection_step
 
     # Always use headless adapter for reproducibility — no Unity required
-    # patched["adapter_folder"] = "headless"
+    patched["adapter_folder"] = "headless"
 
     # Suppress verbose logging during batch runs
-    patched.setdefault("observability", {})
-    patched["observability"]["log_state"] = False
-    patched["observability"]["log_prompts"] = False
-    patched["observability"]["log_memory"] = False
+    # patched.setdefault("observability", {})
+    # patched["observability"]["log_state"] = False
+    # patched["observability"]["log_prompts"] = False
+    # patched["observability"]["log_memory"] = False
 
     return patched
 
