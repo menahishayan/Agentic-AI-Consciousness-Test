@@ -978,6 +978,7 @@ function loadBulkData(data) {
   }
   for (const row of data.positions || []) ingestPosition(row);
   for (const row of data.llm_calls || []) ingestLlmCall(row, false);
+  if (data.run_complete) renderEpisodeStats(data.run_complete);
   // Force update all charts
   for (const chart of Object.values(state.charts)) {
     if (chart) chart.update('none');

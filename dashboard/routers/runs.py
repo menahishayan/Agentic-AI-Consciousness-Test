@@ -91,9 +91,16 @@ async def get_bulk(run_id: str, request: Request):
         for row in raw_llm
     ]
 
+    # Extract run_complete payload from the episode_complete event if present
+    run_complete = None
+    for row in events:
+        if row.get("event") == "episode_complete":
+            run_complete = row.get("payload", {})
+
     return {
         "metrics": metrics,
         "events": events,
         "positions": positions,
         "llm_calls": llm_calls,
+        "run_complete": run_complete,
     }
