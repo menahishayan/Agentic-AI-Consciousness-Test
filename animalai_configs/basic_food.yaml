@@ -15,7 +15,6 @@ arenas:
       - !Vector3 {x: 5, y: 0, z: 25}
       - !Vector3 {x: 25, y: 0, z: 5}
       - !Vector3 {x: 12, y: 0, z: 12}
-      - !Vector3 {x: 5, y: 0, z: 5}
       sizes:
       - !Vector3 {x: 2, y: 2, z: 2}
     - !Item

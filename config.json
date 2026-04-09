@@ -2,10 +2,9 @@
   "adapter_folder": "animalai",
   "adapter_config": {
     "homeostatic": {
-      "saturation_depletion_rate": 0.0003,
-      "food_health_restore": 0.3,
-      "food_saturation_restore": 0.5,
-      "hazard_health_penalty": 0.2,
+      "saturation_depletion_rate": 0.001,
+      "health_depletion_rate": 0.002,
+      "food_saturation_restore": 0.2,
       "death_threshold": 0.0
     },
     "simulation": {

@@ -32,16 +32,18 @@ class HomeostaticWrapper:
         hc = config.get("homeostatic", {})
 
         # Depletion rates (per step)
-        # health_depletion_rate is intentionally absent — Unity health is authoritative
-        # and sync_health() overwrites the simulated value every step.
         self.saturation_depletion_rate: float = float(hc.get("saturation_depletion_rate", 0.002))
+        # Additional health depletion applied on top of Unity's ground-truth value
+        # inside sync_health(). Unity is still authoritative for the base value (food
+        # collection, hazard penalties); this adds extra pressure at config time.
+        self.health_depletion_rate: float = float(hc.get("health_depletion_rate", 0.0))
 
         # Restoration on positive reward (food)
-        self.food_health_restore: float = float(hc.get("food_health_restore", 0.3))
+        # food_health_restore is intentionally absent — sync_health() overwrites health
+        # with Unity's ground-truth value every step, so any simulated restoration is lost.
         self.food_saturation_restore: float = float(hc.get("food_saturation_restore", 0.5))
 
-        # Penalty on negative reward (hazard / bad event)
-        self.hazard_health_penalty: float = float(hc.get("hazard_health_penalty", 0.2))
+        # hazard_health_penalty is intentionally absent — same reason as food_health_restore.
 
         # Death threshold
         self.death_threshold: float = float(hc.get("death_threshold", 0.0))
@@ -71,14 +73,9 @@ class HomeostaticWrapper:
         self._saturation = max(0.0, self._saturation - self.saturation_depletion_rate)
 
         if raw_reward > 0.0:
-            # Food consumed — scale restoration by reward magnitude (capped)
+            # Food consumed — restore saturation (health is overwritten by sync_health())
             restore_scale = min(raw_reward, 1.0)
             self._saturation = min(1.0, self._saturation + restore_scale * self.food_saturation_restore)
-            self._health = min(1.0, self._health + restore_scale * self.food_health_restore)
-        elif raw_reward < 0.0:
-            # Hazard / penalty — health drops proportional to negative reward
-            penalty_scale = min(abs(raw_reward), 1.0)
-            self._health = max(0.0, self._health - penalty_scale * self.hazard_health_penalty)
 
     def sync_health(self, unity_health: float) -> None:
         """
@@ -93,7 +90,7 @@ class HomeostaticWrapper:
         immediately corrected by the observed Unity value.
         Saturation remains simulated (Unity doesn't expose it).
         """
-        self._health = float(np.clip(unity_health, 0.0, 1.0))
+        self._health = float(np.clip(unity_health - self.health_depletion_rate, 0.0, 1.0))
 
     def get_state(self) -> Dict[str, float]:
         """
