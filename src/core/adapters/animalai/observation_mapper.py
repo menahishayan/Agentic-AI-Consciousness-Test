@@ -92,9 +92,8 @@ _RAY_TAG_INDEX_MAP: Dict[float, Optional[str]] = {
 # TWO possible layouts depending on binary build:
 #
 # 13-tag layout (legacy, raysPerSide=3):   7 × 14 = 98 floats
-#   0=arena, 1=Immovable, 2=Movable, 3=goodGoal, 4=goodGoalMulti, 5=badGoal,
-#   6=GoalSpawner, 7=DeathZone, 8=HotZone, 9=Ramp, 10=PillarButton,
-#   11=SignPoster, 12=DecoyGoal
+#   0=goodGoal, 1=goodGoalMulti, 2=badGoal, 3=?, 4=Immovable, 5=OuterWall, ...
+#   (confirmed empirically: hot_slot=0 fires at food collection — RAY_DUMP logs)
 #
 # 13-tag layout (current binary, raysPerSide=4): 9 × 14 = 126 floats
 #   Same tag order as above.
@@ -104,18 +103,19 @@ _RAY_TAG_INDEX_MAP: Dict[float, Optional[str]] = {
 #   6=badGoal, 7=GoalSpawner, 8=DeathZone, 9=HotZone, 10=Ramp, 11=PillarButton,
 #   12=SignPoster, 13=DecoyGoal, 14=DecoyGoalBounce
 #
-# CRITICAL: goodGoal is at index 3 in 13-tag layout, index 4 in 15-tag layout.
+# CRITICAL: goodGoal is at index 0 in 13-tag layout, index 4 in 15-tag layout.
 # Using the wrong remap silently drops all food detections.
 # The actual array size is logged on step 1 — check run logs to confirm.
 # ---------------------------------------------------------------------------
 
 # 13-tag remap: used for 98-float (7-ray) and 126-float (9-ray) arrays.
-# Indices match _TagToIndex in TrainingAgent.cs (return values 0f–5f).
+# Indices are the compiled m_DetectableTags slot order, NOT _TagToIndex return values.
+# Confirmed empirically: hot_slot=0 fires at GoodGoal food collection (RAY_DUMP logs).
 _RAY_SENSOR_TAG_REMAP_13: Dict[int, Optional[str]] = {
-    0:  "arena",
-    1:  "GoodGoal",       # goodGoal — per _TagToIndex return 1f
-    2:  "GoodGoalMulti",  # goodGoalMulti — per _TagToIndex return 2f
-    3:  "BadGoal",        # badGoal — per _TagToIndex return 3f
+    0:  "GoodGoal",       # confirmed empirically — hot_slot=0 at food collection
+    1:  "GoodGoalMulti",
+    2:  "BadGoal",
+    3:  None,
     4:  "wall",           # Immovable
     5:  "wall",           # OuterWall
     6:  None,
@@ -444,7 +444,7 @@ def _parse_raycasts(obs_list: List[Any]) -> List[Dict[str, Any]]:
 
         # Full ray array: parse every ray.
         # Select remap and food indices based on tag count (array size determines layout):
-        #   98/126 floats → 13-tag layout: goodGoal at index 3
+        #   98/126 floats → 13-tag layout: goodGoal at index 0 (confirmed empirically)
         #   144 floats    → 15-tag layout: goodGoal at index 4
         if n in (_RAY_SENSOR_LEN_LEGACY, _RAY_SENSOR_LEN_CURRENT, _RAY_SENSOR_LEN_NEW):
             is_legacy   = (n == _RAY_SENSOR_LEN_LEGACY)
@@ -454,7 +454,7 @@ def _parse_raycasts(obs_list: List[Any]) -> List[Dict[str, Any]]:
             n_rays = _RAY_SENSOR_N_RAYS_LEGACY if is_legacy else _RAY_SENSOR_N_RAYS_CURRENT
             angles = _RAY_ANGLES_7 if is_legacy else _RAY_ANGLES_9
             remap  = _RAY_SENSOR_TAG_REMAP_13 if use_13_tags else _RAY_SENSOR_TAG_REMAP_15
-            food_indices = (1, 2) if use_13_tags else (4, 5)
+            food_indices = (0, 1) if use_13_tags else (4, 5)
 
             floats_per_ray = n_tags + 1
             rays = []

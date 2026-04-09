@@ -169,17 +169,6 @@ class PolicyGenerator:
 
         fe_scores: Dict[str, float] = context.get("free_energy_scores", {})
 
-        # EFE bypass: skip LLM only when the decision is truly unambiguous.
-        # Threshold raised to 0.65 gap / 0.98 top so the LLM still runs during
-        # food-approach scenarios (food proximity pushes gap ~0.40–0.54) — those
-        # are exactly the steps where deliberative reasoning adds value.
-        if fe_scores and len(fe_scores) >= 2:
-            sorted_scores = sorted(fe_scores.values(), reverse=True)
-            top_score = sorted_scores[0]
-            second_score = sorted_scores[1]
-            if top_score >= 0.98 or (top_score - second_score) >= 0.65:
-                return max(fe_scores, key=lambda k: fe_scores[k])
-
         depth, reason = self._depth(context)
 
         selected = self._call_llm_sync(policies, goals, context, step, depth=depth, trigger_reason=reason)
@@ -356,15 +345,13 @@ class PolicyGenerator:
         arousal = av.arousal if av else 0.0
         valence = av.valence if av else 0.0
 
-        # Directional raycast summary — scans all rays for food/hazard/wall.
-        # Food in a side ray now produces "food right (+47°) at 0.45" rather than
-        # "clear" from forward-only, giving the model something to act on.
+        # Directional raycast summary — shows all food directions simultaneously.
         raycast_hits = context.get("raycast_hits") or []
-        food_rays = [
-            (r["angle_deg"], r["distance"])
-            for r in raycast_hits
+        food_ray_dicts = [
+            r for r in raycast_hits
             if r.get("hit_tag") in ("GoodGoal", "GoodGoalMulti")
         ]
+        food_rays = [(r["angle_deg"], r["distance"]) for r in food_ray_dicts]
         wall_rays = [
             r["distance"]
             for r in raycast_hits
@@ -376,9 +363,26 @@ class PolicyGenerator:
             if r.get("hit_tag") in ("BadGoal", "BadGoalMulti")
         ]
         if food_rays:
-            angle, dist = min(food_rays, key=lambda x: x[1])
-            direction = "forward" if abs(angle) < 15 else ("left" if angle < 0 else "right")
-            raycast_line = f"food {direction} ({angle:+.0f}°) at {dist:.2f}"
+            left_food  = min(
+                ((a, d) for a, d in food_rays if a < -10),
+                key=lambda x: x[1], default=None,
+            )
+            fwd_food   = min(
+                ((a, d) for a, d in food_rays if -20 <= a <= 20),
+                key=lambda x: x[1], default=None,
+            )
+            right_food = min(
+                ((a, d) for a, d in food_rays if a > 10),
+                key=lambda x: x[1], default=None,
+            )
+            parts = []
+            if left_food:
+                parts.append(f"L({left_food[0]:+.0f}°,{left_food[1]:.2f})")
+            if fwd_food:
+                parts.append(f"fwd({fwd_food[0]:+.0f}°,{fwd_food[1]:.2f})")
+            if right_food:
+                parts.append(f"R({right_food[0]:+.0f}°,{right_food[1]:.2f})")
+            raycast_line = "food " + " ".join(parts)
         elif hazard_rays:
             raycast_line = f"hazard at {min(hazard_rays):.2f}"
         elif wall_rays:

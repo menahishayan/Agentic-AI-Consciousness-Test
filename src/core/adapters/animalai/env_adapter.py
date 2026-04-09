@@ -495,7 +495,10 @@ class AnimalAIAdapter(AbstractEnvironmentAdapter):
             agent_id = list(terminal_steps.agent_id)[0]
             obs_list = terminal_steps[agent_id].obs
             raw_reward = float(terminal_steps[agent_id].reward)
+            if raw_reward != 0.0:
+                log.info("REWARD step=%d raw_reward=%.6f", self._step_count, raw_reward)
             self._log_obs_shapes(obs_list)
+            self._ray_dump(obs_list)
             if DEBUG:
                 self._debug_gate1(obs_list, raw_reward, env_done=True)
             visual_obs = self._extract_visual(obs_list)
@@ -521,7 +524,10 @@ class AnimalAIAdapter(AbstractEnvironmentAdapter):
         agent_id = list(decision_steps.agent_id)[0]
         obs_list = decision_steps[agent_id].obs
         raw_reward = float(decision_steps[agent_id].reward)
+        if raw_reward != 0.0:
+            log.info("REWARD step=%d raw_reward=%.6f", self._step_count, raw_reward)
         self._log_obs_shapes(obs_list)
+        self._ray_dump(obs_list)
         if DEBUG:
             self._debug_gate1(obs_list, raw_reward, env_done=False)
         visual_obs = self._extract_visual(obs_list)
@@ -563,6 +569,29 @@ class AnimalAIAdapter(AbstractEnvironmentAdapter):
         self._obs_shapes_logged = True
         shapes = [np.asarray(o).shape for o in obs_list if hasattr(o, '__len__')]
         log.info("obs_list shapes (step 1): %s", shapes)
+
+    def _ray_dump(self, obs_list: List[Any]) -> None:
+        """Log the hot slot for every ray in the 126-float ray sensor array.
+
+        Fires on the first 5 steps so we can verify which compiled tag indices
+        fire for arena/GoodGoal/OuterWall without waiting for a food encounter.
+        Only runs when self._step_count <= 5; silent thereafter.
+        """
+        if self._step_count > 50:
+            return
+        for obs in obs_list:
+            arr = np.asarray(obs, dtype=np.float32)
+            if arr.ndim == 1 and len(arr) == 126:
+                for ri in range(9):
+                    one_hot = arr[ri * 14: ri * 14 + 13]
+                    frac = float(arr[ri * 14 + 13])
+                    hot = int(np.argmax(one_hot))
+                    if float(one_hot[hot]) > 0.5:
+                        log.info(
+                            "RAY_DUMP step=%d ray%d hot_slot=%d val=%.2f frac=%.4f",
+                            self._step_count, ri, hot, float(one_hot[hot]), frac,
+                        )
+                return  # only process the first matching array
 
     def _extract_visual(self, obs_list: List[Any]) -> Optional[np.ndarray]:
         """Extract the first visual observation from the observation list."""

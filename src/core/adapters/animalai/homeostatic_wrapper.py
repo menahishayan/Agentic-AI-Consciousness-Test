@@ -32,7 +32,8 @@ class HomeostaticWrapper:
         hc = config.get("homeostatic", {})
 
         # Depletion rates (per step)
-        self.health_depletion_rate: float = float(hc.get("health_depletion_rate", 0.001))
+        # health_depletion_rate is intentionally absent — Unity health is authoritative
+        # and sync_health() overwrites the simulated value every step.
         self.saturation_depletion_rate: float = float(hc.get("saturation_depletion_rate", 0.002))
 
         # Restoration on positive reward (food)
@@ -66,8 +67,7 @@ class HomeostaticWrapper:
         raw_reward < 0  → hazard hit, penalize health
         raw_reward == 0 → normal step, apply passive depletion only
         """
-        # Passive depletion always applies
-        self._health = max(0.0, self._health - self.health_depletion_rate)
+        # Passive depletion: saturation only — health is overwritten by sync_health()
         self._saturation = max(0.0, self._saturation - self.saturation_depletion_rate)
 
         if raw_reward > 0.0:

@@ -44,6 +44,16 @@ _EPISTEMIC_ACTIONS = {"turn_left", "turn_right"}
 # via food-proximity bonus once food enters the ray fan.
 _EPISTEMIC_FORAGING_BASELINE = 0.60
 
+# Angular windows [lo, hi] (degrees) within which food detection benefits each action.
+# Food inside the window earns a proximity bonus; outside → no bonus for that action.
+_ACTION_FOOD_WINDOWS: Dict[str, Optional[tuple]] = {
+    "move_forward":  (-20,  +20),  # food near centre → approach
+    "turn_left":     (-80,  -10),  # food on left  → turn toward it
+    "turn_right":    (+10,  +80),  # food on right → turn toward it
+    "move_backward": None,         # no food bonus
+    "idle":          None,         # handled separately
+}
+
 # Per-policy metabolic cost in [0, 1]
 _MOTOR_COST: Dict[str, float] = {
     "idle":          0.0,
@@ -88,6 +98,31 @@ class FreeEnergyMinimizer:
         # — the agent is spinning next to food it can't reach via turning alone.
         self._stuck_turn_angle: Optional[float] = None
         self._stuck_turn_streak: int = 0
+
+    def _food_bonus_for_action(
+        self,
+        food_rays: List[Dict[str, Any]],
+        action_id: str,
+        turn_bonus_scale: float = 1.0,
+    ) -> float:
+        """Return food-proximity bonus for action_id given the current ray fan.
+
+        Selects the closest food ray inside the action's angular window and
+        returns proximity = 1 - distance (0 = far, 1 = touching).
+        turn_bonus_scale halves the turn bonus when the stuck-turn detector fires.
+        """
+        window = _ACTION_FOOD_WINDOWS.get(action_id)
+        if window is None or not food_rays:
+            return 0.0
+        lo, hi = window
+        relevant = [r for r in food_rays if lo <= float(r.get("angle_deg", 0.0)) <= hi]
+        if not relevant:
+            return 0.0
+        best = min(relevant, key=lambda r: r.get("distance", 1.0))
+        proximity = 1.0 - float(best.get("distance", 1.0))
+        if action_id in _EPISTEMIC_ACTIONS:
+            return proximity * self._food_proximity_bonus * 0.7 * turn_bonus_scale
+        return proximity * self._food_proximity_bonus
 
     def score(
         self,
@@ -145,13 +180,15 @@ class FreeEnergyMinimizer:
                 for tag in signal.suggested_action_tags:
                     urgency_by_tag[tag] = max(urgency_by_tag.get(tag, 0.0), signal.urgency)
 
-        # Find the closest food ray across the full fan — used for directional bonuses.
-        # Scanning all rays means food 45° to the side activates the correct turn bonus
-        # rather than being invisible (forward-only check misses it entirely).
+        # Find the most-aligned food ray across the full fan — used for directional bonuses.
+        # Most-aligned (smallest |angle|) rather than closest (smallest distance) because
+        # the directional bonuses key off angle: food at 80° closest is less actionable
+        # than food at 20° slightly further. Alignment determines which action to boost.
         all_rays = context.get("raycast_hits") or [] if context else []
-        food_ray = next(
-            (r for r in all_rays if r.get("hit_tag") in ("GoodGoal", "GoodGoalMulti")),
-            None,
+        food_candidates = [r for r in all_rays if r.get("hit_tag") in ("GoodGoal", "GoodGoalMulti")]
+        food_ray = (
+            min(food_candidates, key=lambda r: abs(r.get("angle_deg", 90)))
+            if food_candidates else None
         )
 
         # Stuck-turn detector: if the food angle hasn't changed for 5+ steps while
@@ -188,7 +225,7 @@ class FreeEnergyMinimizer:
                 # extreme urgency. At urgency=0.20 with penalty=2.0: -0.40.
                 score -= max(0.0, max_urgency) * self._idle_urgency_penalty
                 # Food visible → idling is never appropriate regardless of urgency level.
-                if food_ray is not None:
+                if food_candidates:
                     score -= 0.6
                 scores[pid] = float(max(0.0, min(1.0, score)))
                 continue
@@ -223,32 +260,22 @@ class FreeEnergyMinimizer:
                 - motor_cost * self._w_motor_cost
             )
 
-            # Food-proximity bonus: distance-gated directional logic.
-            #
+            # Food-proximity bonus via window-based per-action method.
             # Close food (dist < 0.10): alignment irrelevant — just move.
-            #   move_forward gets 1.5× bonus; turns get none (spinning next to
+            #   move_forward gets 1.5× bonus; turns suppressed (spinning next to
             #   adjacent food is counterproductive).
-            #
-            # Far food (dist ≥ 0.10): align first, then approach.
-            #   Forward-aligned food → full bonus on move_forward.
-            #   Side food → 70% turn bonus toward correct side, scaled by
-            #   stuck-turn detector (halved after 5 same-angle turns).
-            if food_ray:
-                food_prox = 1.0 - float(food_ray.get("distance", 1.0))
-                food_angle = float(food_ray.get("angle_deg", 0.0))
-                food_dist = float(food_ray.get("distance", 1.0))
-
-                if food_dist < 0.10:
+            # Far food (dist ≥ 0.10): delegate to _food_bonus_for_action which
+            #   checks each action's angular window against all food rays.
+            if food_candidates:
+                food_dist_min = min(r.get("distance", 1.0) for r in food_candidates)
+                if food_dist_min < 0.01:
                     if pid == "move_forward":
-                        combined += food_prox * self._food_proximity_bonus * 1.5
-                    # No turn bonus: food is adjacent, movement wins unconditionally.
+                        combined += (1.0 - food_dist_min) * self._food_proximity_bonus * 1.5
+                    # No turn bonus when food is adjacent.
                 else:
-                    if pid == "move_forward" and abs(food_angle) < 15:
-                        combined += food_prox * self._food_proximity_bonus
-                    elif pid == "turn_right" and food_angle > 10:
-                        combined += food_prox * self._food_proximity_bonus * 0.7 * _turn_bonus_scale
-                    elif pid == "turn_left" and food_angle < -10:
-                        combined += food_prox * self._food_proximity_bonus * 0.7 * _turn_bonus_scale
+                    combined += self._food_bonus_for_action(
+                        food_candidates, pid, _turn_bonus_scale
+                    )
 
             # Motor failure penalty: soften EFE of the last action if it was blocked
             # for at least 2 consecutive steps (streak guard stops spurious first-obs firing).
@@ -258,7 +285,7 @@ class FreeEnergyMinimizer:
             # The food item itself causes the motor stall — penalising move_forward in this
             # state causes the agent to retreat from food it is already touching.
             food_adj = (food_ray is not None
-                        and float(food_ray.get("distance", 1.0)) < 0.15)
+                        and float(food_ray.get("distance", 1.0)) < 0.015)
             if (pid == last_action
                     and motor_eff < 0.3
                     and self._motor_fail_streak >= 2

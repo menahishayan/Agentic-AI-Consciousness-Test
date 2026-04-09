@@ -1,6 +1,6 @@
 !ArenaConfig
 arenas:
-  0: !Arena
+  1: !Arena
     t: 500
     items:
     - !Item
@@ -14,6 +14,8 @@ arenas:
       - !Vector3 {x: 20, y: 0, z: 20}
       - !Vector3 {x: 5, y: 0, z: 25}
       - !Vector3 {x: 25, y: 0, z: 5}
+      - !Vector3 {x: 12, y: 0, z: 12}
+      - !Vector3 {x: 5, y: 0, z: 5}
       sizes:
       - !Vector3 {x: 2, y: 2, z: 2}
     - !Item
@@ -21,6 +23,7 @@ arenas:
       positions:
       - !Vector3 {x: 15, y: 0, z: 8}
       - !Vector3 {x: 8, y: 0, z: 18}
+      - !Vector3 {x: 15, y: 0, z: 15}
       sizes:
       - !Vector3 {x: 1, y: 1, z: 1}
     - !Item
