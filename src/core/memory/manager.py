@@ -1,482 +1,211 @@
+"""
+MemoryManager — coordinates all memory subsystems.
+
+Provides a unified interface for the rest of the brain to access memory
+without directly instantiating individual memory classes. AgentLoop calls
+the manager; the manager delegates to the appropriate subsystem.
+"""
 from __future__ import annotations
 
-from dataclasses import dataclass
-from datetime import datetime
-from typing import Any, Dict, List, Mapping, Optional
-
-import numpy as np
+import logging
+from pathlib import Path
+from typing import Any, Dict, List, Optional
 
 from core.memory.long_term_memory import LongTermMemory
 from core.memory.policy_traces import PolicyTraces
 from core.memory.prediction_error_history import PredictionErrorHistory
 from core.memory.self_state_tracking import SelfStateTracking
-from core.memory.working_memory_buffer import WorkingMemoryBuffer, WorkingMemoryEntry
+from core.memory.working_memory_buffer import WorkingMemoryBuffer
+from core.models.memory_records import PolicyTraceRecord, PredictionErrorRecord
+from core.models.signals import PredictionErrorBatch
+from core.models.state import AgentState
 
-
-@dataclass
-class MemoryConfig:
-    working_memory_capacity: int = 100
-    pe_min_observations: int = 5
-    pe_ema_alpha: float = 0.1
-    faiss_k_default: int = 5
-    faiss_epsilon: float = 1e-6
-    episode_length: int = 1000
-    long_term_memory_path: str = "data/long_term_memory"
-    long_term_memory_max_score_history: int = 200
-    long_term_memory_max_outcome_history: int = 200
+log = logging.getLogger(__name__)
 
 
 class MemoryManager:
-    def __init__(
+    """
+    Facade over all memory subsystems. Brain layers access memory exclusively
+    through this class.
+
+    Subsystems:
+      - WorkingMemoryBuffer: rolling recent states
+      - PredictionErrorHistory: FAISS PE history by area
+      - SelfStateTracking: FAISS homeostatic state history
+      - PolicyTraces: FAISS policy outcome history
+      - LongTermMemory: JSON-persisted cross-episode policy history
+    """
+
+    def __init__(self, config: Dict[str, Any]) -> None:
+        mem_cfg = config.get("memory", {})
+
+        self._working = WorkingMemoryBuffer(
+            capacity=int(mem_cfg.get("working_memory_capacity", 100))
+        )
+        self._pe_history = PredictionErrorHistory(mem_cfg)
+        self._self_state = SelfStateTracking(mem_cfg)
+        self._policy_traces = PolicyTraces(mem_cfg)
+        self._long_term = LongTermMemory(mem_cfg)
+
+        # Persistence path — same directory as LongTermMemory so all memory
+        # artefacts live together under data/long_term_memory/.
+        self._persist_path = Path(mem_cfg.get("long_term_memory_path", "data/long_term_memory"))
+
+        # Auto-load FAISS stores on startup so prior episodes are immediately
+        # available for retrieval. SelfStateTracking is skipped — its vectors
+        # include broken position coordinates and will be persisted once
+        # dead-reckoning is fixed.
+        self._pe_history.load(self._persist_path)
+        self._policy_traces.load(self._persist_path)
+
+    # ------------------------------------------------------------------
+    # WorkingMemory
+    # ------------------------------------------------------------------
+
+    def record_state(self, state: AgentState, action: Optional[str] = None) -> None:
+        self._working.record(state)
+        self._self_state.record(state, action_taken=action)
+
+    def get_recent_states(self, n: int = 10) -> List[AgentState]:
+        return self._working.get_recent(n)
+
+    # ------------------------------------------------------------------
+    # Prediction Error History
+    # ------------------------------------------------------------------
+
+    def record_prediction_error(
         self,
-        config: Optional[MemoryConfig] = None,
-        long_term_memory_config: Optional[Mapping[str, Any]] = None,
-        logger: Optional[Any] = None,
+        state: AgentState,
+        pe_batch: PredictionErrorBatch,
+        action: Optional[str] = None,
     ) -> None:
-        self.config = config if isinstance(config, MemoryConfig) else MemoryConfig()
-        self.logger = logger
-        ltm_cfg = dict(long_term_memory_config or {})
-
-        self._working_memory = WorkingMemoryBuffer(
-            capacity=self.config.working_memory_capacity,
+        area_id = state.perception.area_id or "unknown"
+        pe_per_channel = {e.channel: e.magnitude for e in pe_batch.errors}
+        rec = PredictionErrorRecord(
+            area_id=area_id,
+            step=state.step,
+            feature_vector=self._pe_history._area_to_vector(area_id),
+            pe_per_channel=pe_per_channel,
+            mean_pe=pe_batch.mean_magnitude,
+            action_id=action,
         )
-        self._prediction_error_history = PredictionErrorHistory(
-            min_observations=self.config.pe_min_observations,
-            ema_alpha=self.config.pe_ema_alpha,
-        )
-        self._self_state_tracking = SelfStateTracking(
-            k_default=self.config.faiss_k_default,
-            epsilon=self.config.faiss_epsilon,
-        )
-        self._policy_traces = PolicyTraces(
-            episode_length=self.config.episode_length,
-            k_default=self.config.faiss_k_default,
-            epsilon=self.config.faiss_epsilon,
-        )
-        self._long_term_memory = LongTermMemory(
-            path=str(ltm_cfg.get("path", self.config.long_term_memory_path)),
-            max_score_history=int(
-                ltm_cfg.get(
-                    "max_score_history",
-                    self.config.long_term_memory_max_score_history,
-                )
-            ),
-            max_outcome_history=int(
-                ltm_cfg.get(
-                    "max_outcome_history",
-                    self.config.long_term_memory_max_outcome_history,
-                )
-            ),
-        )
-        self._self_state_snapshots: List[Dict[str, Any]] = []
-        self._policy_trace_events: List[Dict[str, Any]] = []
-        self._active_pe_policy_id: str = "bootstrap"
-        self._max_self_state_snapshots = 5000
-        self._max_policy_trace_events = 5000
-
-    # WorkingMemoryBuffer delegation
-    def record_working(self, entry: WorkingMemoryEntry) -> None:
-        self._working_memory.record(entry)
-        step: Optional[int] = entry.tick if isinstance(entry.tick, int) else None
-        self._emit_memory_event(
-            operation="record_working",
-            payload={
-                "tick": entry.tick,
-                "entry_type": entry.entry_type,
-                "priority": entry.priority,
-                "payload": entry.payload,
-            },
-            step=step,
-        )
-
-    def get_recent(self, n: int, entry_type: Optional[str] = None) -> List[WorkingMemoryEntry]:
-        return self._working_memory.get_recent(n=n, entry_type=entry_type)
-
-    def get_active_goals(self) -> List[WorkingMemoryEntry]:
-        return self._working_memory.get_active_goals()
-
-    # PredictionErrorHistory delegation
-    def set_active_policy_for_pe(self, policy_id: Optional[str]) -> None:
-        normalized = self._normalize_policy_id(policy_id)
-        self._active_pe_policy_id = normalized if normalized is not None else "bootstrap"
-        self._emit_memory_event(
-            operation="set_active_policy_for_pe",
-            payload={"policy_id": self._active_pe_policy_id},
-        )
-
-    def record_pe(self, area_id: str, error: Any, policy_id: Optional[str] = None) -> None:
-        resolved_policy_id = self._normalize_policy_id(policy_id)
-        if resolved_policy_id is None:
-            resolved_policy_id = self._active_pe_policy_id
-        payload = self._coerce_pe_payload(area_id=area_id, error=error, policy_id=resolved_policy_id)
-        self._prediction_error_history.record(area_id=area_id, error=payload)
-        tick = payload.get("tick")
-        step: Optional[int] = int(tick) if isinstance(tick, int) else None
-        self._emit_memory_event(
-            operation="record_pe",
-            payload={"area_id": area_id, "error": payload},
-            step=step,
-        )
-
-    def record_prediction_error(self, error: Any, area_id: str = "unknown") -> None:
-        self.record_pe(area_id=area_id, error=error)
+        self._pe_history.record(rec)
 
     def get_area_familiarity(self, area_id: str) -> float:
-        return self._prediction_error_history.get_area_familiarity(area_id=area_id)
+        return self._pe_history.get_area_familiarity(area_id)
 
-    def get_area_threat_prior(self, area_id: str) -> float:
-        return self._prediction_error_history.get_area_threat_prior(area_id=area_id)
+    def get_area_mean_pe(self, area_id: str) -> float:
+        return self._pe_history.get_mean_pe(area_id)
 
-    def query_prediction_errors(
+    def reset_area_familiarity(self, area_id: str) -> None:
+        """
+        Clear PE history records for a specific area.
+
+        Called at episode start for the agent's initial area so that
+        area_familiarity = 0 on step 0 every episode, making area_novelty = 1.0
+        and allowing the epistemic value of turns to dominate — producing a
+        natural orienting scan without hardcoded behaviour.
+        """
+        self._pe_history.clear_area(area_id)
+
+    # ------------------------------------------------------------------
+    # SelfStateTracking
+    # ------------------------------------------------------------------
+
+    def update_state_outcome(self, next_state: AgentState) -> None:
+        self._self_state.update_last_outcome(next_state)
+
+    def get_depletion_rates(self) -> Dict[str, float]:
+        return self._self_state.get_depletion_rates()
+
+    # ------------------------------------------------------------------
+    # PolicyTraces
+    # ------------------------------------------------------------------
+
+    def record_policy_trace(
         self,
-        policy_id: Optional[str] = None,
-        area_id: Optional[str] = None,
-        limit: Optional[int] = None,
-    ) -> List[Dict[str, Any]]:
-        query: Dict[str, Any] = {}
-        normalized_policy_id = self._normalize_policy_id(policy_id)
-        if normalized_policy_id is not None:
-            query["policy_id"] = normalized_policy_id
-        if area_id is not None:
-            text_area = str(area_id).strip()
-            if text_area:
-                query["area_id"] = text_area
-        if isinstance(limit, int):
-            query["limit"] = int(limit)
-        return self._prediction_error_history.query(query)
-
-    # SelfStateTracking delegation
-    def record_state(
-        self,
-        state: Any,
-        channel_deltas: Dict[str, float],
-        context_tags: List[str],
-        arousal: float,
-    ) -> None:
-        self._self_state_tracking.record(
-            state=state,
-            channel_deltas=channel_deltas,
-            context_tags=context_tags,
-            arousal=arousal,
-        )
-        state_tick = getattr(state, "tick", None)
-        step: Optional[int] = int(state_tick) if isinstance(state_tick, int) else None
-        self._emit_memory_event(
-            operation="record_state",
-            payload={
-                "state_tick": state_tick,
-                "channel_deltas": dict(channel_deltas),
-                "context_tags": list(context_tags),
-                "arousal": float(arousal),
-            },
-            step=step,
-        )
-
-    def get_depletion_rate(self, state: Any, channel_id: str) -> Optional[float]:
-        return self._self_state_tracking.get_depletion_rate(
-            state=state,
-            channel_id=channel_id,
-            k=self.config.faiss_k_default,
-        )
-
-    def get_capability_estimate(self, state: Any, context_tag: str) -> Optional[float]:
-        return self._self_state_tracking.get_capability_estimate(
-            state=state,
-            context_tag=context_tag,
-            k=self.config.faiss_k_default,
-        )
-
-    # PolicyTraces delegation
-    def record_trace(
-        self,
-        channel_a_id: str,
-        channel_b_id: str,
-        winner_channel_id: str,
-        action_tag: str,
-        context_vector: np.ndarray,
+        state: AgentState,
+        policy_id: str,
         outcome_score: float,
-        tick: int,
+        drive_signals: Optional[Dict[str, float]] = None,
+        notes: Optional[str] = None,
     ) -> None:
-        self._policy_traces.record(
-            channel_a_id=channel_a_id,
-            channel_b_id=channel_b_id,
-            winner_channel_id=winner_channel_id,
-            action_tag=action_tag,
-            context_vector=context_vector,
+        # Context vector (10-dim):
+        #   [0-5] homeostatic_vector: health, saturation, energy, oxygen, threat, resource
+        #   [6]   step_norm
+        #   [7]   food_dist: 0=food far/absent, 1=food at contact — from forward raycast
+        #   [8-9] padding (0.0)
+        # Position excluded — dead-reckoning error would corrupt similarity distances.
+        hv = state.homeostatic_vector()
+        step_norm = min(1.0, state.step / 1000.0)
+        rc = state.perception.raycast_hits
+        food_dist = 0.0
+        if rc and rc[0].get("hit_tag") in ("GoodGoal", "GoodGoalMulti"):
+            food_dist = 1.0 - float(rc[0].get("distance", 1.0))
+        context_vec = hv + [step_norm, food_dist, 0.0, 0.0]  # 10-dim
+
+        rec = PolicyTraceRecord(
+            step=state.step,
+            policy_id=policy_id,
+            context_vector=context_vec[:10],
             outcome_score=outcome_score,
-            tick=tick,
+            drive_signals=drive_signals or {},
+            notes=notes,
         )
-        self._emit_memory_event(
-            operation="record_trace",
-            payload={
-                "channel_a_id": channel_a_id,
-                "channel_b_id": channel_b_id,
-                "winner_channel_id": winner_channel_id,
-                "action_tag": action_tag,
-                "context_vector": context_vector,
-                "outcome_score": float(outcome_score),
-                "tick": int(tick),
-            },
-            step=int(tick),
-        )
+        self._policy_traces.record(rec)
 
-    def get_conflict_resolution_score(
-        self,
-        channel_a_id: str,
-        channel_b_id: str,
-        context_vector: np.ndarray,
-    ) -> float:
-        return self._policy_traces.get_conflict_resolution_score(
-            channel_a_id=channel_a_id,
-            channel_b_id=channel_b_id,
-            context_vector=context_vector,
-            k=self.config.faiss_k_default,
-        )
+    def get_policy_outcome_history(self, policy_id: str) -> float:
+        return self._policy_traces.get_policy_outcome_history(policy_id)
 
-    def get_best_action_for_drive(
-        self,
-        channel_id: str,
-        context_vector: np.ndarray,
-    ) -> Optional[str]:
-        return self._policy_traces.get_best_action_for_drive(
-            channel_id=channel_id,
-            context_vector=context_vector,
-            k=self.config.faiss_k_default,
-        )
+    def query_similar_traces(self, state: AgentState, k: int = 3) -> list:
+        """
+        Return up to k PolicyTraceRecords from past situations most similar
+        to the current homeostatic + position state.
 
-    # Runtime snapshots and policy lifecycle
-    def snapshot_self_state(self, snapshot: Any) -> None:
-        if isinstance(snapshot, Mapping):
-            payload = dict(snapshot)
-        else:
-            payload = {"snapshot": snapshot}
-        payload.setdefault("ts", datetime.utcnow().isoformat() + "Z")
-        self._self_state_snapshots.append(payload)
-        if len(self._self_state_snapshots) > self._max_self_state_snapshots:
-            del self._self_state_snapshots[:-self._max_self_state_snapshots]
-        step_raw = payload.get("step")
-        step: Optional[int] = int(step_raw) if isinstance(step_raw, int) else None
-        self._emit_memory_event(
-            operation="snapshot_self_state",
-            payload=payload,
-            step=step,
-        )
+        Uses the same context vector as record_policy_trace so FAISS distances
+        are meaningful. Called by PolicyGenerator before each LLM prompt to
+        inject episodic memory as a prior.
+        """
+        hv = state.homeostatic_vector()
+        step_norm = min(1.0, state.step / 1000.0)
+        rc = state.perception.raycast_hits
+        food_dist = 0.0
+        if rc and rc[0].get("hit_tag") in ("GoodGoal", "GoodGoalMulti"):
+            food_dist = 1.0 - float(rc[0].get("distance", 1.0))
+        context_vec = hv + [step_norm, food_dist, 0.0, 0.0]
+        records = self._policy_traces.query_similar(context_vec)
+        return records[:k]
 
-    def register_policies(self, policies: Any) -> None:
-        if isinstance(policies, list):
-            self._long_term_memory.upsert_policies(policies)
-            self._emit_memory_event(
-                operation="register_policies",
-                payload={"count": len(policies)},
-            )
+    def save_faiss_stores(self) -> None:
+        """
+        Persist FAISS-backed stores to disk.  Called at episode end.
 
-    def record_policy_selection(
+        PolicyTraces and PredictionErrorHistory are persisted.
+        SelfStateTracking is intentionally skipped until dead-reckoning
+        position coordinates are fixed (spatial vectors are currently corrupt).
+        """
+        self._pe_history.save(self._persist_path)
+        self._policy_traces.save(self._persist_path)
+
+    # ------------------------------------------------------------------
+    # LongTermMemory
+    # ------------------------------------------------------------------
+
+    def record_episode_outcome(
         self,
         policy_id: str,
         score: float,
-        components: Any,
-        step: Optional[int],
+        outcome: str = "partial",
     ) -> None:
-        self._long_term_memory.record_policy_selection(
-            policy_id=policy_id,
-            score=float(score),
-            components=components,
-            step=step,
-        )
-        self._emit_memory_event(
-            operation="record_policy_selection",
-            payload={
-                "policy_id": str(policy_id),
-                "score": float(score),
-                "components": components,
-            },
-            step=step if isinstance(step, int) else None,
-        )
+        self._long_term.record_outcome(policy_id, score, outcome)
 
-    def record_policy_outcome(
-        self,
-        policy_id: str,
-        reward: Any,
-        done: Any,
-        step: Optional[int],
-    ) -> None:
-        self._long_term_memory.record_policy_outcome(
-            policy_id=policy_id,
-            reward=reward,
-            done=bool(done),
-            step=step,
-        )
-        self._emit_memory_event(
-            operation="record_policy_outcome",
-            payload={
-                "policy_id": str(policy_id),
-                "reward": reward,
-                "done": bool(done),
-            },
-            step=step if isinstance(step, int) else None,
-        )
+    def get_ltm_success_rate(self, policy_id: str) -> float:
+        return self._long_term.get_success_rate(policy_id)
 
-    def get_policies(self, adapter_folder: Optional[str] = None) -> List[Dict[str, Any]]:
-        return self._long_term_memory.get_policies(adapter_folder=adapter_folder)
-
-    def record_policy_trace(self, trace: Any) -> None:
-        if isinstance(trace, Mapping):
-            payload = dict(trace)
-        else:
-            payload = {"trace": trace}
-        payload.setdefault("ts", datetime.utcnow().isoformat() + "Z")
-        self._policy_trace_events.append(payload)
-        if len(self._policy_trace_events) > self._max_policy_trace_events:
-            del self._policy_trace_events[:-self._max_policy_trace_events]
-        step_raw = payload.get("step")
-        step: Optional[int] = int(step_raw) if isinstance(step_raw, int) else None
-        self._emit_memory_event(
-            operation="record_policy_trace",
-            payload=payload,
-            step=step,
-        )
-
-    def query(self, query: Any) -> Any:
-        if not isinstance(query, Mapping):
-            return {
-                "self_state": list(self._self_state_snapshots),
-                "policy_traces": list(self._policy_trace_events),
-                "prediction_errors": self._prediction_error_history.query({}),
-                "policies": self.get_policies(),
-            }
-
-        target = str(query.get("target", "")).strip()
-        if target == "self_state":
-            phase = query.get("phase")
-            step = query.get("step")
-            limit = query.get("limit")
-            out = list(self._self_state_snapshots)
-            if phase is not None:
-                out = [
-                    item
-                    for item in out
-                    if isinstance(item, Mapping) and item.get("phase") == phase
-                ]
-            if step is not None:
-                out = [
-                    item
-                    for item in out
-                    if isinstance(item, Mapping) and item.get("step") == step
-                ]
-            if isinstance(limit, int) and limit >= 0:
-                return out[-limit:]
-            return out
-        if target == "policy_traces":
-            policy_id = self._normalize_policy_id(query.get("policy_id"))
-            limit = query.get("limit")
-            out = list(self._policy_trace_events)
-            if policy_id is not None:
-                out = [
-                    item
-                    for item in out
-                    if isinstance(item, Mapping)
-                    and self._normalize_policy_id(item.get("policy_id")) == policy_id
-                ]
-            if isinstance(limit, int) and limit >= 0:
-                return out[-limit:]
-            return out
-        if target == "prediction_errors":
-            return self._prediction_error_history.query(query)
-        if target == "policies":
-            return self.get_policies(adapter_folder=query.get("adapter_folder"))
-        return {
-            "self_state": list(self._self_state_snapshots),
-            "policy_traces": list(self._policy_trace_events),
-            "prediction_errors": self._prediction_error_history.query({}),
-            "policies": self.get_policies(),
-        }
-
-    # Lifecycle
-    def clear_episode(self) -> None:
-        self._working_memory.clear()
-        self._self_state_snapshots.clear()
-        self._policy_trace_events.clear()
-        self._active_pe_policy_id = "bootstrap"
-        self._emit_memory_event(
-            operation="clear_episode",
-            payload={"active_pe_policy_id": self._active_pe_policy_id},
-        )
-
-    def clear_all(self) -> None:
-        self._working_memory.clear()
-        self._prediction_error_history.clear()
-        self._self_state_tracking.clear()
-        self._policy_traces.clear()
-        self._self_state_snapshots.clear()
-        self._policy_trace_events.clear()
-        self._active_pe_policy_id = "bootstrap"
-        self._emit_memory_event(
-            operation="clear_all",
-            payload={"active_pe_policy_id": self._active_pe_policy_id},
-        )
-
-    # Compatibility/read-only accessors
-    @property
-    def working_memory(self) -> WorkingMemoryBuffer:
-        return self._working_memory
-
-    @property
-    def prediction_errors(self) -> PredictionErrorHistory:
-        return self._prediction_error_history
-
-    @property
-    def self_state(self) -> SelfStateTracking:
-        return self._self_state_tracking
-
-    @property
-    def policy_traces(self) -> PolicyTraces:
-        return self._policy_traces
-
-    @property
-    def long_term_memory(self) -> LongTermMemory:
-        return self._long_term_memory
-
-    @staticmethod
-    def _normalize_policy_id(value: Any) -> Optional[str]:
-        if value is None:
-            return None
-        text = str(value).strip()
-        if not text:
-            return None
-        return text
-
-    @staticmethod
-    def _coerce_pe_payload(area_id: str, error: Any, policy_id: str) -> Dict[str, Any]:
-        payload: Dict[str, Any]
-        if isinstance(error, Mapping):
-            payload = dict(error)
-        else:
-            payload = {
-                "magnitude": getattr(error, "magnitude", None),
-                "source": getattr(error, "source", None),
-                "channel": getattr(error, "channel", None),
-                "tick": getattr(error, "tick", None),
-            }
-        payload["area_id"] = str(area_id)
-        payload["policy_id"] = str(policy_id)
-        return payload
-
-    def _emit_memory_event(
-        self,
-        *,
-        operation: str,
-        payload: Mapping[str, Any],
-        step: Optional[int] = None,
-    ) -> None:
-        logger = self.logger
-        if logger is None:
-            return
-        emitter = getattr(logger, "memory_event", None)
-        if not callable(emitter):
-            return
-        event_payload = {"operation": str(operation), **dict(payload)}
-        try:
-            emitter(event_payload, step=step)
-        except Exception:
-            # Memory logging should never interrupt runtime behavior.
-            return
+    def log_summary(self) -> None:
+        records = self._long_term.get_all_records()
+        for pid, rec in records.items():
+            log.info(
+                "LTM[%s]: selections=%d, success_rate=%.2f",
+                pid, rec.total_selections, rec.success_rate,
+            )

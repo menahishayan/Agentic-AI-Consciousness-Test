@@ -1,138 +1,89 @@
+"""
+OpenAI provider — full implementation.
+
+Uses the `openai` SDK. Set provider="openai" in config.json and
+OPENAI_API_KEY in .env to use this provider.
+"""
 from __future__ import annotations
 
+import logging
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Optional
 
-from core.llm.client import LLMClient
-from core.llm.types import LLMMessage, LLMRequest, LLMResponse, LLMUsage
-from core.observability.logger import RunLogger
+from core.llm.base import AbstractLLMClient
+from core.llm.types import LLMRequest, LLMResponse
 
-
-def _messages_to_input(messages: List[LLMMessage]) -> List[Dict[str, Any]]:
-    payload: List[Dict[str, Any]] = []
-    for msg in messages:
-        payload.append({"role": msg.role, "content": msg.content})
-    return payload
+log = logging.getLogger(__name__)
 
 
-class OpenAIClient(LLMClient):
+class OpenAIClient(AbstractLLMClient):
     def __init__(
         self,
-        api_key: Optional[str] = None,
-        organization: Optional[str] = None,
-        project: Optional[str] = None,
+        api_key: str,
         default_model: Optional[str] = None,
-        default_params: Optional[Dict[str, Any]] = None,
-        logger: Optional[RunLogger] = None,
-        client: Any = None,
-        timeout: Optional[float] = None,
+        default_max_tokens: int = 500,
+        default_temperature: float = 0.1,
+        timeout: Optional[float] = 15.0,
+        logger: Optional[Any] = None,
     ) -> None:
-        self.default_model = default_model
-        self.default_params = default_params or {}
-        self.logger = logger
-
-        if client is not None:
-            self.client = client
-            return
-
         try:
-            from openai import OpenAI
-        except Exception as exc:  # pragma: no cover - optional dependency
-            raise ImportError("openai package is required for OpenAIClient") from exc
+            import openai as _openai
+            self._client = _openai.OpenAI(api_key=api_key, timeout=timeout)
+        except ImportError as exc:
+            raise ImportError("openai package not installed. Run: pip install openai>=1.30.0") from exc
 
-        kwargs: Dict[str, Any] = {}
-        if api_key:
-            kwargs["api_key"] = api_key
-        if organization:
-            kwargs["organization"] = organization
-        if project:
-            kwargs["project"] = project
-        if timeout is not None:
-            kwargs["timeout"] = timeout
-        self.client = OpenAI(**kwargs)
+        self._default_model = default_model or "gpt-4o-mini"
+        self._default_max_tokens = default_max_tokens
+        self._default_temperature = default_temperature
+        self._run_logger = logger
 
-    def generate(self, request: LLMRequest) -> LLMResponse:
-        model = request.model or self.default_model
-        if not model:
-            raise ValueError("LLMRequest.model is required when no default_model is set.")
+    @property
+    def provider_name(self) -> str:
+        return "openai"
 
-        input_messages = _messages_to_input(request.messages)
-        params: Dict[str, Any] = {
-            "model": model,
-            "input": input_messages,
-        }
-        if request.temperature is not None:
-            params["temperature"] = request.temperature
-        if request.max_tokens is not None:
-            params["max_output_tokens"] = request.max_tokens
+    def complete(self, request: LLMRequest) -> LLMResponse:
+        model = request.model or self._default_model
+        temperature = request.temperature if request.temperature is not None else self._default_temperature
+        max_tokens = request.max_tokens or self._default_max_tokens
 
-        provider_params = request.metadata.get("provider_params") if request.metadata else None
-        if isinstance(provider_params, dict):
-            params.update(provider_params)
+        messages = [{"role": m.role, "content": m.content} for m in request.messages]
 
-        params.update(self.default_params)
-
-        if self.logger is not None:
-            self.logger.llm_request(
-                {
-                    "provider": "openai",
-                    "model": model,
-                    "messages": input_messages,
-                    "request_params": {
-                        "temperature": request.temperature,
-                        "max_output_tokens": request.max_tokens,
-                    },
-                }
+        t0 = time.monotonic()
+        try:
+            response = self._client.chat.completions.create(
+                model=model,
+                messages=messages,
+                max_tokens=max_tokens,
+                temperature=temperature,
             )
+        except Exception as exc:
+            log.error("OpenAI API error: %s", exc)
+            raise
 
-        start = time.time()
-        resp = self.client.responses.create(**params)
-        latency_ms = (time.time() - start) * 1000.0
+        latency_ms = (time.monotonic() - t0) * 1000.0
+        content = response.choices[0].message.content or "" if response.choices else ""
 
-        text = getattr(resp, "output_text", None)
-        if not text:
-            text = ""
-            output = getattr(resp, "output", None)
-            if output:
-                for item in output:
-                    content = getattr(item, "content", None) or []
-                    for part in content:
-                        part_type = getattr(part, "type", None)
-                        if part_type in {"output_text", "text"}:
-                            text += getattr(part, "text", "")
-
-        usage = None
-        raw_usage = getattr(resp, "usage", None)
-        if raw_usage is not None:
-            usage = LLMUsage(
-                prompt_tokens=getattr(raw_usage, "prompt_tokens", None),
-                completion_tokens=getattr(raw_usage, "completion_tokens", None),
-                total_tokens=getattr(raw_usage, "total_tokens", None),
-            )
-
-        response = LLMResponse(
-            text=text,
-            raw=resp,
-            usage=usage,
-            latency_ms=latency_ms,
-            provider="openai",
+        llm_response = LLMResponse(
+            content=content,
             model=model,
+            provider="openai",
+            input_tokens=response.usage.prompt_tokens if response.usage else 0,
+            output_tokens=response.usage.completion_tokens if response.usage else 0,
+            latency_ms=latency_ms,
+            raw=response,
         )
 
-        if self.logger is not None:
-            self.logger.llm_response(
-                {
-                    "provider": "openai",
-                    "model": model,
-                    "text": response.text,
-                    "usage": usage,
-                    "latency_ms": latency_ms,
-                    "raw": resp,
-                }
-            )
+        if self._run_logger is not None:
+            try:
+                self._run_logger.llm(
+                    prompt=messages[-1]["content"] if messages else "",
+                    response=content,
+                    model=model,
+                    latency_ms=latency_ms,
+                    input_tokens=llm_response.input_tokens,
+                    output_tokens=llm_response.output_tokens,
+                )
+            except Exception:
+                pass
 
-        return response
-
-
-class OpenAIClientStub(OpenAIClient):
-    pass
+        return llm_response

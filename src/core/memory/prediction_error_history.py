@@ -1,260 +1,209 @@
+"""
+PredictionErrorHistory — FAISS-backed store of per-area prediction error history.
+
+Enables the agent to recall: "When I was in this area, how surprising was the world?"
+This feeds into precision weighting in the PredictionErrorCalculator.
+"""
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Any, Dict, List, Mapping, Optional
+import json
+import logging
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
 
+import numpy as np
 
-@dataclass
-class AreaStats:
-    area_id: str
-    pe_mean: float
-    pe_variance: float
-    threat_mean: float
-    count: int
-    last_tick: int
+from core.models.memory_records import PredictionErrorRecord
+
+log = logging.getLogger(__name__)
+
+_FEATURE_DIM = 8  # [area_hash_floats(4), pe_health, pe_saturation, pe_resource, pe_threat]
 
 
 class PredictionErrorHistory:
-    def __init__(self, min_observations: int = 5, ema_alpha: float = 0.1) -> None:
-        self.min_observations = max(1, int(min_observations))
-        self.ema_alpha = max(1e-6, min(1.0, float(ema_alpha)))
-        self._stats: Dict[str, AreaStats] = {}
-        self._records: List[Dict[str, Any]] = []
-        self._welford_mean: Dict[str, float] = {}
-        self._welford_m2: Dict[str, float] = {}
-        self._threat_seen: set[str] = set()
+    """
+    FAISS-indexed store of prediction error records per area.
+    Enables familiarity computation for precision weighting.
+    """
 
-    def record(self, area_id: str, error: Any) -> None:
-        normalized_area = self._normalize_area_id(area_id)
-        if normalized_area is None:
-            return
+    def __init__(self, config: Dict[str, Any]) -> None:
+        self._k: int = int(config.get("faiss_k_default", 5))
+        self._epsilon: float = float(config.get("faiss_epsilon", 1e-6))
+        self._min_obs: int = int(config.get("pe_min_observations", 5))
+        self._ema_alpha: float = float(config.get("pe_ema_alpha", 0.1))
 
-        magnitude = self._extract_magnitude(error)
-        if magnitude is None:
-            return
+        self._records: List[PredictionErrorRecord] = []
+        self._index: Optional[Any] = None  # faiss.IndexFlatL2
+        self._vectors: Optional[np.ndarray] = None
 
-        magnitude = self._clip01(abs(float(magnitude)))
-        source = self._extract_source(error)
-        tick = self._extract_tick(error)
-        policy_id = self._extract_policy_id(error)
-        channel = self._extract_channel(error)
+    def record(self, rec: PredictionErrorRecord) -> None:
+        """Add a new prediction error record and update the FAISS index."""
+        self._records.append(rec)
+        vec = self._to_vector(rec)
 
-        self._records.append(
-            {
-                "area_id": normalized_area,
-                "policy_id": policy_id,
-                "channel": channel,
-                "magnitude": magnitude,
-                "source": source,
-                "tick": tick,
-            }
-        )
-
-        stats = self._stats.get(normalized_area)
-        if stats is None:
-            stats = AreaStats(
-                area_id=normalized_area,
-                pe_mean=magnitude,
-                pe_variance=0.0,
-                threat_mean=0.0,
-                count=0,
-                last_tick=0 if tick is None else int(tick),
-            )
-            self._stats[normalized_area] = stats
-
-        # EMA mean for familiarity/threat estimates.
-        if stats.count == 0:
-            stats.pe_mean = magnitude
+        if self._vectors is None:
+            self._vectors = vec.reshape(1, -1)
         else:
-            stats.pe_mean = self.ema_alpha * magnitude + (1.0 - self.ema_alpha) * stats.pe_mean
+            self._vectors = np.vstack([self._vectors, vec.reshape(1, -1)])
 
-        # Welford online variance for PE magnitudes.
-        prev_count = int(stats.count)
-        new_count = prev_count + 1
-        mean = self._welford_mean.get(normalized_area, 0.0)
-        m2 = self._welford_m2.get(normalized_area, 0.0)
-        delta = magnitude - mean
-        mean += delta / float(new_count)
-        delta2 = magnitude - mean
-        m2 += delta * delta2
-        variance = m2 / float(new_count)
-        self._welford_mean[normalized_area] = mean
-        self._welford_m2[normalized_area] = m2
+        self._rebuild_index()
 
-        if source == "threat":
-            if normalized_area in self._threat_seen:
-                stats.threat_mean = (
-                    self.ema_alpha * magnitude + (1.0 - self.ema_alpha) * stats.threat_mean
-                )
-            else:
-                stats.threat_mean = magnitude
-                self._threat_seen.add(normalized_area)
-
-        stats.pe_variance = max(0.0, float(variance))
-        stats.count = new_count
-        if tick is not None:
-            stats.last_tick = int(tick)
+    def clear_area(self, area_id: str) -> None:
+        """Remove all records for a specific area and rebuild the FAISS index."""
+        self._records = [r for r in self._records if r.area_id != area_id]
+        if self._records:
+            self._vectors = np.vstack([
+                self._to_vector(r).reshape(1, -1) for r in self._records
+            ])
+        else:
+            self._vectors = None
+        self._rebuild_index()
 
     def get_area_familiarity(self, area_id: str) -> float:
-        normalized_area = self._normalize_area_id(area_id)
-        if normalized_area is None:
+        """
+        Return [0,1] familiarity score for the given area.
+        Higher = more observations = more familiar = higher precision.
+        """
+        area_records = [r for r in self._records if r.area_id == area_id]
+        n = len(area_records)
+        if n == 0:
             return 0.0
-        stats = self._stats.get(normalized_area)
-        if stats is None or int(stats.count) < self.min_observations:
-            return 0.0
-        return self._clip01(1.0 - self._clip01(stats.pe_mean))
+        return float(min(1.0, n / max(self._min_obs, 1)))
 
-    def get_area_threat_prior(self, area_id: str) -> float:
-        normalized_area = self._normalize_area_id(area_id)
-        if normalized_area is None:
-            return 0.0
-        stats = self._stats.get(normalized_area)
-        if stats is None or normalized_area not in self._threat_seen:
-            return 0.0
-        return self._clip01(stats.threat_mean)
+    def get_mean_pe(self, area_id: str) -> float:
+        """Return mean PE for a specific area, or global mean if unknown."""
+        area_records = [r for r in self._records if r.area_id == area_id]
+        if not area_records:
+            if self._records:
+                return float(np.mean([r.mean_pe for r in self._records[-50:]]))
+            return 0.5
+        return float(np.mean([r.mean_pe for r in area_records[-20:]]))
 
-    def query(self, query: Any) -> List[Dict[str, Any]]:
-        if not isinstance(query, Mapping):
-            return list(self._records)
+    def query_similar(
+        self,
+        area_id: str,
+        pe_snapshot: Dict[str, float],
+    ) -> List[PredictionErrorRecord]:
+        """Find k nearest records by area embedding + PE values."""
+        if self._index is None or len(self._records) < self._k:
+            return self._records[-self._k:] if self._records else []
 
-        policy_id = self._normalize_optional_text(query.get("policy_id"))
-        area_id = self._normalize_optional_text(query.get("area_id"))
-        channel = self._normalize_optional_text(query.get("channel"))
-        source = self._normalize_optional_text(query.get("source"))
-        limit = query.get("limit")
+        dummy_rec = PredictionErrorRecord(
+            area_id=area_id,
+            step=0,
+            feature_vector=self._area_to_vector(area_id),
+            pe_per_channel=pe_snapshot,
+            mean_pe=float(np.mean(list(pe_snapshot.values()))) if pe_snapshot else 0.0,
+        )
+        query = self._to_vector(dummy_rec).reshape(1, -1)
 
-        out: List[Dict[str, Any]] = []
-        for record in self._records:
-            if policy_id is not None and self._normalize_optional_text(record.get("policy_id")) != policy_id:
-                continue
-            if area_id is not None and self._normalize_optional_text(record.get("area_id")) != area_id:
-                continue
-            if channel is not None and self._normalize_optional_text(record.get("channel")) != channel:
-                continue
-            if source is not None and self._normalize_optional_text(record.get("source")) != source:
-                continue
-            out.append(dict(record))
+        try:
+            import faiss
+            k_actual = min(self._k, len(self._records))
+            distances, indices = self._index.search(query.astype(np.float32), k_actual)
+            return [self._records[i] for i in indices[0] if 0 <= i < len(self._records)]
+        except Exception as exc:
+            log.debug("FAISS query failed: %s", exc)
+            return self._records[-self._k:]
 
-        if isinstance(limit, int) and limit >= 0:
-            return out[-limit:]
-        return out
+    def save(self, path: Path) -> None:
+        """
+        Persist records to JSON sidecar and FAISS index to disk.
+        Two files: pe_history_records.json + pe_history.faiss
+        """
+        if not self._records:
+            return
+        path.mkdir(parents=True, exist_ok=True)
+        try:
+            (path / "pe_history_records.json").write_text(json.dumps([
+                {
+                    "area_id": r.area_id,
+                    "step": r.step,
+                    "feature_vector": r.feature_vector,
+                    "pe_per_channel": r.pe_per_channel,
+                    "mean_pe": r.mean_pe,
+                    "action_id": r.action_id,
+                }
+                for r in self._records
+            ]))
+        except Exception as exc:
+            log.warning("PredictionErrorHistory: records save failed: %s", exc)
+            return
+        try:
+            import faiss
+            if self._index is not None:
+                faiss.write_index(self._index, str(path / "pe_history.faiss"))
+        except Exception as exc:
+            log.warning("PredictionErrorHistory: FAISS index save failed: %s", exc)
+        log.info("PredictionErrorHistory: saved %d records to %s", len(self._records), path)
 
-    def clear(self) -> None:
-        self._stats.clear()
-        self._records.clear()
-        self._welford_mean.clear()
-        self._welford_m2.clear()
-        self._threat_seen.clear()
+    def load(self, path: Path) -> None:
+        """
+        Load records from JSON sidecar and FAISS index from disk.
+        Silently no-ops if files don't exist.
+        """
+        records_file = path / "pe_history_records.json"
+        index_file = path / "pe_history.faiss"
+        if not records_file.exists():
+            return
+        try:
+            data = json.loads(records_file.read_text())
+            self._records = [
+                PredictionErrorRecord(
+                    area_id=r["area_id"],
+                    step=r["step"],
+                    feature_vector=r["feature_vector"],
+                    pe_per_channel=r["pe_per_channel"],
+                    mean_pe=r["mean_pe"],
+                    action_id=r.get("action_id"),
+                )
+                for r in data
+            ]
+            if self._records:
+                self._vectors = np.vstack([
+                    self._to_vector(r).reshape(1, -1) for r in self._records
+                ])
+            try:
+                import faiss
+                if index_file.exists():
+                    self._index = faiss.read_index(str(index_file))
+                else:
+                    self._rebuild_index()
+            except Exception:
+                self._rebuild_index()
+            log.info("PredictionErrorHistory: loaded %d records from %s",
+                     len(self._records), path)
+        except Exception as exc:
+            log.warning("PredictionErrorHistory: load failed: %s", exc)
 
-    @staticmethod
-    def _normalize_area_id(value: Any) -> Optional[str]:
-        if value is None:
-            return None
-        text = str(value).strip()
-        if not text:
-            return None
-        return text
+    def _rebuild_index(self) -> None:
+        try:
+            import faiss
+            if self._vectors is None:
+                return
+            vecs = self._vectors.astype(np.float32)
+            index = faiss.IndexFlatL2(vecs.shape[1])
+            index.add(vecs)
+            self._index = index
+        except Exception:
+            self._index = None
 
-    @staticmethod
-    def _extract_magnitude(error: Any) -> Optional[float]:
-        if isinstance(error, Mapping):
-            value = error.get("magnitude")
-            if isinstance(value, (int, float)):
-                return float(value)
-            nested = error.get("error")
-            if isinstance(nested, Mapping):
-                nested_value = nested.get("magnitude")
-                if isinstance(nested_value, (int, float)):
-                    return float(nested_value)
-        if hasattr(error, "magnitude"):
-            value = getattr(error, "magnitude")
-            if isinstance(value, (int, float)):
-                return float(value)
-        return None
+    def _to_vector(self, rec: PredictionErrorRecord) -> np.ndarray:
+        area_vec = self._area_to_vector(rec.area_id)
+        pe_vals = [
+            rec.pe_per_channel.get("health", 0.0),
+            rec.pe_per_channel.get("saturation", 0.0),
+            rec.pe_per_channel.get("resource_level", 0.0),
+            rec.pe_per_channel.get("threat_proximity", 0.0),
+        ]
+        return np.array(area_vec + pe_vals, dtype=np.float32)
 
-    @staticmethod
-    def _extract_source(error: Any) -> Optional[str]:
-        if isinstance(error, Mapping):
-            source = error.get("source")
-            if isinstance(source, str):
-                return source.strip().lower() or None
-            nested = error.get("error")
-            if isinstance(nested, Mapping):
-                nested_source = nested.get("source")
-                if isinstance(nested_source, str):
-                    return nested_source.strip().lower() or None
-        if hasattr(error, "source"):
-            source = getattr(error, "source")
-            if isinstance(source, str):
-                return source.strip().lower() or None
-        return None
-
-    @staticmethod
-    def _extract_policy_id(error: Any) -> Optional[str]:
-        if isinstance(error, Mapping):
-            policy_id = error.get("policy_id")
-            if isinstance(policy_id, str):
-                normalized = policy_id.strip()
-                return normalized or None
-            nested = error.get("error")
-            if isinstance(nested, Mapping):
-                nested_policy_id = nested.get("policy_id")
-                if isinstance(nested_policy_id, str):
-                    normalized_nested = nested_policy_id.strip()
-                    return normalized_nested or None
-        if hasattr(error, "policy_id"):
-            policy_id = getattr(error, "policy_id")
-            if isinstance(policy_id, str):
-                normalized_attr = policy_id.strip()
-                return normalized_attr or None
-        return None
-
-    @staticmethod
-    def _extract_channel(error: Any) -> Optional[str]:
-        if isinstance(error, Mapping):
-            channel = error.get("channel")
-            if isinstance(channel, str):
-                normalized = channel.strip().lower()
-                return normalized or None
-            nested = error.get("error")
-            if isinstance(nested, Mapping):
-                nested_channel = nested.get("channel")
-                if isinstance(nested_channel, str):
-                    normalized_nested = nested_channel.strip().lower()
-                    return normalized_nested or None
-        if hasattr(error, "channel"):
-            channel = getattr(error, "channel")
-            if isinstance(channel, str):
-                normalized_attr = channel.strip().lower()
-                return normalized_attr or None
-        return None
-
-    @staticmethod
-    def _extract_tick(error: Any) -> Optional[int]:
-        if isinstance(error, Mapping):
-            tick = error.get("tick")
-            if isinstance(tick, int):
-                return int(tick)
-            nested = error.get("error")
-            if isinstance(nested, Mapping):
-                nested_tick = nested.get("tick")
-                if isinstance(nested_tick, int):
-                    return int(nested_tick)
-        if hasattr(error, "tick"):
-            tick = getattr(error, "tick")
-            if isinstance(tick, int):
-                return int(tick)
-        return None
-
-    @staticmethod
-    def _clip01(value: float) -> float:
-        return max(0.0, min(1.0, float(value)))
-
-    @staticmethod
-    def _normalize_optional_text(value: Any) -> Optional[str]:
-        if value is None:
-            return None
-        text = str(value).strip()
-        if not text:
-            return None
-        return text
+    def _area_to_vector(self, area_id: str) -> List[float]:
+        """Deterministic 4-float embedding from area_id string."""
+        h = hash(area_id) % (10 ** 8)
+        return [
+            float((h >> 0) & 0xFF) / 255.0,
+            float((h >> 8) & 0xFF) / 255.0,
+            float((h >> 16) & 0xFF) / 255.0,
+            float((h >> 24) & 0xFF) / 255.0,
+        ]

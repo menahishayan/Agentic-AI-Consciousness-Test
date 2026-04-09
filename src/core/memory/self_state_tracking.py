@@ -1,233 +1,110 @@
+"""
+SelfStateTracking — FAISS-backed store of past homeostatic state snapshots.
+
+Enables the agent to recall past physiological states and their outcomes.
+Feeds depletion rate estimates back to AllostaticController.
+"""
 from __future__ import annotations
 
-from dataclasses import dataclass
 import logging
-from typing import Any, Dict, List, Mapping, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 
-try:
-    import faiss
-except Exception:  # pragma: no cover - import path varies by platform
-    faiss = None
+from core.models.memory_records import SelfStateRecord
+from core.models.state import AgentState
 
+log = logging.getLogger(__name__)
 
-logger = logging.getLogger(__name__)
-
-
-@dataclass
-class SelfStateRecord:
-    record_id: int
-    tick: int
-    state_vector: np.ndarray
-    channel_deltas: Dict[str, float]
-    context_tags: List[str]
-    arousal_at_record: float
+_DIM = 6  # [health, saturation, energy, oxygen, threat, resource]
 
 
 class SelfStateTracking:
-    _DIM = 6
+    def __init__(self, config: Dict[str, Any]) -> None:
+        self._k: int = int(config.get("faiss_k_default", 5))
+        self._records: List[SelfStateRecord] = []
+        self._vectors: Optional[np.ndarray] = None
+        self._index: Optional[Any] = None
 
-    def __init__(self, k_default: int = 5, epsilon: float = 1e-6) -> None:
-        self.k_default = max(1, int(k_default))
-        self.epsilon = max(1e-12, float(epsilon))
-        self._index = self._build_index()
-        self._metadata: Dict[int, SelfStateRecord] = {}
-        self._faiss_ids: List[int] = []
-        self._id_counter = 0
+    def record(self, state: AgentState, action_taken: Optional[str] = None) -> None:
+        vec = state.homeostatic_vector()
+        rec = SelfStateRecord(
+            step=state.step,
+            homeostatic_vector=vec,
+            area_id=state.perception.area_id or "unknown",
+            action_taken=action_taken,
+        )
+        self._records.append(rec)
+        arr = np.array(vec, dtype=np.float32).reshape(1, -1)
+        self._vectors = arr if self._vectors is None else np.vstack([self._vectors, arr])
+        self._rebuild_index()
 
-    def record(
+    def update_last_outcome(
         self,
-        state: Any,
-        channel_deltas: Dict[str, float],
-        context_tags: List[str],
-        arousal: float,
+        next_state: AgentState,
     ) -> None:
-        vector = self._encode_state(state)
-        record_id = int(self._id_counter)
-        self._id_counter += 1
-
-        record = SelfStateRecord(
-            record_id=record_id,
-            tick=self._extract_tick(state),
-            state_vector=vector,
-            channel_deltas={str(key): float(value) for key, value in dict(channel_deltas).items()},
-            context_tags=[str(tag) for tag in list(context_tags)],
-            arousal_at_record=float(arousal),
-        )
-        self._metadata[record_id] = record
-
-        if self._index is None:
+        """Update the most recent record with outcome deltas."""
+        if not self._records:
             return
-        try:
-            self._index.add(vector.reshape(1, self._DIM).astype(np.float32))
-            self._faiss_ids.append(record_id)
-        except Exception as exc:
-            logger.exception("SelfStateTracking FAISS add failed: %s", exc)
+        rec = self._records[-1]
+        prev = rec.homeostatic_vector
+        curr = next_state.homeostatic_vector()
+        rec.outcome_health_delta = curr[0] - prev[0]
+        rec.outcome_saturation_delta = curr[1] - prev[1]
 
-    def get_depletion_rate(
-        self,
-        state: Any,
-        channel_id: str,
-        k: int = 5,
-    ) -> Optional[float]:
-        if not self._metadata:
-            return None
+    def get_depletion_rates(self) -> Dict[str, float]:
+        """
+        Compute average per-step depletion rates from recent history.
+        Returns {channel_id: rate} for channels where rate > 0.
+        """
+        if len(self._records) < 2:
+            return {}
 
-        query = self._encode_state(state)
-        neighbours = self._nearest_records(query, k)
-        if not neighbours:
-            return None
+        recent = self._records[-20:]
+        health_deltas, sat_deltas = [], []
 
-        weights: List[float] = []
-        values: List[float] = []
-        for distance, record in neighbours:
-            if channel_id not in record.channel_deltas:
+        for i in range(1, len(recent)):
+            step_gap = recent[i].step - recent[i - 1].step
+            if step_gap <= 0:
                 continue
-            value = float(record.channel_deltas[channel_id])
-            weight = 1.0 / (float(distance) + self.epsilon)
-            values.append(value)
-            weights.append(weight)
+            prev = recent[i - 1].homeostatic_vector
+            curr = recent[i].homeostatic_vector
+            health_deltas.append((prev[0] - curr[0]) / step_gap)   # depletion = positive
+            sat_deltas.append((prev[1] - curr[1]) / step_gap)
 
-        min_required = max(1, int(k) // 2)
-        if len(values) < min_required:
-            return None
-        denom = float(sum(weights))
-        if denom <= 0.0:
-            return None
-        return float(sum(weight * value for weight, value in zip(weights, values)) / denom)
+        rates = {}
+        if health_deltas:
+            r = float(np.mean(health_deltas))
+            if r > 0:
+                rates["health"] = r
+        if sat_deltas:
+            r = float(np.mean(sat_deltas))
+            if r > 0:
+                rates["saturation"] = r
 
-    def get_capability_estimate(
-        self,
-        state: Any,
-        context_tag: str,
-        k: int = 5,
-    ) -> Optional[float]:
-        if not self._metadata:
-            return None
+        return rates
 
-        query = self._encode_state(state)
-        neighbours = self._nearest_records(query, k)
-        if not neighbours:
-            return None
+    def query_similar(self, state: AgentState) -> List[SelfStateRecord]:
+        if self._index is None or len(self._records) < self._k:
+            return self._records[-self._k:] if self._records else []
 
-        matching = [
-            record.arousal_at_record
-            for _, record in neighbours
-            if context_tag in record.context_tags
-        ]
-        if not matching:
-            return None
-        return float(sum(matching) / float(len(matching)))
-
-    def clear(self) -> None:
-        self._index = self._build_index()
-        self._metadata.clear()
-        self._faiss_ids.clear()
-        self._id_counter = 0
-
-    def _nearest_records(self, query: np.ndarray, k: int) -> List[Tuple[float, SelfStateRecord]]:
-        if not self._metadata:
-            return []
-
-        target_k = max(1, int(k))
-        if self._index is not None and self._faiss_ids:
-            try:
-                k_search = min(target_k, len(self._faiss_ids))
-                distances, indices = self._index.search(
-                    query.reshape(1, self._DIM).astype(np.float32),
-                    int(k_search),
-                )
-                out: List[Tuple[float, SelfStateRecord]] = []
-                for distance, index in zip(distances[0], indices[0]):
-                    if int(index) < 0 or int(index) >= len(self._faiss_ids):
-                        continue
-                    record_id = self._faiss_ids[int(index)]
-                    record = self._metadata.get(record_id)
-                    if record is None:
-                        continue
-                    out.append((float(distance), record))
-                if out:
-                    return out
-            except Exception as exc:
-                logger.exception("SelfStateTracking FAISS search failed: %s", exc)
-
-        # Fallback linear scan for resilience if FAISS fails.
-        scored: List[Tuple[float, SelfStateRecord]] = []
-        for record in self._metadata.values():
-            distance = float(np.sum((query - record.state_vector) ** 2))
-            scored.append((distance, record))
-        scored.sort(key=lambda item: item[0])
-        return scored[:target_k]
-
-    def _build_index(self) -> Optional["faiss.IndexFlatL2"]:
-        if faiss is None:
-            logger.warning("faiss is unavailable; SelfStateTracking will use linear fallback.")
-            return None
+        query = np.array(state.homeostatic_vector(), dtype=np.float32).reshape(1, -1)
         try:
-            return faiss.IndexFlatL2(self._DIM)
-        except Exception as exc:
-            logger.exception("Failed to initialize SelfStateTracking FAISS index: %s", exc)
-            return None
+            import faiss
+            k_actual = min(self._k, len(self._records))
+            _, indices = self._index.search(query, k_actual)
+            return [self._records[i] for i in indices[0] if 0 <= i < len(self._records)]
+        except Exception:
+            return self._records[-self._k:]
 
-    def _encode_state(self, state: Any) -> np.ndarray:
-        health = self._clip01(self._extract_component(state, "health"))
-        hunger = self._clip01(self._extract_component(state, "hunger"))
-        resource_level = self._clip01(self._extract_component(state, "resource_level"))
-        threat_proximity = self._clip01(self._extract_component(state, "threat_proximity"))
-        oxygen = self._clip01(self._extract_component(state, "oxygen"))
-        time_of_day = self._extract_component(state, "time_of_day")
-        if time_of_day is None:
-            time_of_day = 0.0
-        vector = np.asarray(
-            [health, hunger, resource_level, threat_proximity, oxygen, float(time_of_day)],
-            dtype=np.float32,
-        )
-        return self._l2_normalize(vector)
-
-    @staticmethod
-    def _extract_component(state: Any, key: str) -> Optional[float]:
-        raw: Any = None
-        if isinstance(state, Mapping):
-            raw = state.get(key)
-            if raw is None:
-                values = state.get("values")
-                if isinstance(values, Mapping):
-                    raw = values.get(key)
-        else:
-            raw = getattr(state, key, None)
-            if raw is None:
-                values = getattr(state, "values", None)
-                if isinstance(values, Mapping):
-                    raw = values.get(key)
-
-        if isinstance(raw, bool):
-            return None
+    def _rebuild_index(self) -> None:
         try:
-            return float(raw)
-        except (TypeError, ValueError):
-            return None
-
-    @staticmethod
-    def _extract_tick(state: Any) -> int:
-        tick: Any = None
-        if isinstance(state, Mapping):
-            tick = state.get("tick")
-        else:
-            tick = getattr(state, "tick", None)
-        if isinstance(tick, int):
-            return int(tick)
-        return 0
-
-    @staticmethod
-    def _l2_normalize(vector: np.ndarray) -> np.ndarray:
-        norm = float(np.linalg.norm(vector))
-        if norm <= 0.0:
-            return vector.astype(np.float32)
-        return (vector / norm).astype(np.float32)
-
-    @staticmethod
-    def _clip01(value: Optional[float]) -> float:
-        if value is None:
-            return 0.0
-        return float(max(0.0, min(1.0, value)))
+            import faiss
+            if self._vectors is None:
+                return
+            vecs = self._vectors.astype(np.float32)
+            idx = faiss.IndexFlatL2(vecs.shape[1])
+            idx.add(vecs)
+            self._index = idx
+        except Exception:
+            self._index = None

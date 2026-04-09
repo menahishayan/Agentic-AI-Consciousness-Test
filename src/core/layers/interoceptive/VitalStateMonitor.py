@@ -1,63 +1,74 @@
+"""
+VitalStateMonitor — Layer 1, Interoceptive Foundation
+
+Reads AgentState.homeostasis, normalizes values, and publishes vital_state
+messages to GlobalWorkspace. This is the first step in each cognitive cycle.
+
+No game-specific logic. No adapter imports.
+"""
 from __future__ import annotations
 
-from typing import Any, Dict, Iterable, List, Mapping, Optional
+from typing import Any, Dict, List, Optional
+
+from core.coordination.messages import AgentMessage
+from core.coordination.workspace import GlobalWorkspace
+from core.models.state import AgentState
 
 
 class VitalStateMonitor:
-    def __init__(self, expected_vitals: Optional[Iterable[str]] = None) -> None:
-        self._expected_vitals: List[str] = []
-        self._last_state: Dict[str, Any] = {}
-        if expected_vitals is not None:
-            self.set_expected_vitals(expected_vitals)
+    """
+    Monitors the agent's homeostatic variables and publishes normalized
+    vital state snapshots to the GlobalWorkspace each step.
 
-    def set_expected_vitals(self, vitals: Iterable[str]) -> None:
-        ordered_unique: List[str] = []
-        seen = set()
-        for name in vitals:
-            key = str(name).strip()
-            if not key or key in seen:
-                continue
-            ordered_unique.append(key)
-            seen.add(key)
-        self._expected_vitals = ordered_unique
+    Implements Seth's "interoceptive foundation" — the beast machine's
+    awareness of its own body state.
+    """
 
-    def expected_vitals(self) -> List[str]:
-        return list(self._expected_vitals)
+    def __init__(self, available_vitals: List[str]) -> None:
+        """
+        Args:
+            available_vitals: Channel names reported by the adapter
+                              (e.g. ["health", "saturation", "energy"])
+        """
+        self._available_vitals = available_vitals
 
-    def update(self, payload: Any) -> Dict[str, Any]:
-        source = self._coerce_mapping(payload)
-        if not self._expected_vitals:
-            self.set_expected_vitals(source.keys())
-        snapshot = {key: source.get(key) for key in self._expected_vitals}
-        self._last_state = snapshot
-        return dict(snapshot)
+    def update(
+        self,
+        state: AgentState,
+        workspace: GlobalWorkspace,
+        step: int,
+    ) -> Dict[str, Optional[float]]:
+        """
+        Read homeostatic values from state, publish to workspace, return snapshot.
 
-    def last_state(self) -> Dict[str, Any]:
-        return dict(self._last_state)
+        Returns:
+            Dict mapping channel_id → normalized float [0,1] or None
+        """
+        vitals = self._extract_vitals(state)
 
-    def missing_vitals(self) -> List[str]:
-        return [key for key, value in self._last_state.items() if value is None]
+        workspace.publish(AgentMessage(
+            sender="VitalStateMonitor",
+            kind="vital_state",
+            payload=vitals,
+            step=step,
+        ))
 
-    def to_dict(self) -> Dict[str, Any]:
-        return {
-            "expected_vitals": self.expected_vitals(),
-            "state": self.last_state(),
-            "missing": self.missing_vitals(),
+        return vitals
+
+    def read(self, state: AgentState) -> Dict[str, Optional[float]]:
+        """Return vitals dict without publishing to workspace (no side effects)."""
+        return self._extract_vitals(state)
+
+    def _extract_vitals(self, state: AgentState) -> Dict[str, Optional[float]]:
+        h = state.homeostasis
+        raw = {
+            "health":     h.health,
+            "saturation": h.saturation,
+            "energy":     h.energy,
+            "oxygen":     h.oxygen,
+            "is_alive":   float(h.is_alive) if h.is_alive is not None else 1.0,
+            "resource_level":   state.resources.resource_level,
+            "threat_proximity": state.resources.threat_proximity,
         }
-
-    @staticmethod
-    def _coerce_mapping(payload: Any) -> Mapping[str, Any]:
-        if isinstance(payload, Mapping):
-            return payload
-
-        if hasattr(payload, "to_dict") and callable(payload.to_dict):
-            mapped = payload.to_dict()
-            if isinstance(mapped, Mapping):
-                return mapped
-
-        if hasattr(payload, "__dict__"):
-            mapped = vars(payload)
-            if isinstance(mapped, Mapping):
-                return mapped
-
-        raise TypeError("VitalStateMonitor.update expects mapping-like payload data.")
+        # Only return channels that the adapter declared available
+        return {k: v for k, v in raw.items() if k in self._available_vitals or k in ("is_alive", "resource_level", "threat_proximity")}

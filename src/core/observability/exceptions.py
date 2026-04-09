@@ -1,43 +1,25 @@
+"""Structured exception hooks."""
 from __future__ import annotations
 
+import logging
 import sys
-import threading
-from typing import Optional
+import traceback
+from typing import Callable, Optional
 
-import faulthandler
-
-from core.observability.logger import RunLogger
+log = logging.getLogger(__name__)
 
 
-def install_exception_hooks(logger: Optional[RunLogger]) -> None:
-    if logger is None:
-        return
+def install_exception_hooks(on_exception: Optional[Callable] = None) -> None:
+    original = sys.excepthook
 
-    try:
-        fh = logger.paths.tracebacks_log.open("a", encoding="utf-8")
-        faulthandler.enable(file=fh)
-        logger._faulthandler_file = fh
-    except Exception:
-        pass
+    def hook(exc_type, exc_value, exc_tb):
+        tb_str = "".join(traceback.format_exception(exc_type, exc_value, exc_tb))
+        log.critical("Unhandled exception:\n%s", tb_str)
+        if on_exception:
+            try:
+                on_exception(exc_type, exc_value, tb_str)
+            except Exception:
+                pass
+        original(exc_type, exc_value, exc_tb)
 
-    original_sys_hook = sys.excepthook
-
-    def _sys_hook(exc_type, exc, tb):
-        logger.exception(exc, context={"uncaught": True})
-        original_sys_hook(exc_type, exc, tb)
-
-    sys.excepthook = _sys_hook
-
-    if hasattr(threading, "excepthook"):
-        original_thread_hook = threading.excepthook
-
-        def _thread_hook(args):
-            thread_name = args.thread.name if args.thread else None
-            logger.exception(
-                args.exc_value,
-                context={"thread": thread_name, "uncaught": True},
-            )
-            if original_thread_hook:
-                original_thread_hook(args)
-
-        threading.excepthook = _thread_hook
+    sys.excepthook = hook

@@ -1,149 +1,89 @@
 from __future__ import annotations
 
+import time
 from dataclasses import asdict, dataclass, field
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 
 @dataclass
 class HomeostasisState:
-    life: Optional[float] = None
-    armor: Optional[float] = None
-    food: Optional[float] = None
-    saturation: Optional[float] = None
-    xp: Optional[float] = None
-    air: Optional[float] = None
-    is_sleeping: Optional[bool] = None
+    """
+    Internal physiological state — environment-agnostic.
+    All values normalized to [0.0, 1.0].
+    """
+    health: Optional[float] = None       # Overall integrity / vitality
+    saturation: Optional[float] = None   # Fed/hunger proxy (1=full, 0=starving)
+    energy: Optional[float] = None       # Composite resource level
+    oxygen: Optional[float] = None       # Available for environments with suffocation risk
     is_alive: Optional[bool] = None
-    is_dead: Optional[bool] = None
 
 
 @dataclass
 class PositionState:
-    xpos: Optional[float] = None
-    ypos: Optional[float] = None
-    zpos: Optional[float] = None
-    pitch: Optional[float] = None
-    yaw: Optional[float] = None
+    """Spatial location and orientation. Units are environment-relative."""
+    x: Optional[float] = None
+    y: Optional[float] = None
+    z: Optional[float] = None
+    heading: Optional[float] = None     # Radians [0, 2π]
+    velocity_x: Optional[float] = None
+    velocity_z: Optional[float] = None
 
 
 @dataclass
-class BiomeState:
-    biome_name: Optional[str] = None
-    biome_id: Optional[int] = None
-    biome_temperature: Optional[float] = None
-    biome_rainfall: Optional[float] = None
-    sea_level: Optional[float] = None
+class PerceptionState:
+    """
+    Processed sensory features. visual_features is a low-dim embedding
+    extracted by the adapter's observation mapper — the brain never sees raw pixels.
+    """
+    visual_features: Optional[List[float]] = None   # Adapter-extracted embedding
+    detected_objects: Optional[List[str]] = None    # Object class names in FOV
+    area_id: Optional[str] = None                   # Spatial hash for FAISS lookup
+    terrain_novelty: Optional[float] = None         # [0,1] how novel this area is
+    entity_density: Optional[float] = None          # [0,1] nearby entity density
+    # Raycast hits: list of {angle_idx, angle_label, hit_tag, distance} dicts.
+    # angle_label: "left-45°" / "left-22°" / "forward" / "right-22°" / "right-45°"
+    # hit_tag: "GoodGoal" | "BadGoal" | "wall" | None (clear)
+    # distance: [0,1] — 0.0 = right next to agent, 1.0 = max range / no hit
+    raycast_hits: Optional[List[Dict[str, Any]]] = None
 
 
 @dataclass
-class LightingWeatherState:
-    light_level: Optional[float] = None
-    sky_light_level: Optional[float] = None
-    sun_brightness: Optional[float] = None
-    is_raining: Optional[bool] = None
-    can_see_sky: Optional[bool] = None
-
-
-@dataclass
-class WorldTimeState:
-    world_time: Optional[float] = None
-    total_time: Optional[float] = None
-
-
-@dataclass
-class NearbyState:
-    nearby_furnace: Optional[bool] = None
-    nearby_crafting_table: Optional[bool] = None
-
-
-@dataclass
-class InventoryState:
-    inventory: Optional[Any] = None
-    inventories_available: Optional[Any] = None
-    current_item_index: Optional[int] = None
-
-
-@dataclass
-class MiscState:
-    distance_travelled_cm: Optional[float] = None
-    stat: Optional[Any] = None
-    achievement: Optional[Any] = None
-    damage_source: Optional[Any] = None
-    score: Optional[float] = None
-    name: Optional[str] = None
+class ResourceState:
+    """Derived resource estimates computed by the adapter."""
+    resource_level: Optional[float] = None      # [0,1] available resources
+    threat_proximity: Optional[float] = None    # [0,1] 1=immediate threat
 
 
 @dataclass
 class AgentState:
+    """
+    Complete agent state snapshot. Fully environment-agnostic.
+
+    The adapter populates this from raw environment observations.
+    The brain consumes this without any knowledge of the source environment.
+    raw_metadata is an escape hatch for adapter-internal bookkeeping — brain layers
+    must NOT read from it.
+    """
     homeostasis: HomeostasisState = field(default_factory=HomeostasisState)
     position: PositionState = field(default_factory=PositionState)
-    biome: BiomeState = field(default_factory=BiomeState)
-    lighting_weather: LightingWeatherState = field(default_factory=LightingWeatherState)
-    world_time: WorldTimeState = field(default_factory=WorldTimeState)
-    nearby: NearbyState = field(default_factory=NearbyState)
-    inventory_state: InventoryState = field(default_factory=InventoryState)
-    misc: MiscState = field(default_factory=MiscState)
-    voxels: Optional[Any] = None
+    perception: PerceptionState = field(default_factory=PerceptionState)
+    resources: ResourceState = field(default_factory=ResourceState)
+    step: int = 0
+    timestamp: float = field(default_factory=time.time)
+    raw_metadata: Dict[str, Any] = field(default_factory=dict)
 
-    @staticmethod
-    def from_info(info: Dict[str, Any]) -> "AgentState":
-        state = AgentState()
-        if not isinstance(info, dict):
-            return state
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
 
-        state.homeostasis.life = info.get("life")
-        state.homeostasis.armor = info.get("armor")
-        state.homeostasis.food = info.get("food")
-        state.homeostasis.saturation = info.get("saturation")
-        state.homeostasis.xp = info.get("xp")
-        state.homeostasis.air = info.get("air")
-        state.homeostasis.is_sleeping = info.get("is_sleeping")
-        state.homeostasis.is_alive = info.get("is_alive")
-        state.homeostasis.is_dead = info.get("is_dead")
-
-        state.position.xpos = info.get("xpos")
-        state.position.ypos = info.get("ypos")
-        state.position.zpos = info.get("zpos")
-        state.position.pitch = info.get("pitch")
-        state.position.yaw = info.get("yaw")
-
-        state.biome.biome_name = info.get("biome_name")
-        state.biome.biome_id = info.get("biome_id")
-        state.biome.biome_temperature = info.get("biome_temperature")
-        state.biome.biome_rainfall = info.get("biome_rainfall")
-        state.biome.sea_level = info.get("sea_level")
-
-        state.lighting_weather.light_level = info.get("light_level")
-        state.lighting_weather.sky_light_level = info.get("sky_light_level")
-        state.lighting_weather.sun_brightness = info.get("sun_brightness")
-        state.lighting_weather.is_raining = info.get("is_raining")
-        state.lighting_weather.can_see_sky = info.get("can_see_sky")
-
-        state.world_time.world_time = info.get("world_time")
-        state.world_time.total_time = info.get("total_time")
-
-        state.nearby.nearby_furnace = info.get("nearby_furnace")
-        state.nearby.nearby_crafting_table = info.get("nearby_crafting_table")
-
-        state.inventory_state.inventory = info.get("inventory")
-        state.inventory_state.inventories_available = info.get("inventories_available")
-        state.inventory_state.current_item_index = info.get("current_item_index")
-
-        state.misc.distance_travelled_cm = info.get("distance_travelled_cm")
-        state.misc.stat = info.get("stat")
-        state.misc.achievement = info.get("achievement")
-        state.misc.damage_source = info.get("damage_source")
-        state.misc.score = info.get("score")
-        state.misc.name = info.get("name")
-
-        state.voxels = info.get("voxels")
-        return state
-
-    def to_dict(self, include_inventory: bool = False, include_voxels: bool = False) -> Dict[str, Any]:
-        data = asdict(self)
-        if not include_inventory:
-            data["inventory_state"]["inventory"] = None
-            data["inventory_state"]["inventories_available"] = None
-        if not include_voxels:
-            data["voxels"] = None
-        return data
+    def homeostatic_vector(self) -> List[float]:
+        """Compact float vector over homeostatic channels for FAISS indexing."""
+        h = self.homeostasis
+        r = self.resources
+        return [
+            h.health or 0.0,
+            h.saturation or 0.0,
+            h.energy or 0.0,
+            h.oxygen or 1.0,
+            r.threat_proximity or 0.0,
+            r.resource_level or 0.5,
+        ]

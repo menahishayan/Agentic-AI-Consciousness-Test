@@ -1,138 +1,193 @@
+"""
+RunLogger — structured JSONL telemetry per run.
+
+Writes to src/logs/runs/<timestamp>_<run_id>/:
+  run.json       — run metadata (config, start time, Python version)
+  events.jsonl   — per-step events
+  state.jsonl    — AgentState snapshots (gated by LOG_STATE)
+  llm.jsonl      — LLM calls (gated by LOG_PROMPTS)
+  memory.jsonl   — FAISS operations (gated by LOG_MEMORY)
+  metrics.jsonl  — numeric per-step metrics (always on, fixed schema)
+  tracebacks.jsonl — structured exceptions
+"""
 from __future__ import annotations
 
+import dataclasses
 import json
+import logging
 import os
 import platform
 import sys
+import time
 import traceback
-from datetime import datetime
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Dict, Optional
 
-from core.observability.config import LoggingConfig
-from core.observability.paths import RunPaths, create_run_dir
-from core.observability.serializer import safe_serialize
+from core.observability.serializer import SafeEncoder, safe_dumps
 
-
-def _utc_ts() -> str:
-    return datetime.utcnow().isoformat() + "Z"
+log = logging.getLogger(__name__)
 
 
 class RunLogger:
-    def __init__(self, config: LoggingConfig, paths: Optional[RunPaths] = None) -> None:
-        self.config = config
-        self.paths = paths or create_run_dir(config)
-        self._files = {
-            "events": self.paths.events_jsonl.open("a", encoding="utf-8"),
-            "llm": self.paths.llm_jsonl.open("a", encoding="utf-8"),
-            "memory": self.paths.memory_jsonl.open("a", encoding="utf-8"),
-            "state": self.paths.state_jsonl.open("a", encoding="utf-8"),
-            "tracebacks": self.paths.tracebacks_log.open("a", encoding="utf-8"),
-            "tracebacks_jsonl": self.paths.tracebacks_jsonl.open("a", encoding="utf-8"),
-        }
-        self._faulthandler_file = None
-        self._write_run_metadata()
+    """
+    Structured telemetry for a single agent run.
+    All writes are append-only JSONL for easy streaming analysis.
+    """
 
-    def _write_run_metadata(self) -> None:
-        metadata = {
-            "run_id": self.config.run_id,
-            "run_name": self.config.run_name,
-            "start_time": _utc_ts(),
-            "pid": os.getpid(),
-            "python": sys.version.split()[0],
-            "platform": platform.platform(),
-            "config": {
-                "log_root": str(self.config.log_root),
-                "log_prompts": self.config.log_prompts,
-                "log_memory": self.config.log_memory,
-                "log_state": self.config.log_state,
-                "max_field_bytes": self.config.max_field_bytes,
-                "include_raw_llm": self.config.include_raw_llm,
-                "redact_keys": list(self.config.redact_keys),
-            },
-        }
-        self.paths.run_json.write_text(
-            json.dumps(metadata, ensure_ascii=True, indent=2), encoding="utf-8"
-        )
+    def __init__(
+        self,
+        run_dir: Path,
+        config: Dict[str, Any],
+        log_state: bool = True,
+        log_prompts: bool = False,
+        log_memory: bool = True,
+    ) -> None:
+        self._dir = run_dir
+        self._log_state = log_state
+        self._log_prompts = log_prompts
+        self._log_memory = log_memory
+        self._start_time = time.time()
 
-    def _emit(self, stream_key: str, event: str, payload: Any, step: Optional[int]) -> None:
-        record = {
-            "ts": _utc_ts(),
-            "run_id": self.config.run_id,
+        self._events_f = open(run_dir / "events.jsonl", "a")
+        self._metrics_f = open(run_dir / "metrics.jsonl", "a")
+        self._tracebacks_f = open(run_dir / "tracebacks.jsonl", "a")
+        self._state_f = open(run_dir / "state.jsonl", "a") if log_state else None
+        self._llm_f = open(run_dir / "llm.jsonl", "a") if log_prompts else None
+        self._memory_f = open(run_dir / "memory.jsonl", "a") if log_memory else None
+
+        self._write_run_metadata(config)
+
+    @property
+    def run_dir(self) -> Path:
+        return self._dir
+
+    # ------------------------------------------------------------------
+    # Public logging methods
+    # ------------------------------------------------------------------
+
+    def event(self, name: str, payload: Any, step: int = 0) -> None:
+        self._append(self._events_f, {
+            "t": time.time(),
             "step": step,
-            "event": event,
-            "payload": safe_serialize(
-                payload,
-                max_bytes=self.config.max_field_bytes,
-                redact_keys=self.config.redact_keys,
-            ),
+            "event": name,
+            "payload": payload,
+        })
+
+    def metrics(
+        self,
+        step: int,
+        health: float,
+        saturation: float,
+        energy: float,
+        arousal: float,
+        valence: float,
+        pe_mean: float,
+        policy_id: str,
+        extra: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        row: Dict[str, Any] = {
+            "step": step,
+            "health": round(health, 4),
+            "saturation": round(saturation, 4),
+            "energy": round(energy, 4),
+            "arousal": round(arousal, 4),
+            "valence": round(valence, 4),
+            "pe_mean": round(pe_mean, 4),
+            "policy_id": policy_id,
         }
-        fh = self._files[stream_key]
-        fh.write(json.dumps(record, ensure_ascii=True) + "\n")
-        fh.flush()
+        if extra:
+            row.update(extra)
+        self._append(self._metrics_f, row)
 
-    def event(self, name: str, payload: Any, step: Optional[int] = None) -> None:
-        self._emit("events", name, payload, step)
+    def state(self, state_obj: Any, step: int = 0) -> None:
+        if self._state_f:
+            self._append(self._state_f, {"step": step, "state": state_obj})
 
-    def llm_request(self, payload: Any, step: Optional[int] = None) -> None:
-        if not self.config.log_prompts:
-            return
-        self._emit("llm", "llm.request", payload, step)
+    def llm(
+        self,
+        prompt: str,
+        response: str,
+        model: str,
+        latency_ms: float,
+        input_tokens: int = 0,
+        output_tokens: int = 0,
+        trigger_reason: str = "",
+        selected: Optional[str] = None,
+        step: int = 0,
+    ) -> None:
+        if self._llm_f:
+            self._append(self._llm_f, {
+                "t": time.time(),
+                "step": step,
+                "model": model,
+                "trigger_reason": trigger_reason,
+                "selected": selected,
+                "latency_ms": round(latency_ms, 1),
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+                "prompt": prompt,
+                "response": response,
+            })
 
-    def llm_response(self, payload: Any, step: Optional[int] = None) -> None:
-        if (
-            not self.config.include_raw_llm
-            and isinstance(payload, dict)
-            and "raw" in payload
-        ):
-            payload = {**payload}
-            payload.pop("raw", None)
-        self._emit("llm", "llm.response", payload, step)
+    def memory_op(self, op: str, details: Any, step: int = 0) -> None:
+        if self._memory_f:
+            self._append(self._memory_f, {
+                "t": time.time(),
+                "step": step,
+                "op": op,
+                "details": details,
+            })
 
-    def memory_event(self, payload: Any, step: Optional[int] = None) -> None:
-        if not self.config.log_memory:
-            return
-        self._emit("memory", "memory.event", payload, step)
-
-    def state_snapshot(self, agent_state: Any, step: Optional[int] = None) -> None:
-        if not self.config.log_state:
-            return
-        data = agent_state
-        if hasattr(agent_state, "to_dict"):
-            try:
-                data = agent_state.to_dict()
-            except Exception:
-                data = agent_state
-        self._emit("state", "state.snapshot", {"state": data}, step)
-
-    def exception(self, exc: BaseException, context: Any = None, step: Optional[int] = None) -> None:
-        tb = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
-        payload = {
-            "type": type(exc).__name__,
+    def traceback(self, exc: BaseException, context: str = "", step: int = 0) -> None:
+        tb = traceback.format_exc()
+        self._append(self._tracebacks_f, {
+            "t": time.time(),
+            "step": step,
+            "context": context,
+            "exception_type": type(exc).__name__,
             "message": str(exc),
             "traceback": tb,
-            "context": context,
-        }
-        self._emit("tracebacks_jsonl", "exception", payload, step)
-        self._files["tracebacks"].write(tb + "\n")
-        self._files["tracebacks"].flush()
+        })
+        log.error("[step %d] %s: %s", step, context, exc)
 
     def close(self) -> None:
-        for fh in self._files.values():
-            try:
-                fh.close()
-            except Exception:
-                pass
-        if self._faulthandler_file is not None:
-            try:
-                self._faulthandler_file.close()
-            except Exception:
-                pass
+        for f in [
+            self._events_f,
+            self._metrics_f,
+            self._tracebacks_f,
+            self._state_f,
+            self._llm_f,
+            self._memory_f,
+        ]:
+            if f:
+                try:
+                    f.close()
+                except Exception:
+                    pass
 
-    def __enter__(self) -> "RunLogger":
-        return self
+    # ------------------------------------------------------------------
+    # Internal
+    # ------------------------------------------------------------------
 
-    def __exit__(self, exc_type, exc, tb) -> None:
-        if exc is not None:
-            self.exception(exc)
-        self.close()
+    def _write_run_metadata(self, config: Dict[str, Any]) -> None:
+        meta = {
+            "start_time": self._start_time,
+            "start_time_str": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(self._start_time)),
+            "python_version": sys.version,
+            "platform": platform.platform(),
+            "log_dir": str(self._dir),
+            "adapter": config.get("adapter_folder", "unknown"),
+            "llm_provider": config.get("llm", {}).get("provider", "unknown"),
+            "llm_model": config.get("llm", {}).get("model", "unknown"),
+            "config": config,
+        }
+        (self._dir / "run.json").write_text(safe_dumps(meta))
+
+    def _append(self, f: Any, obj: Any) -> None:
+        if f is None:
+            return
+        try:
+            f.write(safe_dumps(obj) + "\n")
+            f.flush()
+        except Exception as exc:
+            log.warning("RunLogger write error: %s", exc)

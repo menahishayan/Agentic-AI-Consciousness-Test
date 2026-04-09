@@ -1,41 +1,54 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Any, List, Optional
-
-
-@dataclass
-class SelfStateSnapshot:
-    timestamp: Optional[str] = None
-    state: Optional[Any] = None
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional
 
 
 @dataclass
 class PredictionErrorRecord:
-    timestamp: Optional[str] = None
-    error: Optional[Any] = None
+    """Stored in PredictionErrorHistory FAISS index."""
+    area_id: str
+    step: int
+    feature_vector: List[float]     # Area embedding for FAISS
+    pe_per_channel: Dict[str, float]
+    mean_pe: float
+    action_id: Optional[str] = None
+
+
+@dataclass
+class SelfStateRecord:
+    """Stored in SelfStateTracking FAISS index."""
+    step: int
+    homeostatic_vector: List[float]  # [health, saturation, energy, oxygen, threat, resource]
+    area_id: str
+    action_taken: Optional[str] = None
+    outcome_health_delta: Optional[float] = None
+    outcome_saturation_delta: Optional[float] = None
 
 
 @dataclass
 class PolicyTraceRecord:
-    timestamp: Optional[str] = None
-    action: Optional[Any] = None
-    outcome: Optional[Any] = None
+    """Stored in PolicyTraces FAISS index."""
+    step: int
+    policy_id: str
+    context_vector: List[float]     # Flattened context for FAISS
+    outcome_score: float            # [0,1] how well the policy performed
+    drive_signals: Dict[str, float] # channel_id → urgency at time of selection
+    goal_coherence: Optional[float] = None
+    notes: Optional[str] = None
 
 
 @dataclass
-class PolicyMemoryRecord:
-    policy_id: Optional[str] = None
-    adapter_folder: Optional[str] = None
-    callable_name: Optional[str] = None
-    source: Optional[str] = None
-    signature: Optional[str] = None
-    tags: Optional[List[str]] = None
-    discovered_at: Optional[str] = None
-    last_seen_at: Optional[str] = None
-    selected_count: Optional[int] = None
-    success_count: Optional[int] = None
-    last_selected_at: Optional[str] = None
-    last_score: Optional[float] = None
-    score_history: Optional[List[Any]] = None
-    outcome_history: Optional[List[Any]] = None
+class LongTermPolicyRecord:
+    """Persisted in JSON — survives restarts."""
+    policy_id: str
+    score_history: List[float] = field(default_factory=list)
+    outcome_history: List[str] = field(default_factory=list)   # "success"|"failure"|"partial"
+    total_selections: int = 0
+    total_successes: int = 0
+
+    @property
+    def success_rate(self) -> float:
+        if not self.score_history:
+            return 0.5
+        return sum(self.score_history[-50:]) / len(self.score_history[-50:])

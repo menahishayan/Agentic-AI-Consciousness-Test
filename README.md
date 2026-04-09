@@ -1,397 +1,442 @@
-# Capstone — Biomimetic Agent (MineDojo)
+# Brain-Inspired Multi-Agent System — Animal AI Testbed
 
-A biomimetic AI agent grounded in predictive processing and homeostatic drive-regulation, evaluated inside the MineDojo/Minecraft environment. The architecture implements five functional layers (interoceptive, perceptual, metacognitive, action-selection, memory) communicating through a shared `GlobalWorkspace`. All configuration is centralized in `config.json`; all runtime state is logged per-run to `src/logs/runs/`.
+A game-agnostic brain architecture grounded in Anil Seth's *Beast Machine* / predictive processing theory, designed to survive in the Animal AI testbed and adaptable to any environment via a swap of one config value.
 
 ---
 
-## Prerequisites
+## Table of Contents
 
-| Dependency | Version |
-|---|---|
-| Python | 3.9.x (required — MineDojo's Malmo build is incompatible with 3.10+) |
-| JDK | 8 (Temurin recommended) |
-| pip / setuptools / wheel | Pinned — see below |
-| NumPy | `<2` (MineDojo references `np.unicode_`, removed in NumPy 2) |
-| OpenCV | `4.8.1.78` (pinned for NumPy `<2` compatibility on Python 3.9) |
-| gym | `0.21.0` (requires legacy pip toolchain to build correctly) |
+- [Theoretical Background](#theoretical-background)
+- [Architecture Overview](#architecture-overview)
+- [Project Structure](#project-structure)
+- [Setup](#setup)
+- [Building Animal AI](#building-animal-ai)
+- [Connecting to Animal AI](#connecting-to-animal-ai)
+- [Configuration](#configuration)
+- [Running](#running)
+- [Observability](#observability)
+- [Swapping Environments](#swapping-environments)
+- [LLM Provider](#llm-provider)
+- [Testing](#testing)
+
+---
+
+## Theoretical Background
+
+The brain is modelled after predictive processing and allostatic regulation:
+
+- **Interoceptive layer** — monitors internal physiological drives (health, saturation, energy, safety) and computes urgency via the *allostatic controller*
+- **Predictive layer** — maintains an action-conditional world model (EMA transition table) and computes precision-weighted *prediction errors* per drive channel
+- **Action selection layer** — a *free-energy minimiser* scores policies; an LLM is called selectively (5 trigger conditions) rather than on every step
+- **Metacognitive monitor** — integrates signals from all layers, detects uncertainty spikes, broadcasts urgency
+- **FAISS memory** — prediction error history, self-state tracking, and policy traces are stored in vector DBs; long-term policy outcomes persist as JSON across restarts
+
+All layers communicate exclusively through a `GlobalWorkspace` message bus. No layer imports any concrete adapter.
+
+---
+
+## Architecture Overview
+
+```
+Environment (Animal AI / Headless / IoT)
+        │
+        ▼
+AbstractEnvironmentAdapter  ←── only interface the brain touches
+        │
+        ├─ HomeostaticWrapper        (reward → health/saturation/energy deltas)
+        ├─ ObservationMapper         (84×84 RGB → 11-dim visual feature vector)
+        └─ ActionMapper              (policy_id → [movement, rotation] action tuple)
+        │
+        ▼
+AgentLoop (runtime/loop.py)
+        │
+        ├─ Layer 1 · Interoceptive
+        │   ├─ VitalStateMonitor
+        │   ├─ AllostaticController   (urgency per drive channel)
+        │   └─ ArousalValenceSystem
+        │
+        ├─ Layer 2 · Predictive
+        │   ├─ WorldModelGenerator    (action-conditional EMA)
+        │   └─ PredictionErrorCalculator
+        │
+        ├─ Layer 3 · Action Selection
+        │   ├─ PolicyGenerator        (selective LLM + urgency fallback)
+        │   ├─ FreeEnergyMinimizer
+        │   └─ MotorControlInterface
+        │
+        ├─ Layer 4 · Metacognitive
+        │   ├─ MetacognitiveMonitor
+        │   └─ GoalCoherenceChecker
+        │
+        └─ Memory (FAISS + LTM JSON)
+            ├─ PredictionErrorHistory
+            ├─ SelfStateTracking
+            ├─ PolicyTraces
+            └─ LongTermMemory
+```
+
+Inter-layer messages flow through `GlobalWorkspace` only. Kinds: `vital_state`, `drive_signal`, `prediction_error`, `arousal_valence`, `goal`, `policy_proposal`, `metacognitive`, `world_model`.
+
+---
+
+## Project Structure
+
+```
+capstone/
+├── .env                          # API keys (not committed)
+├── .env.sample                   # Template
+├── .python-version               # Pins Python 3.10.12 (required by animalai 5.0.1)
+├── config.json                   # All tunable parameters
+├── requirements.txt
+├── run.sh                        # Entry point
+├── animalai_configs/
+│   └── basic_food.yaml           # Arena: food items + hazard walls
+├── animal-ai-unity/              # Unity binary (built separately — see below)
+│   └── AnimalAI.app
+├── data/
+│   └── long_term_memory/         # Persisted policy outcomes (JSON)
+├── src/
+│   └── core/
+│       ├── main.py               # Entry point — loads config, wires everything
+│       ├── adapters/
+│       │   ├── base.py           # AbstractEnvironmentAdapter (ABC)
+│       │   ├── loader.py         # Dynamic adapter loader (reads adapter_folder from config)
+│       │   ├── animalai/         # Real Unity-backed adapter
+│       │   │   ├── env_adapter.py
+│       │   │   ├── homeostatic_wrapper.py
+│       │   │   ├── observation_mapper.py
+│       │   │   └── action_mapper.py
+│       │   ├── headless/         # Pure Python simulation (no Unity needed)
+│       │   │   └── env_adapter.py
+│       │   └── iot/              # Stub — demonstrates extensibility
+│       │       └── env_adapter.py
+│       ├── coordination/
+│       │   ├── messages.py       # AgentMessage dataclass
+│       │   └── workspace.py      # GlobalWorkspace (publish / broadcast / clear)
+│       ├── models/
+│       │   ├── state.py          # AgentState, HomeostasisState, PerceptionState, …
+│       │   ├── signals.py        # DriveChannel, DriveSignal, PredictionError, ArousalValence, …
+│       │   └── memory_records.py # FAISS record types
+│       ├── layers/
+│       │   ├── interoceptive/
+│       │   ├── predictive/
+│       │   ├── action_selection/
+│       │   └── metacognitive/
+│       ├── memory/
+│       │   ├── manager.py        # MemoryManager facade
+│       │   ├── prediction_error_history.py
+│       │   ├── self_state_tracking.py
+│       │   ├── policy_traces.py
+│       │   └── long_term_memory.py
+│       ├── llm/
+│       │   ├── factory.py        # build_llm_client() — dispatches on config["provider"]
+│       │   └── providers/
+│       │       ├── anthropic.py  # Full (default)
+│       │       ├── openai.py     # Full
+│       │       └── gemini.py     # Stub (NotImplementedError)
+│       ├── observability/
+│       │   └── logger.py         # RunLogger — JSONL telemetry per run
+│       └── runtime/
+│           └── loop.py           # AgentLoop — per-step cognitive cycle
+└── tests/
+    └── core/                     # 38 unit tests, no Unity required
+```
 
 ---
 
 ## Setup
 
-### 1. Install Rosetta and JDK 8
+### Requirements
 
-```bash
-softwareupdate --install-rosetta --agree-to-license
-brew install --cask temurin@8
-```
+- **macOS** (tested on Apple Silicon and Intel)
+- **pyenv** — manages the exact Python micro-version
+- **Anthropic API key** (or OpenAI key if you prefer that provider)
 
-Set `JAVA_HOME` before running anything:
-
-```bash
-export JAVA_HOME=/Library/Java/JavaVirtualMachines/temurin-8.jdk/Contents/Home
-```
-
-### 2. Create a Python 3.9 virtual environment
+### 1. Install pyenv (if not already installed)
 
 ```bash
 brew install pyenv
-pyenv install 3.9.25
-~/.pyenv/versions/3.9.25/bin/python -m venv ./.venv
+# Add to your shell profile:
+echo 'export PYENV_ROOT="$HOME/.pyenv"' >> ~/.zshrc
+echo 'export PATH="$PYENV_ROOT/bin:$PATH"' >> ~/.zshrc
+echo 'eval "$(pyenv init -)"' >> ~/.zshrc
+source ~/.zshrc
 ```
 
-### 3. Install dependencies
+### 2. Install Python 3.10.12
 
-Downgrade pip toolchain first — gym 0.21.0 fails to build with newer versions:
+`animalai 5.0.1` requires Python `>=3.10.0,<3.10.13`. The project pins **3.10.12**.
 
 ```bash
-./.venv/bin/python -m pip install "pip<23" "setuptools<65" "wheel<0.40" "packaging<23"
-./.venv/bin/python -m pip install -r ./requirements.txt
-./.venv/bin/python -m pip install -e ./MineDojo
+pyenv install 3.10.12
 ```
 
-### 4. Apply the Gradle patch
+The `.python-version` file at the project root automatically activates this version when you `cd` into the directory.
 
-The stock MineDojo build references a JitPack SHA that no longer resolves. The patch switches to the SpongePowered repo and pins `org.spongepowered:mixingradle:0.6-SNAPSHOT`:
+### 3. Clone and set up the project
 
 ```bash
-git -C ./MineDojo apply ./gradle-fix.patch
+git clone <repo-url>
+cd capstone
 ```
 
-### 5. Validate
+### 4. Create the virtual environment
 
 ```bash
-./.venv/bin/python ./MineDojo/scripts/validate_install.py
+python3 -m venv venv
+source venv/bin/activate
+pip install --upgrade pip setuptools wheel
+pip install grpcio==1.47.5 --only-binary=grpcio  # must pre-install; animalai pins <=1.48.2
+pip install -r requirements.txt
+```
+
+> **Why the manual grpcio step?** `animalai` depends on `mlagents-envs` which requires
+> `grpcio<=1.48.2`, and grpcio 1.48.2 has no pre-built wheel for Python 3.10 on macOS.
+> 1.47.5 is the highest version with a binary wheel inside that range.
+
+### 5. Create `.env`
+
+```bash
+cp .env.sample .env
+# Edit .env and add your API key:
+ANTHROPIC_API_KEY=sk-ant-...
 ```
 
 ---
 
-## Environment variables
+## Building Animal AI
 
-Create a `.env` file at the project root. `core/main.py` loads it automatically via `load_env_file`.
+Pre-built Animal AI binaries are no longer distributed (removed due to a Unity security advisory). You must build the Unity project yourself.
 
-```dotenv
-# LLM provider keys (only needed when llm.enabled is true in config.json)
-OPENAI_API_KEY=...
-ANTHROPIC_API_KEY=...
-GEMINI_API_KEY=...
+### Requirements
 
-# Runtime options
-MAX_STEPS=50               # Steps per run (default: 50)
-INCLUDE_INVENTORY=1        # Log inventory in AgentState (default: 1)
-INCLUDE_VOXELS=1           # Log voxel data in AgentState (default: 1)
+- **Unity Hub** — download from [unity.com/download](https://unity.com/download)
+- **Unity 6000.0.23f1** — the exact editor version used by Animal AI v5
 
-# Observability
-LOG_ROOT=src/logs/runs     # Root directory for per-run logs
-LOG_PROMPTS=0              # Log full LLM prompts (default: 0)
-LOG_MEMORY=1               # Log memory operations (default: 1)
-LOG_STATE=1                # Log AgentState each step (default: 1)
+### Steps
+
+**1. Install Unity Hub and add the editor**
+
+Open Unity Hub → *Installs* → *Install Editor* → search for `6000.0.23f1` and install it.
+Include the **Mac Build Support (Mono)** module if it is not pre-selected.
+
+**2. Clone the Animal AI Unity project**
+
+```bash
+git clone https://github.com/Kinds-of-Intelligence-CFI/animal-ai-unity
 ```
+
+**3. Open in Unity Hub**
+
+*Projects* → *Add* → select the `animal-ai-unity` folder → open with Unity 6000.0.23f1.
+Allow Unity to import assets (takes a few minutes on first open).
+
+**4. Build for macOS**
+
+`File → Build Settings` → select **macOS** → click **Build**.
+Save the output as `AnimalAI.app` inside a folder at the project root, e.g.:
+
+```
+capstone/animal-ai-unity/AnimalAI.app
+```
+
+**5. Fix macOS permissions**
+
+macOS quarantines newly built apps. Run once after every build:
+
+```bash
+xattr -r -d com.apple.quarantine ./animal-ai-unity/AnimalAI.app
+chmod -R 755 ./animal-ai-unity/AnimalAI.app
+```
+
+**6. Verify the app opens**
+
+```bash
+open ./animal-ai-unity/AnimalAI.app
+```
+
+You should see a Unity splash screen / grey environment window. Close it before running the agent (the Python API launches its own instance).
 
 ---
 
-## Running the agent
+## Connecting to Animal AI
 
-### Option A — Persistent server (recommended)
+### Option A — Python launches Unity automatically (recommended)
 
-The persistent server keeps the Minecraft process alive across multiple agent runs, avoiding the ~60-second JVM startup on every reset. Start it once and leave it running:
+Set `file_name` in `config.json` to the path of the built app:
 
-```bash
-JAVA_HOME=/Library/Java/JavaVirtualMachines/temurin-8.jdk/Contents/Home \
-PYTHONPATH=src \
-./.venv/bin/python -m core.adapters.minedojo.persistent_server
-```
-
-The server listens on `127.0.0.1:9876` by default. Then run the agent:
-
-```bash
-JAVA_HOME=... PYTHONPATH=src ./.venv/bin/python -m core.main
-```
-
-Set `"use_remote": true` in `config.json` (under `adapter_config`) so the agent connects to the server rather than spawning its own process.
-
-### Option B — Standalone (spawns its own Minecraft process)
-
-Set `"use_remote": false` (or omit it) in `config.json`. The agent owns the full environment lifecycle.
-
-```bash
-JAVA_HOME=... PYTHONPATH=src ./.venv/bin/python -m core.main
-```
-
----
-
-## Configuration (`config.json`)
-
-`config.json` lives at the project root. All keys have defaults baked into `core/main.py`; the file deep-merges on top of those defaults, so only overrides need to be specified.
-
-### Full annotated schema
-
-```jsonc
-{
-  // Which adapter subfolder to load from src/core/adapters/
-  "adapter_folder": "minedojo",
-
-  // LLM integration (currently optional — set enabled: false to skip)
-  "llm": {
-    "enabled": false,
-    "provider": "openai",           // "openai" | "anthropic" | "gemini"
-    "model": "gpt-4.1-mini",
-    "temperature": 0.1,
-    "max_tokens": 500,
-    "timeout_s": 1.0
-  },
-
-  // Passed directly to the adapter on construction
-  "adapter_config": {
-    "task_id": "harvest_milk",
-    "image_size": [160, 256],
-    "initial_health": 6,            // Starting health (out of 20)
-    "initial_food": 4,              // Starting food (out of 20)
-    "use_remote": true,             // Connect to persistent_server instead of spawning
-    "remote_host": "127.0.0.1",    // Optional; default shown
-    "remote_port": 9876             // Optional; default shown
-  },
-
-  "policy_generator": {
-
-    // Scoring weights for policy selection
-    // goal_coherence + prediction_error must sum to <= 1.0
-    "weights": {
-      "goal_coherence": 0.6,
-      "prediction_error": 0.4,
-      "allostatic_survival_fit": 0.2,
-      "allostatic_urgency_alignment": 0.2
-    },
-
-    // Fallback scores used when a scorer cannot produce a value
-    "fallback_scores": {
-      "goal_coherence": 0.5,
-      "prediction_error": 0.5,
-      "allostatic_survival_fit": 0.5,
-      "allostatic_urgency_alignment": 0.5
-    },
-
-    // Long-term memory (persistent policy performance history)
-    "long_term_memory": {
-      "path": "data/long_term_memory",
-      "max_score_history": 200,
-      "max_outcome_history": 200
-    },
-
-    // Policy-level prediction error
-    "max_expected_error": 1.0,
-    "prediction_error_window": 20,
-
-    // Selective LLM arbitration gate
-    "llm_conflict_threshold": 0.8,
-    "skill_gap_urgency_threshold": 0.8,
-    "pe_high_threshold": 0.7,
-    "pe_streak_threshold": 5,
-    "llm_reeval_interval": 10,
-
-    // Allostatic / homeostatic controller
-    "allostatic_controller": {
-      "planning_horizon": 50,
-      "history_window": 20,
-      "irreversibility_bonus": 0.3,   // Extra weight for irreversible drive violations
-      "recovery_weight_factor": 0.2,
-      "urgency_tie_epsilon": 0.05,
-      "threat_prior_weight": 0.3,
-      "min_confidence": 0.5,
-
-      // Drive channels — each maps to a homeostatic variable
-      "channels": [
-        {
-          "id": "health",
-          "setpoint": 0.9,
-          "critical_threshold": 0.25,
-          "irreversible": true,
-          "recovery_cost_ticks": 25,
-          "suggested_action_tag": "heal"
-        },
-        { "id": "hunger",   "setpoint": 0.8, "critical_threshold": 0.2,  "irreversible": false, "recovery_cost_ticks": 20, "suggested_action_tag": "eat"     },
-        { "id": "oxygen",   "setpoint": 0.9, "critical_threshold": 0.2,  "irreversible": true,  "recovery_cost_ticks": 30, "suggested_action_tag": "surface"  },
-        { "id": "resource_level", "setpoint": 0.7, "critical_threshold": 0.3, "irreversible": false, "recovery_cost_ticks": 15, "suggested_action_tag": "gather" },
-        { "id": "safety",   "setpoint": 0.8, "critical_threshold": 0.35, "irreversible": true,  "recovery_cost_ticks": 20, "suggested_action_tag": "retreat"  }
-      ]
-    },
-
-    // Perceptual prediction error (action-conditional world model + variance normalization)
-    "perceptual_prediction_error": {
-      "alpha": 0.1,
-      "epsilon": 0.01,
-      "sigma_clip": 3.0,
-      "default_precision": 0.5,
-      "min_precision": 0.3,
-      "world_model_alpha": 0.1,
-      "action_confidence_threshold": 20
-    },
-
-    // Working-memory and FAISS retrieval settings
-    "memory": {
-      "working_memory_capacity": 100,
-      "pe_min_observations": 5,
-      "pe_ema_alpha": 0.1,
-      "faiss_k_default": 5,
-      "faiss_epsilon": 1e-6,
-      "episode_length": 1000
-    },
-
-    // Arousal/valence system weights
-    "arousal_valence": {
-      "w_health": 0.35,
-      "w_hunger": 0.25,
-      "w_threat": 0.30,
-      "w_pred_err": 0.10,
-      "v_health": 0.30,
-      "v_hunger": 0.30,
-      "v_resources": 0.20,
-      "v_oxygen": 0.20,
-      "decay_rate": 0.95,
-      "resting_arousal": 0.10,
-      "urgency_broadcast_threshold": 0.65
-    }
-  }
+```json
+"adapter_folder": "animalai",
+"adapter_config": {
+  "file_name": "./animal-ai-unity/AnimalAI.app",
+  "arena_config": "animalai_configs/basic_food.yaml",
+  "worker_id": 1,
+  "base_port": 5005
 }
 ```
 
----
+Then just run:
 
-## Adapter contract
-
-Adapters live in `src/core/adapters/<adapter_folder>/`. The loader at `src/core/adapters/loader.py` resolves the folder name from config and constructs the adapter.
-
-**Required methods:**
-
-| Method | Signature | Notes |
-|---|---|---|
-| `reset` | `() -> (obs, info)` | |
-| `step` | `(action) -> (obs, reward, done, info)` | |
-| `close` | `() -> None` | |
-| `get_available_vitals` | `() -> list[str]` | Returns homeostatic variable names |
-| `get_available_policies` | `() -> list[dict]` | Each entry must have `tags` and `drive_tags` |
-| `estimate_resource_level` | `(...) -> float` | |
-| `estimate_threat_proximity` | `(...) -> float` | |
-| `build_area_id` | `(...) -> str` | |
-
-**Optional methods:**
-
-| Method | Notes |
-|---|---|
-| `sample_action()` | Random action for exploration |
-| `estimate_entity_density(...)` | |
-| `estimate_terrain_novelty(...)` | |
-
-Policy descriptor requirements: each dict returned by `get_available_policies()` must include non-empty `tags` and `drive_tags`. Drive tags may be inferred from `tags`, `description`, or the callable name if omitted, but explicit tags are preferred.
-
----
-
-## Memory subsystems
-
-`MemoryManager` (`src/core/memory/manager.py`) owns four sub-systems:
-
-| Sub-system | Class | Purpose |
-|---|---|---|
-| Working Memory Buffer | `WorkingMemoryBuffer` | Ring buffer of the most recent N observations/states |
-| Prediction Error History | `PredictionErrorHistory` | EMA-tracked per-feature prediction errors with FAISS retrieval |
-| Self-State Tracking | `SelfStateTracking` | Longitudinal homeostatic variable history with FAISS retrieval |
-| Policy Traces | `PolicyTraces` | Per-episode policy selection and outcome records with FAISS retrieval |
-
-Long-term memory is a separate persistent layer (`LongTermMemory`) backed by JSON files in `src/data/long_term_memory/policies/`. It survives restarts and accumulates performance history across runs.
-
----
-
-## AgentState
-
-`AgentState` (`src/core/models/state.py`) is built from the MineDojo `info` dict each step and passed between modules.
-
-```python
-from core.models.state import AgentState
-
-state = AgentState.from_info(info)
-state_dict = state.to_dict(include_inventory=False, include_voxels=False)
+```bash
+./run.sh
 ```
 
-**Homeostasis fields:** `life`, `armor`, `food`, `saturation`, `xp`, `air`, `is_sleeping`, `is_alive`, `is_dead`
+The Python API will launch the Unity binary, wait for it to start, load the arena config, and begin stepping. The Unity window will appear in the background.
 
-**Position/orientation:** `xpos`, `ypos`, `zpos`, `pitch`, `yaw`
+### Option B — Connect to a manually launched instance
 
-**Biome/world:** `biome_name`, `biome_id`, `biome_temperature`, `biome_rainfall`, `sea_level`
+If you want to control Unity separately (e.g., for visual debugging):
 
-**Lighting/weather:** `light_level`, `sky_light_level`, `sun_brightness`, `is_raining`, `can_see_sky`
+1. Launch the app manually: `open ./animal-ai-unity/AnimalAI.app`
+2. Remove (or `null`) the `file_name` key in `config.json`
+3. Run `./run.sh`
 
-**Time:** `world_time`, `total_time`
+The Python API connects on port `base_port + worker_id` (default: **5006**).
 
-**Local structures:** `nearby_furnace`, `nearby_crafting_table`
+### Troubleshooting connection failures
 
-**Heavy fields (opt-in via env vars):** `voxels` (`INCLUDE_VOXELS=1`), `inventory`, `inventories_available`, `current_item_index` (`INCLUDE_INVENTORY=1`)
-
-**Misc:** `distance_travelled_cm`, `stat`, `achievement`, `damage_source`, `score`, `name`
+| Symptom | Fix |
+|---------|-----|
+| `TimeoutError` / no behavior specs | App not running, or wrong port. Check `worker_id` + `base_port`. |
+| `Permission denied` on `.app` | Re-run the `xattr` + `chmod` commands above. |
+| Port already in use | A previous crashed run may have left Unity alive: `lsof -i :5006 \| awk 'NR>1{print $2}' \| xargs kill -9` |
+| Unity opens but immediately closes | Arena YAML is invalid — validate `animalai_configs/basic_food.yaml` |
+| `ModuleNotFoundError: animalai` | Venv not activated or wrong Python. Run `source venv/bin/activate && python --version` — should print `3.10.12`. |
 
 ---
 
-## Observability and logging
+## Configuration
 
-Each run produces an isolated directory under `src/logs/runs/<timestamp>_<run_id>/` containing:
+All parameters live in `config.json`. No code changes are needed to tune behaviour.
+
+| Key | Description |
+|-----|-------------|
+| `adapter_folder` | `"animalai"` (Unity), `"headless"` (pure Python sim), `"iot"` (stub) |
+| `adapter_config.file_name` | Path to Unity binary; omit to connect to a running instance |
+| `adapter_config.arena_config` | Path to Animal AI YAML arena definition |
+| `adapter_config.worker_id` | Worker index (allows multiple parallel environments) |
+| `adapter_config.base_port` | Base port; Python connects on `base_port + worker_id` |
+| `adapter_config.homeostatic.*` | Depletion rates, food restore amounts, hazard penalty |
+| `llm.provider` | `"anthropic"` \| `"openai"` \| `"gemini"` (stub) |
+| `llm.model` | Model name, e.g. `"claude-sonnet-4-6"` or `"gpt-4o-mini"` |
+| `llm.enabled` | Set `false` to disable LLM entirely (urgency fallback only) |
+| `policy_generator.llm_conflict_threshold` | Drive urgency gap that triggers LLM |
+| `policy_generator.pe_streak_threshold` | Steps of high PE before LLM is called |
+| `policy_generator.llm_reeval_interval` | Periodic LLM re-evaluation cadence (steps) |
+| `memory.episode_length` | Steps per episode for LTM bookkeeping |
+| `observability.log_root` | Directory for run logs |
+
+### Environment variables (override config)
+
+```bash
+MAX_STEPS=200 ./run.sh          # override step count
+LOG_PROMPTS=1 ./run.sh          # log every LLM prompt/response
+LOG_STATE=0 ./run.sh            # disable AgentState snapshots
+LOG_LEVEL=DEBUG ./run.sh        # verbose logging
+```
+
+---
+
+## Running
+
+```bash
+source venv/bin/activate
+./run.sh              # 500 steps (default)
+./run.sh 200          # 200 steps
+MAX_STEPS=1000 LOG_PROMPTS=1 ./run.sh
+```
+
+To use the headless simulation (no Unity needed):
+
+```json
+// config.json
+"adapter_folder": "headless"
+```
+
+```bash
+./run.sh
+```
+
+---
+
+## Observability
+
+Each run writes structured logs to `src/logs/runs/<timestamp>_<run_id>/`:
 
 | File | Contents |
-|---|---|
-| `run.json` | Run metadata (start time, PID, Python version, full config) |
-| `events.jsonl` | Step-level events (policy selected, drive signals, scores) |
-| `state.jsonl` | AgentState snapshot each step (gated by `LOG_STATE`) |
-| `llm.jsonl` | LLM prompt/response pairs (gated by `LOG_PROMPTS`) |
-| `memory.jsonl` | Memory read/write operations (gated by `LOG_MEMORY`) |
-| `tracebacks.jsonl` | Structured exception records |
-| `tracebacks.log` | Human-readable traceback text |
+|------|----------|
+| `run.json` | Metadata: config snapshot, Python version, adapter, start time |
+| `metrics.jsonl` | Per-step: health, saturation, arousal, valence, PE, policy chosen |
+| `events.jsonl` | Drive signals, PE summary, LLM trigger reason |
+| `state.jsonl` | Full `AgentState` snapshots (gated by `LOG_STATE`) |
+| `llm.jsonl` | Prompt + response + latency (gated by `LOG_PROMPTS`) |
+| `memory.jsonl` | FAISS queries and updates (gated by `LOG_MEMORY`) |
+| `tracebacks.jsonl` | Structured exception traces |
 
-Watchdog logs are written separately to `src/logs/watchdog/`.
+**Quick health plot:**
 
-> **Note:** The JSONL telemetry currently logs `info_keys` (available field names), not their values. To log values, update `__main__.py` to include selected `info` and `obs` fields in each record.
+```bash
+cat src/logs/runs/$(ls -t src/logs/runs | head -1)/metrics.jsonl \
+  | python3 -c "import sys,json; [print(json.loads(l)['health']) for l in sys.stdin]"
+```
 
 ---
 
-## Project structure
+## Swapping Environments
+
+The brain has zero knowledge of the environment it runs in. To swap:
+
+1. Change `"adapter_folder"` in `config.json`
+2. That is all — no brain code changes
+
+| `adapter_folder` | Environment |
+|-----------------|-------------|
+| `"animalai"` | Real Animal AI Unity testbed |
+| `"headless"` | Pure Python 2D arena simulation (no Unity, no install) |
+| `"iot"` | Stub — implement `src/core/adapters/iot/env_adapter.py` for real IoT sensors |
+
+To add a new environment, create `src/core/adapters/<name>/env_adapter.py` implementing `AbstractEnvironmentAdapter` (see `src/core/adapters/base.py`) and add a `create_adapter(config)` factory function.
+
+---
+
+## LLM Provider
+
+Change `config.json`:
+
+```json
+"llm": {
+  "provider": "anthropic",   // or "openai"
+  "model": "claude-sonnet-4-6"
+}
+```
+
+Add the corresponding key to `.env`:
 
 ```
-.
-├── config.json                         # Runtime configuration (deep-merged with defaults)
-├── requirements.txt
-├── MineDojo/                           # MineDojo submodule + gradle-fix.patch
-└── src/
-    ├── core/
-    │   ├── main.py                     # Entry point — loads config, builds components, starts AgentLoop
-    │   ├── adapters/
-    │   │   ├── loader.py
-    │   │   └── minedojo/
-    │   │       ├── env_adapter.py      # MineDojoAdapter (owns the Minecraft process)
-    │   │       ├── remote_adapter.py   # RemoteMineDojoAdapter (connects to persistent_server)
-    │   │       ├── persistent_server.py# Long-lived server — keeps Minecraft alive between runs
-    │   │       ├── action_mapper.py
-    │   │       ├── observation_mapper.py
-    │   │       └── skill_library/      # Voyager-style pre-built policy descriptors
-    │   ├── layers/
-    │   │   ├── interoceptive/          # VitalStateMonitor, AllostaticController, ArousalValenceSystem
-    │   │   ├── action_selection/       # PolicyGenerator, FreeEnergyMinimizer, MotorControlInterface
-    │   │   ├── predictive.py           # Policy-level PredictionErrorCalculator
-    │   │   └── metacognitive.py        # GoalCoherenceChecker
-    │   ├── memory/
-    │   │   ├── manager.py              # MemoryManager — owns all four sub-systems
-    │   │   ├── working_memory_buffer.py
-    │   │   ├── prediction_error_history.py
-    │   │   ├── self_state_tracking.py
-    │   │   ├── policy_traces.py
-    │   │   └── long_term_memory.py     # Persistent JSON-backed policy history
-    │   ├── perceptual/                 # Perceptual PredictionErrorCalculator
-    │   ├── runtime/
-    │   │   └── loop.py                 # AgentLoop — main per-step control flow
-    │   ├── coordination/               # GlobalWorkspace, AgentMessage
-    │   ├── models/                     # AgentState, ActionProposal, signal types
-    │   ├── llm/                        # Provider-agnostic LLM client (OpenAI / Anthropic / Gemini)
-    │   └── observability/              # RunLogger, LoggingConfig, paths, serializer
-    ├── data/
-    │   └── long_term_memory/
-    │       └── policies/               # Persistent per-policy JSON records (persists across runs)
-    └── logs/
-        ├── runs/                       # Per-run structured logs
-        └── watchdog/                   # Watchdog process logs
+ANTHROPIC_API_KEY=sk-ant-...
+OPENAI_API_KEY=sk-...
 ```
+
+Set `"enabled": false` to run the brain on urgency-based heuristics only (no API calls).
+
+The LLM is called **selectively** — only when one of 5 conditions is met:
+1. Drive conflict (two channels both urgency > threshold)
+2. Sustained prediction error streak
+3. Skill gap (unfamiliar area, low policy confidence)
+4. Periodic re-evaluation interval
+5. Goal change detected
+
+This prevents the rate-limiting and cost problems of calling the LLM every step.
+
+---
+
+## Testing
+
+Tests run without Unity or any API keys:
+
+```bash
+source venv/bin/activate
+PYTHONPATH=src pytest tests/ -v
+```
+
+38 tests cover: homeostatic wrapper, adapter contract, allostatic controller, prediction error calculator, policy generator (all 5 LLM trigger conditions), memory system (FAISS + LTM persistence), and full runtime loop.

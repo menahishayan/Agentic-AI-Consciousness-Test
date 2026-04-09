@@ -1,1419 +1,495 @@
+"""
+AgentLoop — main per-step orchestration engine.
+
+Wires all brain layers together and drives the cognitive cycle:
+  1. Receive AgentState from environment
+  2. Layer 1: VitalStateMonitor → drive signals → arousal/valence
+  3. Layer 2: WorldModel predict → PredictionError → publish
+  4. Layer 4: MetacognitiveMonitor → context assembly
+  5. Layer 3: FreeEnergy → PolicyGenerator → action
+  6. MotorControlInterface.execute → next state
+  7. WorldModel.update → learn from transition
+  8. Memory record → log metrics
+
+The AgentLoop holds references to the adapter (as AbstractEnvironmentAdapter)
+and dispatches actions through MotorControlInterface's action_dispatcher closure.
+Brain layers access the adapter ONLY through this controlled interface.
+"""
 from __future__ import annotations
 
-from collections import deque
-from dataclasses import asdict
-import re
-from typing import Any, Callable, Deque, Dict, List, Mapping, Optional
+import logging
+import os
+import time
+from typing import Any, Callable, Dict, List, Optional
 
-import numpy as np
+# Set AAI_DEBUG=1 to enable per-step signal diagnostics (Gate 5).
+DEBUG: bool = os.getenv("AAI_DEBUG", "").lower() in ("1", "true", "yes")
 
+from core.adapters.base import AbstractEnvironmentAdapter
 from core.coordination.messages import AgentMessage
 from core.coordination.workspace import GlobalWorkspace
-from core.layers.action_selection import PolicyGenerator
-from core.layers.interoceptive import (
-    AllostaticConfig,
-    AllostaticController,
-    ArousalHomeostaticState as HomeostaticState,
-    ArousalValenceSystem,
-    DriveChannel,
-    HomeostaticHistory as DriveHistory,
-    HomeostaticState as DriveState,
-    PredictionError,
-    PrioritisedDriveSignals,
-    VitalStateMonitor,
-)
-from core.layers.metacognitive import GoalCoherenceChecker
-from core.layers.predictive import PredictionErrorCalculator as PolicyPredictionErrorCalculator
-from core.models.signals import ActionProposal
+from core.layers.action_selection.FreeEnergyMinimizer import FreeEnergyMinimizer
+from core.layers.action_selection.MotorControlInterface import MotorControlInterface
+from core.layers.action_selection.PolicyGenerator import PolicyGenerator, _affect_label
+from core.layers.interoceptive.AllostaticController import AllostaticController
+from core.layers.interoceptive.ArousalValenceSystem import ArousalValenceSystem
+from core.layers.interoceptive.VitalStateMonitor import VitalStateMonitor
+from core.layers.metacognitive.MetacognitiveMonitor import MetacognitiveMonitor
+from core.layers.predictive.PredictionErrorCalculator import PredictionErrorCalculator
+from core.layers.predictive.WorldModelGenerator import WorldModelGenerator
+from core.llm.base import AbstractLLMClient
+from core.memory.manager import MemoryManager
 from core.models.state import AgentState
 from core.observability.logger import RunLogger
-from core.memory import MemoryManager, WorkingMemoryEntry
-from core.perceptual import (
-    ObservationSnapshot,
-    PEConfig,
-    PredictionErrorBatch,
-    PredictionErrorCalculator as PerceptualPredictionErrorCalculator,
-)
+
+log = logging.getLogger(__name__)
 
 
 class AgentLoop:
-    _POLICY_DRIVE_TAG_RULES: Dict[str, set[str]] = {
-        "health": {"heal", "retreat", "defend", "protect", "shield"},
-        "hunger": {"eat", "collect", "cook", "food", "harvest"},
-        "oxygen": {"surface", "ascend", "air", "breath"},
-        "resource_level": {"gather", "mine", "craft", "smelt", "harvest", "interact"},
-        "safety": {"retreat", "avoid", "shelter", "escape"},
-    }
+    """
+    Orchestrates a single agent episode.
+
+    Receives fully initialized components at construction time.
+    No imports of concrete adapters, providers, or memory implementations.
+    """
 
     def __init__(
         self,
-        adapter: Any,
-        observation_mapper: Callable[[Any, Any, Optional[VitalStateMonitor]], AgentState],
-        memory_manager: MemoryManager,
-        adapter_folder: str,
-        policy_config: Optional[Mapping[str, Any]] = None,
-        llm_config: Optional[Mapping[str, Any]] = None,
-        workspace: Optional[GlobalWorkspace] = None,
-        llm_client: Optional[Any] = None,
-        logger: Optional[RunLogger] = None,
-        include_inventory: bool = True,
-        include_voxels: bool = True,
+        adapter: AbstractEnvironmentAdapter,
+        memory: MemoryManager,
+        llm_client: Optional[AbstractLLMClient],
+        logger: RunLogger,
+        config: Dict[str, Any],
     ) -> None:
-        self.adapter = adapter
-        self.observation_mapper = observation_mapper
-        self.memory_manager = memory_manager
-        self.adapter_folder = adapter_folder
-        self.policy_config = dict(policy_config or {})
-        self.llm_config = dict(llm_config or {})
-        self.workspace = workspace or GlobalWorkspace()
-        self.llm_client = llm_client
-        self.logger = logger
-        self.include_inventory = include_inventory
-        self.include_voxels = include_voxels
+        self._adapter = adapter
+        self._memory = memory
+        self._llm = llm_client
+        self._logger = logger
+        self._config = config
 
-        allostatic_cfg = self.policy_config.get("allostatic_controller", {})
-        if not isinstance(allostatic_cfg, Mapping):
-            raise TypeError("'policy_generator.allostatic_controller' must be an object.")
-        arousal_cfg = self.policy_config.get("arousal_valence", {})
-        if not isinstance(arousal_cfg, Mapping):
-            raise TypeError("'policy_generator.arousal_valence' must be an object.")
-        perceptual_cfg = self.policy_config.get("perceptual_prediction_error", {})
-        if not isinstance(perceptual_cfg, Mapping):
-            raise TypeError("'policy_generator.perceptual_prediction_error' must be an object.")
+        # Debug log: written to the run directory so each run gets its own file.
+        # Falls back to "debug.log" in cwd if run_dir is unavailable.
+        _debug_path = str(logger.run_dir / "debug.log") if hasattr(logger, "run_dir") else "debug.log"
+        self._debug_log_path: str = _debug_path
 
-        self.vital_state_monitor = VitalStateMonitor(
-            expected_vitals=self._load_available_vitals(adapter),
-        )
-        self._drive_channels = self._resolve_drive_channels(adapter, allostatic_cfg)
-        self._drive_channel_map = {channel.id: channel for channel in self._drive_channels}
-        self._allostatic_config = self._build_allostatic_config(allostatic_cfg)
-        self._homeostatic_history: Deque[DriveState] = deque(
-            maxlen=max(1, int(self._allostatic_config.history_window))
-        )
-        self.allostatic_controller = AllostaticController(
-            config=self._allostatic_config,
-            channels=self._drive_channels,
-            memory_manager=self.memory_manager,
-            message_bus=self.workspace,
-        )
-        self.arousal_valence_system = ArousalValenceSystem(
-            config=arousal_cfg,
-            message_bus=self.workspace,
-            self_state_tracker=self.memory_manager.self_state,
-            memory_manager=self.memory_manager,
-        )
-        self.perceptual_prediction_error_calculator = PerceptualPredictionErrorCalculator(
-            config=self._build_pe_config(perceptual_cfg),
-            memory_manager=self.memory_manager,
-            message_bus=self.workspace,
-        )
+        # Workspace — cleared at top of each step
+        self._workspace = GlobalWorkspace()
 
-        self._initialized = False
-        self._last_obs: Any = None
-        self._last_info: Any = {}
-        self._last_selected_policy_id = "bootstrap"
-        self._last_drive_signals: Optional[PrioritisedDriveSignals] = None
-        self._last_perceptual_batch: Optional[PredictionErrorBatch] = None
-        self._last_homeostatic_state_for_memory: Optional[HomeostaticState] = None
+        # Available policies from adapter
+        self._policies = adapter.get_available_policies()
 
-        self.goal_checker = GoalCoherenceChecker()
-        self.policy_prediction_error_calculator = PolicyPredictionErrorCalculator(
-            max_expected_error=float(self.policy_config.get("max_expected_error", 1.0)),
-            window_size=int(self.policy_config.get("prediction_error_window", 20)),
-        )
-        policy_generator_config = dict(self.policy_config)
-        if "model" not in policy_generator_config and self.llm_config.get("model") is not None:
-            policy_generator_config["model"] = self.llm_config.get("model")
-        self.policy_generator = PolicyGenerator(
-            adapter=self.adapter,
-            adapter_folder=self.adapter_folder,
-            memory_manager=self.memory_manager,
-            goal_checker=self.goal_checker,
-            prediction_error_calculator=self.policy_prediction_error_calculator,
-            config=policy_generator_config,
-            logger=self.logger,
-            llm_client=self.llm_client,
-        )
+        # Layer 1: Interoceptive
+        vitals = adapter.get_available_vitals()
+        drive_channels = adapter.get_drive_channels()
 
-    @staticmethod
-    def _load_available_vitals(adapter: Any) -> List[str]:
-        getter = getattr(adapter, "get_available_vitals", None)
-        if not callable(getter):
-            raise AttributeError("Adapter must implement get_available_vitals().")
-        vitals = getter()
-        if not isinstance(vitals, list):
-            raise TypeError("Adapter get_available_vitals() must return list[str].")
-        if not all(isinstance(v, str) for v in vitals):
-            raise TypeError("Adapter get_available_vitals() must return list[str].")
-        return vitals
+        self._vital_monitor = VitalStateMonitor(available_vitals=vitals + ["resource_level", "threat_proximity"])
+        self._allostatic = AllostaticController(drive_channels=drive_channels, config=config)
+        self._arousal_valence = ArousalValenceSystem(config=config)
 
-    def run_step(self, step: int) -> Any:
-        if self.logger is not None:
-            self.logger.event("step.start", {"component": "AgentLoop"}, step=step)
+        # Layer 2: Predictive
+        self._world_model = WorldModelGenerator(config=config)
+        self._pe_calc = PredictionErrorCalculator(world_model=self._world_model, config=config)
 
-        if not self._initialized:
-            obs, info = self.adapter.reset()
-            self._last_obs = obs
-            self._last_info = info
-            self._initialized = True
-            current_state = self.observation_mapper(
-                raw_obs=obs,
-                info=info,
-                vital_state_monitor=self.vital_state_monitor,
-            )
-            if self.logger is not None:
-                state_dict = current_state.to_dict(
-                    include_inventory=self.include_inventory,
-                    include_voxels=self.include_voxels,
-                )
-                self.logger.state_snapshot(state_dict, step=step)
-                info_keys = list(info.keys()) if isinstance(info, dict) else None
-                self.logger.event("env.reset", {"info_keys": info_keys}, step=step)
-        else:
-            current_state = self.observation_mapper(
-                raw_obs=self._last_obs,
-                info=self._last_info,
-                vital_state_monitor=self.vital_state_monitor,
-            )
+        # Layer 3: Action selection
+        self._policy_gen = PolicyGenerator(llm_client=llm_client, config=config)
+        self._policy_gen.set_policy_history_callback(memory.get_ltm_success_rate)
+        self._policy_gen.set_episodic_memory_callback(memory.query_similar_traces)
 
-        self._record_vital_state(step=step, phase="pre_action")
-        workspace_messages = self.workspace.broadcast()
-        workspace_goals = self._extract_goals(workspace_messages)
-        adapter_goals = self._get_adapter_task_goals()
-        goals = self._merge_goals(workspace_goals, adapter_goals)
-
-        homeostatic_state = self._build_homeostatic_state(
-            step=step,
-            state=current_state,
-            workspace_messages=workspace_messages,
-        )
-        area_id = self._build_area_id(
-            step=step,
-            state=current_state,
-            info=self._last_info,
-            obs=self._last_obs,
-        )
-        drive_state = self._build_drive_state(
-            homeostatic_state=homeostatic_state,
-            step=step,
-            area_id=area_id,
-        )
-        self._homeostatic_history.appendleft(drive_state)
-
-        drive_history = DriveHistory(
-            snapshots=list(self._homeostatic_history),
-            channels=self._drive_channels,
-            tick=step,
-        )
-        drive_signals = self.allostatic_controller.update(
-            history=drive_history,
-            area_id=area_id,
-        )
-        self._last_drive_signals = drive_signals
-        allostatic_assessment = self._build_allostatic_assessment(drive_signals)
-
-        self.memory_manager.set_active_policy_for_pe(self._last_selected_policy_id)
-        perceptual_snapshot = self._build_perceptual_snapshot(
-            step=step,
-            state=current_state,
-            homeostatic_state=homeostatic_state,
-            area_id=area_id,
-        )
-        world_facts = self._build_world_facts(
-            state=current_state,
-            info=self._last_info,
-            obs=self._last_obs,
-        )
-        prediction_error_batch = self.perceptual_prediction_error_calculator.update(
-            perceptual_snapshot,
-            last_action=self._last_selected_policy_id,
-        )
-        self._last_perceptual_batch = prediction_error_batch
-        latest_prediction_error = self._prediction_error_from_batch(
-            prediction_error_batch
-        )
-        arousal_valence_state = self.arousal_valence_system.update(
-            homeostatic_state=homeostatic_state,
-            prediction_error=latest_prediction_error,
-        )
-        arousal_payload = asdict(arousal_valence_state)
-        channel_deltas = self._homeostatic_deltas(homeostatic_state)
-        self._last_homeostatic_state_for_memory = homeostatic_state
-        self.memory_manager.record_state(
-            state=homeostatic_state,
-            channel_deltas=channel_deltas,
-            context_tags=[
-                f"area:{area_id}",
-                f"tick_bucket:{step // 100}",
-            ],
-            arousal=float(arousal_valence_state.arousal),
-        )
-
-        allostatic_assessment["policy_bias"] = dict(arousal_payload["policy_bias"])
-        allostatic_assessment["urgency_signal"] = arousal_payload["urgency_signal"]
-        allostatic_assessment["arousal"] = arousal_payload["arousal"]
-        allostatic_assessment["valence"] = arousal_payload["valence"]
-
-        self.memory_manager.snapshot_self_state(
-            {
-                "step": step,
-                "phase": "allostatic_pre_action",
-                "allostatic_assessment": allostatic_assessment,
-                "drive_signals": asdict(drive_signals),
-            }
-        )
-        self.memory_manager.snapshot_self_state(
-            {
-                "step": step,
-                "phase": "arousal_valence_pre_action",
-                "arousal_valence": arousal_payload,
-            }
-        )
-        if self.logger is not None:
-            self.logger.event(
-                "allostatic.assessment",
-                {
-                    "source": allostatic_assessment.get("source"),
-                    "risk_level": allostatic_assessment.get("risk_level"),
-                    "highest_urgency": allostatic_assessment.get("highest_urgency"),
-                    "needs_count": len(allostatic_assessment.get("needs", [])),
-                },
-                step=step,
-            )
-            self.logger.event(
-                "homeostatic.arousal_valence",
-                {
-                    "arousal": arousal_valence_state.arousal,
-                    "valence": arousal_valence_state.valence,
-                    "urgency_signal": arousal_valence_state.urgency_signal,
-                    "learning_rate_mod": arousal_valence_state.learning_rate_mod,
-                },
+        def _llm_log_cb(prompt: str, resp: Any, reason: str, step: int, selected: Optional[str] = None) -> None:
+            logger.llm(
+                prompt=prompt,
+                response=resp.content,
+                model=resp.model or "",
+                latency_ms=resp.latency_ms or 0.0,
+                input_tokens=resp.input_tokens or 0,
+                output_tokens=resp.output_tokens or 0,
+                trigger_reason=reason,
+                selected=selected,
                 step=step,
             )
 
-        policy_context = {
-            "state": current_state,
-            "obs": self._last_obs,
-            "info": self._last_info,
-            "workspace_messages": workspace_messages,
-            "step": step,
-            "memory_manager": self.memory_manager,
-            "allostatic_assessment": allostatic_assessment,
-            "drive_signals": asdict(drive_signals),
-            "arousal_valence_state": arousal_payload,
-            "perceptual_prediction_error": asdict(prediction_error_batch),
-            "world_facts": dict(world_facts),
-        }
-        skill_plan = self._get_adapter_skill_plan(goals=goals, context=policy_context)
-        if skill_plan is not None:
-            policy_context["skill_plan"] = skill_plan
-        action_proposal = self.policy_generator.propose_action(
-            goals=goals,
-            context=policy_context,
-        )
+        self._policy_gen.set_llm_log_callback(_llm_log_cb)
+        self._free_energy = FreeEnergyMinimizer(config=config)
 
-        action = self._select_env_action(action_proposal)
-        selected_policy_id = (
-            action_proposal.action_id if isinstance(action_proposal, ActionProposal) else None
-        )
-        selected_policy_or_bootstrap = selected_policy_id or "bootstrap"
-        if selected_policy_id:
-            self._notify_adapter_policy_selected(
-                policy_id=selected_policy_id,
-                goals=goals,
-                context=policy_context,
-            )
-        self.perceptual_prediction_error_calculator.prepare_next_prediction(
-            observation=perceptual_snapshot,
-            action_id=selected_policy_or_bootstrap,
-        )
+        # Action dispatcher closure — MotorControlInterface has NO adapter import
+        def _dispatch(action_id: str):
+            return adapter.step(action_id)
 
-        obs, reward, done, info = self.adapter.step(action)
-        self._last_obs = obs
-        self._last_info = info
+        self._motor = MotorControlInterface(action_dispatcher=_dispatch)
 
-        state = self.observation_mapper(
-            raw_obs=obs,
-            info=info,
-            vital_state_monitor=self.vital_state_monitor,
-        )
-        post_workspace_messages = self.workspace.broadcast()
-        post_homeostatic_state = self._build_homeostatic_state(
-            step=step + 1,
-            state=state,
-            workspace_messages=post_workspace_messages,
-        )
-        post_area_id = self._build_area_id(
-            step=step + 1,
-            state=state,
-            info=self._last_info,
-            obs=self._last_obs,
-        )
-        post_perceptual_snapshot = self._build_perceptual_snapshot(
-            step=step + 1,
-            state=state,
-            homeostatic_state=post_homeostatic_state,
-            area_id=post_area_id,
-        )
-        next_world_facts = self._build_world_facts(
-            state=state,
-            info=self._last_info,
-            obs=self._last_obs,
-        )
-        self.perceptual_prediction_error_calculator.observe_transition(
-            prev_observation=perceptual_snapshot,
-            action_id=selected_policy_or_bootstrap,
-            next_observation=post_perceptual_snapshot,
-        )
-        self._record_transition_memory(
-            step=step,
-            policy_id=selected_policy_or_bootstrap,
-            reward=reward,
-            done=done,
-            prev_facts=world_facts,
-            next_facts=next_world_facts,
-        )
-        self._record_vital_state(step=step, phase="post_step")
-        if self.logger is not None:
-            state_dict = state.to_dict(
-                include_inventory=self.include_inventory,
-                include_voxels=self.include_voxels,
-            )
-            self.logger.state_snapshot(state_dict, step=step)
-            self.logger.event(
-                "env.step",
-                {
-                    "action": action,
-                    "reward": reward,
-                    "done": done,
-                    "selected_policy_id": selected_policy_id,
-                },
-                step=step,
-            )
+        # Layer 4: Metacognitive
+        self._metacognitive = MetacognitiveMonitor(config=config)
 
-        if selected_policy_id:
-            self.memory_manager.record_policy_outcome(
-                policy_id=selected_policy_id,
-                reward=reward,
-                done=done,
-                step=step,
-            )
-            self._record_policy_trace(
-                selected_policy_id=selected_policy_id,
-                drive_signals=drive_signals,
-                reward=reward,
-                step=step,
-            )
-            self._last_selected_policy_id = selected_policy_id
-        else:
-            self._last_selected_policy_id = "bootstrap"
+        # Runtime state
+        self._current_state: Optional[AgentState] = None
+        self._last_policy_id: Optional[str] = None
+        self._step: int = 0
+        # Rolling action history for LLM context (last 10 actions)
+        self._recent_actions: List[str] = []
+        # Previous step's arousal — passed to PEC so LC-NE precision scaling uses
+        # the arousal that was current when the action was taken, not the one computed
+        # from its outcome (which isn't available yet at PEC call time).
+        self._last_arousal: float = 0.0
 
-        return {"obs": obs, "reward": reward, "done": done, "info": info, "state": state}
+    def _dbg(self, msg: str) -> None:
+        """Append a debug line to this run's debug.log (line-buffered)."""
+        with open(self._debug_log_path, "a", buffering=1) as _f:
+            _f.write(msg + "\n")
 
-    def run(self, max_steps: int) -> None:
-        if self.logger is not None:
-            self.logger.event("run.start", {"max_steps": max_steps})
-        try:
-            for step in range(max_steps):
-                if self.logger is not None:
-                    self.logger.event("step.begin", {"step": step}, step=step)
-                result = self.run_step(step)
-                if self.logger is not None:
-                    self.logger.event("step.end", {"step": step}, step=step)
-                if isinstance(result, dict) and result.get("done"):
-                    break
-        except Exception as exc:
-            if self.logger is not None:
-                self.logger.exception(exc, context={"stage": "run"})
-            raise
-        finally:
-            if self.logger is not None:
-                self.logger.event("run.end", {"max_steps": max_steps})
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
 
-    def _select_env_action(self, action_proposal: Optional[ActionProposal]) -> Any:
-        if isinstance(action_proposal, ActionProposal) and action_proposal.action is not None:
-            return action_proposal.action
+    def run(self, max_steps: int = 500) -> Dict[str, Any]:
+        """
+        Run a full episode for up to max_steps steps.
 
-        sample_action = getattr(self.adapter, "sample_action", None)
-        if callable(sample_action):
-            return sample_action()
-        return None
+        Returns summary dict with episode statistics.
+        """
+        log.info("Episode starting (max_steps=%d, adapter=%s)",
+                 max_steps, type(self._adapter).__name__)
 
-    def _extract_goals(self, messages: List[AgentMessage]) -> List[Any]:
-        goals: List[Any] = []
-        for message in messages:
-            kind = getattr(message, "kind", None)
-            payload = getattr(message, "payload", None)
-            if kind == "goal":
-                if isinstance(payload, list):
-                    goals.extend(payload)
-                elif payload is not None:
-                    goals.append(payload)
-                continue
-            if isinstance(payload, Mapping):
-                payload_goals = payload.get("goals")
-                if isinstance(payload_goals, list):
-                    goals.extend(payload_goals)
-        return goals
+        self._current_state = self._adapter.reset()
+        self._step = 0
 
-    def _get_adapter_task_goals(self) -> List[Any]:
-        getter = getattr(self.adapter, "get_task_goals", None)
-        if not callable(getter):
-            return []
-        try:
-            raw = getter()
-        except Exception:
-            return []
-        if isinstance(raw, list):
-            return list(raw)
-        if raw is None:
-            return []
-        return [raw]
+        # Reset area familiarity for the starting position so area_novelty = 1.0
+        # on step 0. This lets the epistemic value of turns dominate the urgency
+        # fallback, producing a natural orienting scan at episode start without
+        # any hardcoded behaviour.
+        start_area = (self._current_state.perception.area_id or "unknown")
+        self._memory.reset_area_familiarity(start_area)
 
-    def _merge_goals(self, workspace_goals: List[Any], adapter_goals: List[Any]) -> List[Any]:
-        merged: List[Any] = []
-        seen: set[str] = set()
-
-        def _goal_key(goal: Any) -> str:
-            if isinstance(goal, Mapping):
-                candidate = goal.get("goal_id") or goal.get("description") or goal.get("goal")
-            else:
-                candidate = goal
-            return str(candidate or "").strip().lower()
-
-        for goal in list(workspace_goals) + list(adapter_goals):
-            key = _goal_key(goal)
-            if not key or key in seen:
-                continue
-            seen.add(key)
-            merged.append(goal)
-        return merged
-
-    def _get_adapter_skill_plan(
-        self,
-        goals: List[Any],
-        context: Mapping[str, Any],
-    ) -> Optional[Dict[str, Any]]:
-        getter = getattr(self.adapter, "get_skill_plan", None)
-        if not callable(getter):
-            return None
-        try:
-            plan = getter(goals=goals, context=context)
-        except TypeError:
-            try:
-                plan = getter(goals, context)
-            except Exception:
-                return None
-        except Exception:
-            return None
-        if isinstance(plan, Mapping):
-            return dict(plan)
-        return None
-
-    def _notify_adapter_policy_selected(
-        self,
-        policy_id: str,
-        goals: List[Any],
-        context: Mapping[str, Any],
-    ) -> None:
-        notifier = getattr(self.adapter, "notify_policy_selected", None)
-        if not callable(notifier):
-            return
-
-        payload = {
-            "step": context.get("step"),
-            "goals": goals,
-            "skill_plan": context.get("skill_plan"),
-            "allostatic_assessment": context.get("allostatic_assessment"),
-        }
-        try:
-            notifier(policy_id=policy_id, context=payload)
-        except TypeError:
-            try:
-                notifier(policy_id, payload)
-            except Exception:
-                pass
-        except Exception:
-            pass
-
-    def _record_vital_state(self, step: int, phase: str) -> None:
-        self.memory_manager.snapshot_self_state(
-            {
-                "step": step,
-                "phase": phase,
-                "vital_state": self.vital_state_monitor.to_dict(),
-            }
-        )
-
-    def _build_homeostatic_state(
-        self,
-        step: int,
-        state: AgentState,
-        workspace_messages: List[AgentMessage],
-    ) -> HomeostaticState:
-        homeostasis = self._as_mapping(getattr(state, "homeostasis", None))
-        lighting = self._as_mapping(getattr(state, "lighting_weather", None))
-        nearby = self._as_mapping(getattr(state, "nearby", None))
-        inventory_state = self._as_mapping(getattr(state, "inventory_state", None))
-        vitals = self.vital_state_monitor.last_state()
-
-        life = self._as_optional_float(homeostasis.get("life"))
-        if life is None:
-            life = self._as_optional_float(vitals.get("life"))
-        food = self._as_optional_float(homeostasis.get("food"))
-        if food is None:
-            food = self._as_optional_float(vitals.get("food"))
-        air = self._as_optional_float(homeostasis.get("air"))
-        if air is None:
-            air = self._as_optional_float(vitals.get("air"))
-
-        health = self._clamp01(0.0 if life is None else life / 20.0)
-        hunger = self._clamp01(0.0 if food is None else food / 20.0)
-        oxygen = self._clamp01(0.0 if air is None else air / 300.0)
-        resource_level = self._estimate_resource_level(
-            state=state,
-            hunger=hunger,
-            lighting=lighting,
-            nearby=nearby,
-            inventory_state=inventory_state,
-            info=self._last_info,
-            obs=self._last_obs,
-        )
-        threat_proximity = self._estimate_threat_proximity(
-            state=state,
-            messages=workspace_messages,
-            health=health,
-            lighting=lighting,
-            homeostasis=homeostasis,
-            info=self._last_info,
-            obs=self._last_obs,
-        )
-        return HomeostaticState(
-            health=health,
-            hunger=hunger,
-            resource_level=resource_level,
-            threat_proximity=threat_proximity,
-            oxygen=oxygen,
-            tick=step,
-        )
-
-    def _build_drive_state(
-        self,
-        homeostatic_state: HomeostaticState,
-        step: int,
-        area_id: str,
-    ) -> DriveState:
-        values = {
-            "health": self._clamp01(homeostatic_state.health),
-            "hunger": self._clamp01(homeostatic_state.hunger),
-            "oxygen": self._clamp01(homeostatic_state.oxygen),
-            "resource_level": self._clamp01(homeostatic_state.resource_level),
-            "safety": self._clamp01(1.0 - homeostatic_state.threat_proximity),
-        }
-        return DriveState(values=values, tick=step, context_hash=area_id)
-
-    def _build_allostatic_assessment(
-        self,
-        drive_signals: PrioritisedDriveSignals,
-    ) -> Dict[str, Any]:
-        needs: List[Dict[str, Any]] = []
-        tags: List[str] = []
-        min_ttc: Optional[float] = None
-        for signal in drive_signals.signals:
-            need = {
-                "need_id": f"stabilize_{signal.channel_id}",
-                "channel_id": str(signal.channel_id),
-                "urgency": self._clamp01(signal.urgency),
-                "time_to_critical_steps": max(0, int(round(signal.ticks_to_critical))),
-                "actions": [signal.suggested_action_tag] if signal.suggested_action_tag else [],
-                "resources": [signal.channel_id],
-                "evidence": [
-                    f"current={signal.current_value:.3f}",
-                    f"projected={signal.projected_value:.3f}",
-                ],
-            }
-            channel = self._drive_channel_map.get(str(signal.channel_id))
-            if channel is not None:
-                need["irreversible"] = bool(channel.irreversible)
-            needs.append(need)
-            if signal.suggested_action_tag:
-                tags.append(str(signal.suggested_action_tag).strip().lower())
-            tags.append(str(signal.channel_id).strip().lower())
-            if min_ttc is None:
-                min_ttc = signal.ticks_to_critical
-            else:
-                min_ttc = min(min_ttc, signal.ticks_to_critical)
-
-        horizon = (
-            int(round(min_ttc))
-            if isinstance(min_ttc, (int, float))
-            else int(self._allostatic_config.planning_horizon)
-        )
-        return {
-            "source": "drive_model",
-            "risk_level": self._clamp01(drive_signals.highest_urgency),
-            "confidence": 1.0,
-            "highest_urgency": self._clamp01(drive_signals.highest_urgency),
-            "survival_horizon_steps": max(1, horizon),
-            "needs": needs,
-            "policy_bias_tags": list(dict.fromkeys(tag for tag in tags if tag)),
+        episode_stats = {
+            "steps_run": 0,
+            "done_reason": "max_steps",
+            "final_health": 0.0,
+            "final_saturation": 0.0,
         }
 
-    def _build_perceptual_snapshot(
-        self,
-        step: int,
-        state: AgentState,
-        homeostatic_state: HomeostaticState,
-        area_id: str,
-    ) -> ObservationSnapshot:
-        entity_density = self._estimate_entity_density(
-            state=state,
-            info=self._last_info,
-            obs=self._last_obs,
-        )
-        terrain_novelty = self._estimate_terrain_novelty(
-            state=state,
-            info=self._last_info,
-            obs=self._last_obs,
-        )
-        return ObservationSnapshot(
-            health=self._clamp01(homeostatic_state.health),
-            hunger=self._clamp01(homeostatic_state.hunger),
-            resource_level=self._clamp01(homeostatic_state.resource_level),
-            oxygen=self._clamp01(homeostatic_state.oxygen),
-            threat_proximity=self._clamp01(homeostatic_state.threat_proximity),
-            entity_density=self._clamp01(entity_density),
-            terrain_novelty=self._clamp01(terrain_novelty),
-            area_id=area_id,
-            last_action=self._last_selected_policy_id,
-            tick=int(step),
-        )
-
-    def _build_world_facts(
-        self,
-        state: AgentState,
-        info: Any,
-        obs: Any,
-    ) -> Dict[str, Any]:
-        _ = obs
-        info_map = self._as_mapping(info)
-        biome = self._as_mapping(getattr(state, "biome", None))
-        position = self._as_mapping(getattr(state, "position", None))
-        nearby = self._as_mapping(getattr(state, "nearby", None))
-        inventory_state = self._as_mapping(getattr(state, "inventory_state", None))
-
-        biome_name = str(
-            biome.get("biome_name")
-            or info_map.get("biome_name")
-            or "unknown"
-        ).strip().lower() or "unknown"
-
-        xpos = self._as_optional_float(position.get("xpos"))
-        ypos = self._as_optional_float(position.get("ypos"))
-        zpos = self._as_optional_float(position.get("zpos"))
-        if xpos is None:
-            xpos = self._as_optional_float(info_map.get("xpos"))
-        if ypos is None:
-            ypos = self._as_optional_float(info_map.get("ypos"))
-        if zpos is None:
-            zpos = self._as_optional_float(info_map.get("zpos"))
-
-        raw_inventory = inventory_state.get("inventory")
-        if not isinstance(raw_inventory, list):
-            info_inventory = info_map.get("inventory")
-            raw_inventory = info_inventory if isinstance(info_inventory, list) else []
-        inventory_non_air_slots, inventory_total_quantity, bucket_count = self._inventory_metrics(raw_inventory)
-
-        nearby_crafting_table = self._resolve_world_bool(
-            [
-                nearby.get("nearby_crafting_table"),
-                info_map.get("nearby_crafting_table"),
-                info_map.get("nearby_workbench"),
-                info_map.get("workbench_nearby"),
-            ],
-            default=False,
-        )
-        nearby_cow = self._resolve_world_bool(
-            [
-                info_map.get("nearby_cow"),
-                info_map.get("cow_nearby"),
-                info_map.get("has_nearby_cow"),
-                self._entity_nearby(info_map, target="cow"),
-            ],
-            default=False,
-        )
-
-        max_slots = self._as_non_negative_int(getattr(self.adapter, "_max_inventory_slots", 36))
-        if max_slots <= 0:
-            max_slots = max(1, len(raw_inventory))
-        inventory_fullness = self._clamp01(float(inventory_non_air_slots) / float(max_slots))
-
-        return {
-            "biome": biome_name,
-            "position": {
-                "x": self._round_optional(xpos),
-                "y": self._round_optional(ypos),
-                "z": self._round_optional(zpos),
-            },
-            "nearby_crafting_table": nearby_crafting_table,
-            "nearby_cow": nearby_cow,
-            "has_bucket": bucket_count > 0,
-            "bucket_count": int(bucket_count),
-            "inventory_non_air_slots": int(inventory_non_air_slots),
-            "inventory_total_quantity": int(inventory_total_quantity),
-            "inventory_fullness": float(inventory_fullness),
-        }
-
-    def _record_transition_memory(
-        self,
-        *,
-        step: int,
-        policy_id: str,
-        reward: Any,
-        done: Any,
-        prev_facts: Mapping[str, Any],
-        next_facts: Mapping[str, Any],
-    ) -> None:
-        recorder = getattr(self.memory_manager, "record_working", None)
-        if not callable(recorder):
-            return
-
-        inventory_progress = self._inventory_progress(prev_facts, next_facts)
-        bucket_progress = self._bucket_progress(prev_facts, next_facts)
-        payload = {
-            "policy_id": str(policy_id),
-            "reward": reward,
-            "done": bool(done),
-            "prev_facts": dict(prev_facts),
-            "next_facts": dict(next_facts),
-            "inventory_progress": inventory_progress,
-            "bucket_progress": bucket_progress,
-        }
-        try:
-            recorder(
-                WorkingMemoryEntry(
-                    tick=int(step),
-                    entry_type="transition",
-                    payload=payload,
-                    priority=0.6,
-                )
-            )
-        except Exception:
-            # Working-memory recording is supplemental and must not interrupt runtime.
-            return
-
-    def _prediction_error_from_batch(
-        self,
-        batch: PredictionErrorBatch,
-    ) -> Optional[PredictionError]:
-        if not batch.errors:
-            return None
-        source = str(batch.dominant_source or "visual")
-        if source not in {"visual", "proprioceptive", "threat"}:
-            source = "visual"
-        return PredictionError(
-            magnitude=self._clamp01(batch.aggregate_magnitude),
-            source=source,
-            tick=int(batch.tick),
-        )
-
-    def _build_area_id(
-        self,
-        step: int,
-        state: AgentState,
-        info: Any,
-        obs: Any,
-    ) -> str:
-        builder = getattr(self.adapter, "build_area_id", None)
-        if callable(builder):
+        for step in range(max_steps):
+            self._step = step
             try:
-                area_id = builder(state=state, info=info, obs=obs, step=step)
-                if isinstance(area_id, str) and area_id.strip():
-                    return area_id.strip()
-            except Exception:
-                pass
-
-        biome = self._as_mapping(getattr(state, "biome", None))
-        position = self._as_mapping(getattr(state, "position", None))
-        biome_name = str(biome.get("biome_name") or "unknown").strip().lower() or "unknown"
-        xpos = self._as_optional_float(position.get("xpos")) or 0.0
-        zpos = self._as_optional_float(position.get("zpos")) or 0.0
-        return f"{biome_name}:{int(xpos // 32.0)}:{int(zpos // 32.0)}"
-
-    def _estimate_resource_level(
-        self,
-        state: AgentState,
-        hunger: float,
-        lighting: Mapping[str, Any],
-        nearby: Mapping[str, Any],
-        inventory_state: Mapping[str, Any],
-        info: Any,
-        obs: Any,
-    ) -> float:
-        estimator = getattr(self.adapter, "estimate_resource_level", None)
-        if callable(estimator):
-            try:
-                value = estimator(
-                    state=state,
-                    hunger=hunger,
-                    lighting=lighting,
-                    nearby=nearby,
-                    inventory_state=inventory_state,
-                    info=info,
-                    obs=obs,
-                )
-                if isinstance(value, (int, float)):
-                    return self._clamp01(float(value))
-            except Exception:
-                pass
-        return self._clamp01(hunger)
-
-    def _estimate_threat_proximity(
-        self,
-        state: AgentState,
-        messages: List[AgentMessage],
-        health: float,
-        lighting: Mapping[str, Any],
-        homeostasis: Mapping[str, Any],
-        info: Any,
-        obs: Any,
-    ) -> float:
-        estimator = getattr(self.adapter, "estimate_threat_proximity", None)
-        if callable(estimator):
-            try:
-                value = estimator(
-                    state=state,
-                    messages=messages,
-                    health=health,
-                    lighting=lighting,
-                    homeostasis=homeostasis,
-                    info=info,
-                    obs=obs,
-                )
-                if isinstance(value, (int, float)):
-                    return self._clamp01(float(value))
-            except Exception:
-                pass
-        return self._clamp01(1.0 - health)
-
-    def _estimate_entity_density(self, state: AgentState, info: Any, obs: Any) -> float:
-        estimator = getattr(self.adapter, "estimate_entity_density", None)
-        if callable(estimator):
-            try:
-                value = estimator(state=state, info=info, obs=obs)
-                if isinstance(value, (int, float)):
-                    return self._clamp01(float(value))
-            except Exception:
-                pass
-        return 0.0
-
-    def _estimate_terrain_novelty(self, state: AgentState, info: Any, obs: Any) -> float:
-        estimator = getattr(self.adapter, "estimate_terrain_novelty", None)
-        if callable(estimator):
-            try:
-                value = estimator(state=state, info=info, obs=obs)
-                if isinstance(value, (int, float)):
-                    return self._clamp01(float(value))
-            except Exception:
-                pass
-        return 0.0
-
-    def _homeostatic_deltas(self, current: HomeostaticState) -> Dict[str, float]:
-        previous = self._last_homeostatic_state_for_memory
-        if previous is None:
-            return {}
-
-        dt = max(1, int(current.tick) - int(previous.tick))
-        channels = ("health", "hunger", "resource_level", "threat_proximity", "oxygen")
-        out: Dict[str, float] = {}
-        for channel in channels:
-            prev_value = getattr(previous, channel, None)
-            curr_value = getattr(current, channel, None)
-            if not isinstance(prev_value, (int, float)):
-                continue
-            if not isinstance(curr_value, (int, float)):
-                continue
-            out[channel] = float(curr_value - prev_value) / float(dt)
-        return out
-
-    def _record_policy_trace(
-        self,
-        selected_policy_id: str,
-        drive_signals: PrioritisedDriveSignals,
-        reward: Any,
-        step: int,
-    ) -> None:
-        signals = list(drive_signals.signals)
-        if len(signals) < 2:
-            return
-
-        winner, runner_up = self._trace_channels_for_policy(
-            selected_policy_id=selected_policy_id,
-            signals=signals,
-        )
-        if winner is None or runner_up is None:
-            return
-        if winner.channel_id == runner_up.channel_id:
-            return
-
-        winner_channel = self._drive_channel_map.get(winner.channel_id)
-        runner_up_channel = self._drive_channel_map.get(runner_up.channel_id)
-        survival_weight = 1.0 if (
-            bool(getattr(winner_channel, "irreversible", False))
-            or bool(getattr(runner_up_channel, "irreversible", False))
-        ) else 0.5
-        tick_norm = self._clamp01(
-            float(step % max(1, self._allostatic_config.planning_horizon))
-            / float(max(1, self._allostatic_config.planning_horizon))
-        )
-        context_vector = np.asarray(
-            [
-                self._clamp01(winner.urgency),
-                self._clamp01(runner_up.urgency),
-                self._clamp01(max(winner.urgency, runner_up.urgency)),
-                self._clamp(
-                    winner.projected_value - runner_up.projected_value,
-                    -1.0,
-                    1.0,
-                ),
-                self._clamp01(survival_weight),
-                tick_norm,
-            ],
-            dtype=np.float32,
-        )
-        self.memory_manager.record_trace(
-            channel_a_id=winner.channel_id,
-            channel_b_id=runner_up.channel_id,
-            winner_channel_id=winner.channel_id,
-            action_tag=str(selected_policy_id),
-            context_vector=context_vector,
-            outcome_score=self._reward_to_outcome_score(reward),
-            tick=int(step),
-        )
-
-    def _trace_channels_for_policy(
-        self,
-        selected_policy_id: str,
-        signals: List[Any],
-    ) -> tuple[Optional[Any], Optional[Any]]:
-        policy_drive_tags = self._policy_drive_tags(selected_policy_id)
-        winner: Optional[Any] = None
-        if policy_drive_tags:
-            for signal in signals:
-                channel_id = str(getattr(signal, "channel_id", "")).strip().lower()
-                if channel_id in policy_drive_tags:
-                    winner = signal
-                    break
-        if winner is None and signals:
-            winner = signals[0]
-
-        if winner is None:
-            return None, None
-
-        winner_channel_id = str(getattr(winner, "channel_id", "")).strip().lower()
-        runner_up: Optional[Any] = None
-        for signal in signals:
-            channel_id = str(getattr(signal, "channel_id", "")).strip().lower()
-            if channel_id == winner_channel_id:
-                continue
-            runner_up = signal
-            break
-        return winner, runner_up
-
-    def _policy_drive_tags(self, policy_id: str) -> set[str]:
-        getter = getattr(self.adapter, "get_available_policies", None)
-        if not callable(getter):
-            return set()
-        try:
-            policies = getter()
-        except Exception:
-            return set()
-        if not isinstance(policies, list):
-            return set()
-
-        descriptor: Optional[Mapping[str, Any]] = None
-        for item in policies:
-            if not isinstance(item, Mapping):
-                continue
-            item_policy_id = item.get("policy_id")
-            if isinstance(item_policy_id, str) and item_policy_id == policy_id:
-                descriptor = item
+                done = self._run_step()
+                episode_stats["steps_run"] = step + 1
+            except Exception as exc:
+                self._logger.traceback(exc, context="AgentLoop.run_step", step=step)
+                log.error("Step %d failed: %s", step, exc)
+                episode_stats["done_reason"] = "error"
                 break
-        if descriptor is None:
-            return set()
 
-        drive_tags = descriptor.get("drive_tags")
-        if isinstance(drive_tags, list):
-            normalized = {
-                str(tag).strip().lower()
-                for tag in drive_tags
-                if isinstance(tag, str) and tag.strip()
-            }
-            if normalized:
-                return normalized
+            if done:
+                episode_stats["done_reason"] = "episode_done"
+                break
 
-        tags = descriptor.get("tags")
-        tokens: set[str] = set()
-        if isinstance(tags, list):
-            for tag in tags:
-                if isinstance(tag, str):
-                    tokens.update(self._name_tokens(tag))
-        description = descriptor.get("description")
-        if isinstance(description, str):
-            tokens.update(self._name_tokens(description))
-        callable_name = descriptor.get("callable_name")
-        if isinstance(callable_name, str):
-            tokens.update(self._name_tokens(callable_name))
+        # Final stats
+        if self._current_state:
+            episode_stats["final_health"] = self._current_state.homeostasis.health or 0.0
+            episode_stats["final_saturation"] = self._current_state.homeostasis.saturation or 0.0
 
-        inferred: set[str] = set()
-        for drive_tag, marker_tokens in self._POLICY_DRIVE_TAG_RULES.items():
-            if drive_tag in tokens or marker_tokens.intersection(tokens):
-                inferred.add(drive_tag)
-        return inferred
+        self._memory.save_faiss_stores()
+        self._memory.log_summary()
+        log.info("Episode complete: %s", episode_stats)
+        self._logger.event("episode_complete", episode_stats, step=self._step)
+        return episode_stats
 
-    def _inventory_progress(
-        self,
-        prev_facts: Mapping[str, Any],
-        next_facts: Mapping[str, Any],
-    ) -> Dict[str, Any]:
-        prev_slots = self._as_non_negative_int(prev_facts.get("inventory_non_air_slots"))
-        next_slots = self._as_non_negative_int(next_facts.get("inventory_non_air_slots"))
-        prev_quantity = self._as_non_negative_int(prev_facts.get("inventory_total_quantity"))
-        next_quantity = self._as_non_negative_int(next_facts.get("inventory_total_quantity"))
-        prev_fullness = self._clamp01(prev_facts.get("inventory_fullness", 0.0))
-        next_fullness = self._clamp01(next_facts.get("inventory_fullness", 0.0))
-        slot_delta = int(next_slots - prev_slots)
-        quantity_delta = int(next_quantity - prev_quantity)
-        fullness_delta = float(round(next_fullness - prev_fullness, 4))
-        return {
-            "slot_delta": slot_delta,
-            "quantity_delta": quantity_delta,
-            "fullness_delta": fullness_delta,
-            "changed": bool(slot_delta or quantity_delta or abs(fullness_delta) > 0.0),
-        }
+    def run_step(self) -> bool:
+        """Run a single step. Returns True if episode is done."""
+        return self._run_step()
 
-    def _bucket_progress(
-        self,
-        prev_facts: Mapping[str, Any],
-        next_facts: Mapping[str, Any],
-    ) -> Dict[str, Any]:
-        prev_has_bucket = bool(prev_facts.get("has_bucket", False))
-        next_has_bucket = bool(next_facts.get("has_bucket", False))
-        prev_bucket_count = self._as_non_negative_int(prev_facts.get("bucket_count"))
-        next_bucket_count = self._as_non_negative_int(next_facts.get("bucket_count"))
-        count_delta = int(next_bucket_count - prev_bucket_count)
-        return {
-            "had_bucket": prev_has_bucket,
-            "has_bucket": next_has_bucket,
-            "bucket_count_delta": count_delta,
-            "acquired_bucket": (not prev_has_bucket) and next_has_bucket,
-            "changed": bool((prev_has_bucket != next_has_bucket) or count_delta != 0),
-        }
+    # ------------------------------------------------------------------
+    # Core step logic
+    # ------------------------------------------------------------------
 
-    def _inventory_metrics(self, inventory_items: Any) -> tuple[int, int, int]:
-        if not isinstance(inventory_items, list):
-            return 0, 0, 0
-        non_air_slots = 0
-        total_quantity = 0
-        bucket_count = 0
-        for item in inventory_items:
-            if not isinstance(item, Mapping):
-                continue
-            name = str(item.get("name") or "").strip().lower()
-            quantity = self._as_non_negative_int(item.get("quantity"))
-            if quantity <= 0:
-                continue
-            total_quantity += quantity
-            if name and name != "air":
-                non_air_slots += 1
-            if "bucket" in self._name_tokens(name):
-                bucket_count += quantity
-        return non_air_slots, total_quantity, bucket_count
+    def _run_step(self) -> bool:
+        step = self._step
+        state = self._current_state
+        if state is None:
+            return True
 
-    def _entity_nearby(
-        self,
-        info_map: Mapping[str, Any],
-        *,
-        target: str,
-    ) -> bool:
-        target_tokens = set(self._name_tokens(target))
-        if not target_tokens:
-            return False
+        t_step_start = time.monotonic()
 
-        for key in ("nearby_entities", "entities", "mobs", "entity_names", "nearby"):
-            if self._contains_entity_token(info_map.get(key), target_tokens, depth=2):
-                return True
-        return False
+        self._workspace.clear()
 
-    def _contains_entity_token(
-        self,
-        value: Any,
-        target_tokens: set[str],
-        *,
-        depth: int,
-    ) -> bool:
-        if depth < 0 or value is None:
-            return False
-        if isinstance(value, str):
-            tokens = set(self._name_tokens(value))
-            return bool(tokens.intersection(target_tokens))
-        if isinstance(value, Mapping):
-            for field in ("name", "id", "type", "entity", "mob", "kind"):
-                field_value = value.get(field)
-                if isinstance(field_value, str):
-                    if set(self._name_tokens(field_value)).intersection(target_tokens):
-                        return True
-            for key, item in value.items():
-                key_tokens = set(self._name_tokens(str(key)))
-                if key_tokens.intersection(target_tokens):
-                    bool_value = self._as_optional_bool(item)
-                    if bool_value is True:
-                        return True
-                if self._contains_entity_token(item, target_tokens, depth=depth - 1):
-                    return True
-            return False
-        if isinstance(value, list):
-            for item in value:
-                if self._contains_entity_token(item, target_tokens, depth=depth - 1):
-                    return True
-            return False
-        return False
+        # --- Layer 1: Interoceptive ---
+        vitals = self._vital_monitor.update(state, self._workspace, step)
 
-    def _resolve_world_bool(self, values: List[Any], default: bool) -> bool:
-        for value in values:
-            parsed = self._as_optional_bool(value)
-            if parsed is not None:
-                return parsed
-        return default
-
-    @staticmethod
-    def _name_tokens(name: str) -> List[str]:
-        text = str(name).strip().lower()
-        if not text:
-            return []
-        tokens = re.split(r"[^a-z0-9]+", text)
-        return [token for token in tokens if token]
-
-    @staticmethod
-    def _reward_to_outcome_score(reward: Any) -> float:
-        try:
-            numeric = float(reward)
-        except (TypeError, ValueError):
-            return 0.0
-        # Sparse non-negative reward assumption: 0 is failure/neutral, positives are progress.
-        return max(0.0, min(1.0, numeric))
-
-    @staticmethod
-    def _build_drive_channels(config: Mapping[str, Any]) -> List[DriveChannel]:
-        default_channels: List[DriveChannel] = [
-            DriveChannel(
-                id="health",
-                setpoint=0.9,
-                critical_threshold=0.25,
-                irreversible=True,
-                recovery_cost_ticks=25,
-                suggested_action_tag="heal",
-            ),
-            DriveChannel(
-                id="hunger",
-                setpoint=0.8,
-                critical_threshold=0.2,
-                irreversible=False,
-                recovery_cost_ticks=20,
-                suggested_action_tag="eat",
-            ),
-            DriveChannel(
-                id="oxygen",
-                setpoint=0.9,
-                critical_threshold=0.2,
-                irreversible=True,
-                recovery_cost_ticks=30,
-                suggested_action_tag="surface",
-            ),
-            DriveChannel(
-                id="resource_level",
-                setpoint=0.7,
-                critical_threshold=0.3,
-                irreversible=False,
-                recovery_cost_ticks=15,
-                suggested_action_tag="gather",
-            ),
-            DriveChannel(
-                id="safety",
-                setpoint=0.8,
-                critical_threshold=0.35,
-                irreversible=True,
-                recovery_cost_ticks=20,
-                suggested_action_tag="retreat",
-            ),
-        ]
-        raw_channels = config.get("channels")
-        if not isinstance(raw_channels, list):
-            return default_channels
-
-        out: List[DriveChannel] = []
-        for item in raw_channels:
-            if not isinstance(item, Mapping):
-                continue
-            channel_id = item.get("id")
-            if not isinstance(channel_id, str) or not channel_id.strip():
-                continue
-            out.append(
-                DriveChannel(
-                    id=channel_id.strip(),
-                    setpoint=AgentLoop._clamp(item.get("setpoint", 0.8), 0.0, 1.0),
-                    critical_threshold=AgentLoop._clamp(
-                        item.get("critical_threshold", 0.3), 0.0, 1.0
-                    ),
-                    irreversible=bool(item.get("irreversible", False)),
-                    recovery_cost_ticks=max(0, int(item.get("recovery_cost_ticks", 20))),
-                    suggested_action_tag=str(item.get("suggested_action_tag", "")).strip(),
-                )
-            )
-        return out or default_channels
-
-    @staticmethod
-    def _resolve_drive_channels(adapter: Any, config: Mapping[str, Any]) -> List[DriveChannel]:
-        getter = getattr(adapter, "get_drive_channels", None)
-        if callable(getter):
-            try:
-                raw_channels = getter()
-                channels = AgentLoop._coerce_drive_channels(raw_channels)
-                if channels:
-                    return channels
-            except Exception:
-                pass
-        return AgentLoop._build_drive_channels(config)
-
-    @staticmethod
-    def _coerce_drive_channels(raw_channels: Any) -> List[DriveChannel]:
-        if not isinstance(raw_channels, list):
-            return []
-        out: List[DriveChannel] = []
-        for item in raw_channels:
-            if isinstance(item, DriveChannel):
-                out.append(item)
-                continue
-            if not isinstance(item, Mapping):
-                continue
-            channel_id = item.get("id")
-            if not isinstance(channel_id, str) or not channel_id.strip():
-                continue
-            out.append(
-                DriveChannel(
-                    id=channel_id.strip(),
-                    setpoint=AgentLoop._clamp(item.get("setpoint", 0.8), 0.0, 1.0),
-                    critical_threshold=AgentLoop._clamp(
-                        item.get("critical_threshold", 0.3),
-                        0.0,
-                        1.0,
-                    ),
-                    irreversible=bool(item.get("irreversible", False)),
-                    recovery_cost_ticks=max(0, int(item.get("recovery_cost_ticks", 20))),
-                    suggested_action_tag=str(item.get("suggested_action_tag", "")).strip(),
-                )
-            )
-        return out
-
-    @staticmethod
-    def _build_allostatic_config(config: Mapping[str, Any]) -> AllostaticConfig:
-        return AllostaticConfig(
-            planning_horizon=max(1, int(config.get("planning_horizon", 50))),
-            history_window=max(1, int(config.get("history_window", 20))),
-            irreversibility_bonus=AgentLoop._clamp(  # type: ignore[arg-type]
-                config.get("irreversibility_bonus", 0.3), 0.0, 1.0
-            ),
-            recovery_weight_factor=AgentLoop._clamp(  # type: ignore[arg-type]
-                config.get("recovery_weight_factor", 0.2), 0.0, 1.0
-            ),
-            urgency_tie_epsilon=AgentLoop._clamp(  # type: ignore[arg-type]
-                config.get("urgency_tie_epsilon", 0.05), 0.0, 1.0
-            ),
-            threat_prior_weight=AgentLoop._clamp(  # type: ignore[arg-type]
-                config.get("threat_prior_weight", 0.3), 0.0, 1.0
-            ),
-            min_confidence=AgentLoop._clamp(  # type: ignore[arg-type]
-                config.get("min_confidence", 0.5), 0.0, 1.0
-            ),
+        # Inject memory depletion rates into allostatic controller
+        depletion_rates = self._memory.get_depletion_rates()
+        drive_batch = self._allostatic.update(
+            vitals, self._workspace, step,
+            memory_depletion_rates=depletion_rates,
         )
 
-    @staticmethod
-    def _build_pe_config(config: Mapping[str, Any]) -> PEConfig:
-        return PEConfig(
-            alpha=AgentLoop._clamp(config.get("alpha", 0.1), 1e-6, 1.0),  # type: ignore[arg-type]
-            epsilon=AgentLoop._clamp(config.get("epsilon", 0.01), 1e-6, 1.0),  # type: ignore[arg-type]
-            sigma_clip=AgentLoop._clamp(config.get("sigma_clip", 3.0), 1e-6, 10.0),  # type: ignore[arg-type]
-            default_precision=AgentLoop._clamp(config.get("default_precision", 0.5), 0.0, 1.0),  # type: ignore[arg-type]
-            min_precision=AgentLoop._clamp(config.get("min_precision", 0.3), 0.0, 1.0),  # type: ignore[arg-type]
-            world_model_alpha=AgentLoop._clamp(config.get("world_model_alpha", 0.1), 1e-6, 1.0),  # type: ignore[arg-type]
-            action_confidence_threshold=max(
-                1,
-                int(config.get("action_confidence_threshold", 20)),
-            ),
+        # --- Layer 2: Predictive ---
+        predicted = self._world_model.predict(state, self._last_policy_id)
+        area_id = state.perception.area_id or "unknown"
+        familiarity = self._memory.get_area_familiarity(area_id)
+        pe_batch = self._pe_calc.update(
+            predicted=predicted,
+            observed=state,
+            last_action=self._last_policy_id,
+            workspace=self._workspace,
+            step=step,
+            area_familiarity=familiarity,
+            arousal=self._last_arousal,
         )
 
-    @staticmethod
-    def _as_mapping(value: Any) -> Mapping[str, Any]:
-        if isinstance(value, Mapping):
-            return value
-        if hasattr(value, "__dict__"):
-            mapped = vars(value)
-            if isinstance(mapped, Mapping):
-                return mapped
-        return {}
+        # --- Layer 1 continued: Arousal/Valence ---
+        av = self._arousal_valence.update(
+            vitals=vitals,
+            drive_batch=drive_batch,
+            pe_batch=pe_batch,
+            workspace=self._workspace,
+            step=step,
+            raycast_hits=state.perception.raycast_hits,
+        )
 
-    @staticmethod
-    def _as_optional_float(value: Any) -> Optional[float]:
-        if isinstance(value, bool):
-            return None
-        try:
-            return float(value)
-        except (TypeError, ValueError):
-            return None
+        if DEBUG:
+            _motor_pe_dbg = 0.0
+            if pe_batch:
+                for _e in pe_batch.errors:
+                    if _e.channel == "motor":
+                        _motor_pe_dbg = float(_e.magnitude)
+                        break
+            self._dbg(f"[DBG STEP {step}] signals →")
+            self._dbg(f"  arousal={av.arousal:.4f}  valence={av.valence:.4f}  "
+                  f"lr_mod={av.learning_rate_mod:.4f}")
+            self._dbg(f"  drive_urgency max={drive_batch.max_urgency:.4f}  "
+                  f"dominant={drive_batch.dominant_channel}")
+            for _s in drive_batch.signals:
+                self._dbg(f"    {_s.channel_id}: val={_s.current_value:.4f}  "
+                      f"urgency={_s.urgency:.4f}")
+            if pe_batch:
+                self._dbg(f"  PE mean={pe_batch.mean_magnitude:.4f}  "
+                      f"max={pe_batch.max_magnitude:.4f}")
+                _me = next((e for e in pe_batch.errors if e.channel == "motor"), None)
+                if _me:
+                    _warn = "  *** always 1.0 = motor_efficiency broken" if _me.magnitude > 0.9 else ""
+                    self._dbg(f"  PE motor: expected={_me.expected:.3f}  "
+                          f"observed={_me.observed:.3f}  "
+                          f"magnitude={_me.magnitude:.4f}{_warn}")
+            self._dbg(f"  lc_ne_motor_pe_contribution≈{min(_motor_pe_dbg, 1.0) * 0.4:.4f}  "
+                  f"(should be ~0 in open space, ~0.4 at wall)")
 
-    @staticmethod
-    def _as_non_negative_int(value: Any) -> int:
-        try:
-            numeric = int(float(value))
-        except (TypeError, ValueError):
-            return 0
-        return max(0, numeric)
+        # --- Layer 4: Metacognitive ---
+        context = self._metacognitive.update(self._workspace, [], step)
+        context["policies"] = self._policies
+        context["heading"] = state.position.heading or 0.0
+        context["motor_efficiency"] = float(state.raw_metadata.get("motor_efficiency", 1.0))
+        context["stuck_steps"] = int(state.raw_metadata.get("stuck_steps", 0))
+        # Affect state — used by PolicyGenerator arousal-diversity fallback
+        context["arousal"] = av.arousal
+        context["valence"] = av.valence
+        self._last_arousal = av.arousal   # carried into next step's PEC precision
+        # Last action — excluded from candidates when arousal is high
+        context["last_action"] = self._last_policy_id
+        # Rolling history for LLM prompt — lets the model detect repetition
+        context["recent_actions"] = list(self._recent_actions)
+        # Raycast hits from perception — directional food/threat bearing for LLM.
+        # Use `or []` so context always holds a list; downstream consumers (FEA,
+        # PolicyGenerator) iterate directly without their own None-guards.
+        context["raycast_hits"] = state.perception.raycast_hits or []
+        # Current AgentState — used by PolicyGenerator to query episodic memory
+        context["current_state"] = state
 
-    @staticmethod
-    def _as_optional_bool(value: Any) -> Optional[bool]:
-        if isinstance(value, bool):
-            return value
-        if value is None:
-            return None
-        if isinstance(value, (int, float)):
-            return bool(value)
-        if isinstance(value, str):
-            normalized = value.strip().lower()
-            if normalized in {"1", "true", "yes", "y", "on"}:
-                return True
-            if normalized in {"0", "false", "no", "n", "off"}:
-                return False
-            return None
-        return None
+        if DEBUG:
+            _rc_ctx = context["raycast_hits"]
+            _food_rc = [r for r in _rc_ctx if r.get("hit_tag") in ("GoodGoal", "GoodGoalMulti")]
+            self._dbg(
+                f"CONTEXT_RC step={step}  n_rays={len(_rc_ctx)}  food_rays={_food_rc}"
+                f"  state_rc_none={state.perception.raycast_hits is None}"
+            )
 
-    @staticmethod
-    def _round_optional(value: Optional[float], digits: int = 2) -> Optional[float]:
-        if not isinstance(value, (int, float)):
-            return None
-        return round(float(value), int(digits))
+        # --- Layer 3: Free energy scoring ---
+        fe_scores = self._free_energy.score(
+            policies=self._policies,
+            drive_batch=drive_batch,
+            pe_batch=pe_batch,
+            area_familiarity=familiarity,
+            context=context,
+        )
+        context["free_energy_scores"] = fe_scores
 
-    @staticmethod
-    def _clamp01(value: Any) -> float:
-        try:
-            numeric = float(value)
-        except (TypeError, ValueError):
-            numeric = 0.0
-        return max(0.0, min(1.0, numeric))
+        # --- Layer 3: Policy selection ---
+        selected_id = self._policy_gen.propose_action(
+            policies=self._policies,
+            goals=[],
+            context=context,
+            workspace=self._workspace,
+            step=step,
+        )
 
-    @staticmethod
-    def _clamp(value: Any, lo: float, hi: float) -> float:
-        try:
-            numeric = float(value)
-        except (TypeError, ValueError):
-            numeric = lo
-        return max(lo, min(hi, numeric))
+        if selected_id is None:
+            selected_id = "idle"
+
+        # --- Execute action ---
+        prev_state = state
+        next_state, done = self._motor.execute(selected_id)
+        self._last_policy_id = selected_id
+        self._current_state = next_state
+        # Maintain rolling action history (last 10 steps)
+        self._recent_actions.append(selected_id)
+        if len(self._recent_actions) > 10:
+            self._recent_actions.pop(0)
+
+        # --- Layer 2: World model learning ---
+        self._world_model.update(
+            prev_state=prev_state,
+            action_id=selected_id,
+            next_state=next_state,
+            workspace=self._workspace,
+            step=step,
+        )
+
+        # --- Memory recording ---
+        self._memory.record_state(next_state, action=selected_id)
+        self._memory.update_state_outcome(next_state)
+        self._memory.record_prediction_error(next_state, pe_batch, action=selected_id)
+
+        # Outcome score: drive-relief based.
+        #
+        # Measures whether this action reduced allostatic urgency, not whether
+        # urgency is currently low. An agent at low urgency scoring high for
+        # every action (including wall hits) would give the LTM no useful signal.
+        #
+        # relief > 0 → action reduced urgency (good)
+        # relief < 0 → action increased urgency (bad, e.g. depletion tick with no progress)
+        #
+        # Per-step urgency change is tiny (~0.001–0.002); scale=5 spreads the
+        # signal so ±0.1 relief maps to ±0.5 around the neutral midpoint of 0.5.
+        # A food collection (~0.18 urgency relief) saturates to 1.0.
+        #
+        # Motor efficiency is a necessary second component: without it, move_forward
+        # into a wall and turn_right produce the same drive urgency delta in most
+        # steps, so the LTM can't differentiate them. motor_eff=0 (wall-blocked)
+        # pulls the score down regardless of urgency change.
+        next_vitals = self._vital_monitor.read(next_state)
+        prev_urgency = drive_batch.max_urgency
+        next_urgency = self._allostatic.peek_max_urgency(next_vitals)
+        relief = prev_urgency - next_urgency
+        relief_score = max(0.0, min(1.0, 0.5 + relief * 5.0))
+
+        # Homeostatic delta: direct physiological improvement this step.
+        # Replaces motor_eff * 0.3, which was always 0.0 when the proprioceptive
+        # obs wasn't available and added no signal. A positive health+saturation
+        # delta is the ground-truth consequence of successful foraging.
+        prev_health = float(prev_state.homeostasis.health or 0.0)
+        prev_sat = float(prev_state.homeostasis.saturation or 0.0)
+        next_health = float(next_state.homeostasis.health or 0.0)
+        next_sat = float(next_state.homeostasis.saturation or 0.0)
+        homeo_delta = max(0.0, (next_health - prev_health) + (next_sat - prev_sat))
+
+        # Exteroceptive component: did food distance change as the world model expected?
+        # Only computed when move_forward was executed with food visible.
+        # Differentiates "moving toward food" from "blocked facing food" — two outcomes
+        # that produce identical drive relief but opposite exteroceptive consequences.
+        extero_match = 1.0
+        if selected_id == "move_forward":
+            prev_rc = prev_state.perception.raycast_hits
+            next_rc = next_state.perception.raycast_hits
+            if prev_rc and next_rc:
+                p_food = next(
+                    (r for r in prev_rc if r.get("hit_tag") in ("GoodGoal", "GoodGoalMulti")), None
+                )
+                n_food = next(
+                    (r for r in next_rc if r.get("hit_tag") in ("GoodGoal", "GoodGoalMulti")), None
+                )
+                if p_food:
+                    prev_dist = float(p_food.get("distance", 1.0))
+                    next_dist = float(n_food.get("distance", prev_dist)) if n_food else prev_dist
+                    actual_delta = next_dist - prev_dist   # negative = approached
+                    heading_deg = float(prev_state.position.heading or 0.0)
+                    expected_delta = self._world_model.get_expected_delta(
+                        "move_forward", "food_distance", heading_deg
+                    )
+                    extero_match = max(0.0, min(1.0, 1.0 - abs(expected_delta - actual_delta)))
+
+        outcome_score = float(max(0.0, min(1.0, relief_score * 0.5 + homeo_delta * 0.3 + extero_match * 0.2)))
+
+        # Situation note for episodic memory — encodes perceptual context + causal
+        # consequence so the LLM can read "GoodGoal at 1.32, health_delta=+0.300" and
+        # distinguish "approached food" from "blocked facing food" in retrieved traces.
+        _rc = prev_state.perception.raycast_hits
+        if _rc:
+            # Use the closest food ray for the situation note; fall back to forward ray.
+            _food_r = next(
+                (r for r in _rc if r.get("hit_tag") in ("GoodGoal", "GoodGoalMulti")), _rc[0]
+            )
+            _tag = _food_r.get("hit_tag")
+            _dist = _food_r.get("distance", 1.0)
+            _situation = f"{_tag} at {_dist:.2f}" if _tag else "open"
+        else:
+            _situation = "no raycast"
+        _motor = float(prev_state.raw_metadata.get("motor_efficiency", 1.0))
+        if _motor < 0.3:
+            _situation += ", blocked"
+        _health_before = float(prev_state.homeostasis.health or 0.0)
+        _health_after = float(next_state.homeostasis.health or 0.0)
+        _health_delta = _health_after - _health_before
+        _situation += f", health_delta={_health_delta:+.3f}"
+        situation_note = _situation
+
+        self._memory.record_policy_trace(
+            state=prev_state,
+            policy_id=selected_id,
+            outcome_score=outcome_score,
+            drive_signals={s.channel_id: s.urgency for s in drive_batch.signals},
+            notes=situation_note,
+        )
+        self._memory.record_episode_outcome(
+            selected_id,
+            score=outcome_score,
+            outcome="success" if outcome_score > 0.6 else "partial" if outcome_score > 0.3 else "failure",
+        )
+
+        # --- Structured metrics logging ---
+        step_ms = (time.monotonic() - t_step_start) * 1000.0
+        _rc = next_state.perception.raycast_hits
+        _food_vis = bool(_rc and any(r.get("hit_tag") in ("GoodGoal", "GoodGoalMulti") for r in _rc))
+        affect_state = _affect_label(
+            av.arousal, av.valence, drive_batch.dominant_channel, _food_vis
+        )
+        self._logger.metrics(
+            step=step,
+            health=next_state.homeostasis.health or 0.0,
+            saturation=next_state.homeostasis.saturation or 0.0,
+            energy=next_state.homeostasis.energy or 0.0,
+            arousal=av.arousal,
+            valence=av.valence,
+            pe_mean=pe_batch.mean_magnitude,
+            policy_id=selected_id,
+            extra={
+                "step_ms": round(step_ms, 1),
+                "drive_urgency": drive_batch.max_urgency,
+                "dominant_channel": drive_batch.dominant_channel,
+                "area_id": area_id,
+                "outcome_score": outcome_score,
+                "affect_state": affect_state,
+            },
+        )
+
+        self._logger.event("step", {
+            "policy": selected_id,
+            "drive_urgency": drive_batch.max_urgency,
+            "pe_mean": pe_batch.mean_magnitude,
+            "arousal": av.arousal,
+            "valence": av.valence,
+            "step_ms": round(step_ms, 1),
+        }, step=step)
+
+        if self._config.get("observability", {}).get("log_state", True):
+            self._logger.state(next_state.to_dict(), step=step)
+
+        if done:
+            log.info("Step %d: episode done (health=%.3f)", step, next_state.homeostasis.health or 0.0)
+            # Structured homeostatic collapse event — queryable across runs in events.jsonl
+            if (next_state.homeostasis.health is not None
+                    and next_state.homeostasis.health <= 0.0):
+                self._logger.event("homeostatic_collapse", {
+                    "health": next_state.homeostasis.health,
+                    "saturation": next_state.homeostasis.saturation,
+                    "dominant_drive": drive_batch.dominant_channel,
+                    "steps_survived": step,
+                }, step=step)
+
+        return done

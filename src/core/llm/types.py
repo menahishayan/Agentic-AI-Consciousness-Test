@@ -6,7 +6,7 @@ from typing import Any, Dict, List, Optional
 
 @dataclass
 class LLMMessage:
-    role: str
+    role: str    # "system" | "user" | "assistant"
     content: str
 
 
@@ -14,23 +14,17 @@ class LLMMessage:
 class LLMRequest:
     messages: List[LLMMessage]
     model: Optional[str] = None
-    temperature: Optional[float] = None
-    max_tokens: Optional[int] = None
-    metadata: Dict[str, Any] = field(default_factory=dict)
-
-
-@dataclass
-class LLMUsage:
-    prompt_tokens: Optional[int] = None
-    completion_tokens: Optional[int] = None
-    total_tokens: Optional[int] = None
+    max_tokens: int = 500
+    temperature: float = 0.1
+    extra_params: Dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
 class LLMResponse:
-    text: str
-    raw: Any = None
-    usage: Optional[LLMUsage] = None
-    latency_ms: Optional[float] = None
-    provider: Optional[str] = None
-    model: Optional[str] = None
+    content: str
+    model: str
+    provider: str
+    input_tokens: int = 0
+    output_tokens: int = 0
+    latency_ms: float = 0.0
+    raw: Optional[Any] = None

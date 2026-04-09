@@ -1,121 +1,108 @@
 {
-  "adapter_folder": "minedojo",
+  "adapter_folder": "animalai",
+  "adapter_config": {
+    "homeostatic": {
+      "saturation_depletion_rate": 0.001,
+      "health_depletion_rate": 0.01,
+      "food_saturation_restore": 0.2,
+      "death_threshold": 0.0
+    },
+    "simulation": {
+      "arena_size": 30.0,
+      "step_size": 1.0,
+      "turn_angle_deg": 33.3,
+      "interaction_radius": 1.0,
+      "hazard_margin": 2.0,
+      "n_food": 8,
+      "seed": null
+    },
+    "arena_config": "animalai_configs/basic_food.yaml",
+    "worker_id": 1,
+    "base_port": 5005,
+    "physics_fps": 30.0,
+    "decision_period": 5.0,
+    "file_name": "./animal-ai-unity/AnimalAI.app",
+    "additional_args": [
+      "-screen-width",
+      "300",
+      "-screen-height",
+      "300",
+      "-popupwindow"
+    ]
+  },
   "llm": {
     "enabled": true,
-    "provider": "openai",
-    "model": "gpt-4.1-mini",
+    "provider": "ollama",
+    "model": "gemma3:4b",
+    "base_url": "http://localhost:11434/v1",
     "temperature": 0.1,
     "max_tokens": 500,
-    "timeout_s": 10.0
-  },
-  "adapter_config": {
-    "task_id": "harvest_milk",
-    "image_size": [
-      160,
-      256
-    ],
-    "initial_health": 6,
-    "initial_food": 4,
-    "use_remote": true
+    "timeout_s": 8.0
   },
   "policy_generator": {
+    "llm_conflict_threshold": 0.8,
+    "pe_streak_threshold": 5,
+    "pe_high_threshold": 0.35,
+    "llm_reeval_interval": 3,
+    "skill_gap_urgency_threshold": 0.8,
+    "plan_window": 20,
+    "arousal_diversity_threshold": 0.6,
+    "max_plan_phases": 5,
     "weights": {
-      "goal_coherence": 0.6,
-      "prediction_error": 0.4,
-      "allostatic_survival_fit": 0.2,
-      "allostatic_urgency_alignment": 0.2
-    },
-    "fallback_scores": {
-      "goal_coherence": 0.5,
-      "prediction_error": 0.5,
-      "allostatic_survival_fit": 0.5,
-      "allostatic_urgency_alignment": 0.5
-    },
-    "long_term_memory": {
-      "path": "data/long_term_memory/policies.json",
-      "max_score_history": 200,
-      "max_outcome_history": 200
-    },
-    "max_expected_error": 1.0,
-    "prediction_error_window": 20,
-    "allostatic_controller": {
-      "planning_horizon": 50,
-      "history_window": 20,
-      "irreversibility_bonus": 0.3,
-      "recovery_weight_factor": 0.2,
-      "urgency_tie_epsilon": 0.05,
-      "threat_prior_weight": 0.3,
-      "min_confidence": 0.5,
-      "channels": [
-        {
-          "id": "health",
-          "setpoint": 0.9,
-          "critical_threshold": 0.25,
-          "irreversible": true,
-          "recovery_cost_ticks": 25,
-          "suggested_action_tag": "heal"
-        },
-        {
-          "id": "hunger",
-          "setpoint": 0.8,
-          "critical_threshold": 0.2,
-          "irreversible": false,
-          "recovery_cost_ticks": 20,
-          "suggested_action_tag": "eat"
-        },
-        {
-          "id": "oxygen",
-          "setpoint": 0.9,
-          "critical_threshold": 0.2,
-          "irreversible": true,
-          "recovery_cost_ticks": 30,
-          "suggested_action_tag": "surface"
-        },
-        {
-          "id": "resource_level",
-          "setpoint": 0.7,
-          "critical_threshold": 0.3,
-          "irreversible": false,
-          "recovery_cost_ticks": 15,
-          "suggested_action_tag": "gather"
-        },
-        {
-          "id": "safety",
-          "setpoint": 0.8,
-          "critical_threshold": 0.35,
-          "irreversible": true,
-          "recovery_cost_ticks": 20,
-          "suggested_action_tag": "retreat"
-        }
-      ]
-    },
-    "perceptual_prediction_error": {
-      "alpha": 0.1,
-      "epsilon": 0.01,
-      "sigma_clip": 3.0,
-      "default_precision": 0.5,
-      "min_precision": 0.3
-    },
-    "memory": {
-      "working_memory_capacity": 100,
-      "pe_min_observations": 5,
-      "pe_ema_alpha": 0.1,
-      "faiss_k_default": 5,
-      "faiss_epsilon": 1e-6,
-      "episode_length": 1000
-    },
-    "arousal_valence": {
-      "w_health": 0.35,
-      "w_hunger": 0.25,
-      "w_threat": 0.30,
-      "w_pred_err": 0.10,
-      "v_health": 0.30,
-      "v_hunger": 0.30,
-      "v_resources": 0.20,
-      "v_oxygen": 0.20,
-      "decay_rate": 0.95,
-      "resting_arousal": 0.10,
-      "urgency_broadcast_threshold": 0.65
+      "allostatic_urgency": 0.40,
+      "epistemic_gain": 0.40,
+      "motor_cost": 0.15,
+      "idle_urgency_penalty": 2.0,
+      "food_proximity_bonus": 0.6
     }
+  },
+  "allostatic_controller": {
+    "planning_horizon": 50,
+    "history_window": 20,
+    "irreversibility_bonus": 0.3,
+    "recovery_weight_factor": 0.2,
+    "urgency_tie_epsilon": 0.05,
+    "threat_prior_weight": 0.3,
+    "min_confidence": 0.5
+  },
+  "world_model": {
+    "alpha": 0.1,
+    "action_confidence_threshold": 20,
+    "min_precision": 0.3
+  },
+  "perceptual_prediction_error": {
+    "alpha": 0.1,
+    "epsilon": 0.01,
+    "sigma_clip": 3.0,
+    "default_precision": 0.5,
+    "min_precision": 0.3
+  },
+  "arousal_valence": {
+    "w_threat": 0.30,
+    "w_pred_err": 0.35,
+    "w_threat_roc": 0.20,
+    "w_food_pe": 0.40,
+    "lc_ne_gain": 0.40,
+    "rpe_scale": 3.0,
+    "anticipation_weight": 0.4,
+    "threat_hit_threshold": 0.3,
+    "threat_hit_weight": 0.5
+  },
+  "memory": {
+    "working_memory_capacity": 100,
+    "faiss_k_default": 5,
+    "pe_ema_alpha": 0.1,
+    "pe_min_observations": 5,
+    "faiss_epsilon": 1e-6,
+    "episode_length": 1000,
+    "long_term_memory_path": "data/long_term_memory",
+    "max_score_history": 200,
+    "max_outcome_history": 200
+  },
+  "observability": {
+    "log_root": "src/logs/runs",
+    "log_prompts": true,
+    "log_state": true,
+    "log_memory": true
   }
 }
