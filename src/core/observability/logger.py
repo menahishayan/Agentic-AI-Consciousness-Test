@@ -113,10 +113,11 @@ class RunLogger:
         output_tokens: int = 0,
         trigger_reason: str = "",
         selected: Optional[str] = None,
+        reason: Optional[str] = None,
         step: int = 0,
     ) -> None:
         if self._llm_f:
-            self._append(self._llm_f, {
+            entry: Dict[str, Any] = {
                 "t": time.time(),
                 "step": step,
                 "model": model,
@@ -127,7 +128,10 @@ class RunLogger:
                 "output_tokens": output_tokens,
                 "prompt": prompt,
                 "response": response,
-            })
+            }
+            if reason is not None:
+                entry["reason"] = reason
+            self._append(self._llm_f, entry)
 
     def memory_op(self, op: str, details: Any, step: int = 0) -> None:
         if self._memory_f:
