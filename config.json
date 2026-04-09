@@ -3,7 +3,7 @@
   "adapter_config": {
     "homeostatic": {
       "saturation_depletion_rate": 0.001,
-      "health_depletion_rate": 0.002,
+      "health_depletion_rate": 0.01,
       "food_saturation_restore": 0.2,
       "death_threshold": 0.0
     },

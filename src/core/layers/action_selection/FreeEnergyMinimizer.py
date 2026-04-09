@@ -166,12 +166,15 @@ class FreeEnergyMinimizer:
         motor_eff = float(context.get("motor_efficiency", 1.0)) if context else 1.0
         last_action = context.get("last_action") if context else None
 
-        # Update consecutive-failure streak; penalty requires streak ≥ 2 so a
-        # single stale obs (e.g. the first step after reset) doesn't fire it.
-        if motor_eff < 0.3:
+        # Update consecutive move_forward failure streak.
+        # Only increment on move_forward; turns/backward don't count as failures.
+        # Penalty requires streak ≥ 2 to avoid firing on the first stale obs.
+        if last_action == "move_forward" and motor_eff < 0.3:
             self._motor_fail_streak += 1
-        else:
+        elif last_action == "move_forward":
             self._motor_fail_streak = 0
+        # On turn/backward/idle actions: leave streak unchanged — the wall is
+        # still there; resetting would immediately re-allow move_forward.
 
         # tag → max urgency across all drive signals
         urgency_by_tag: Dict[str, float] = {}

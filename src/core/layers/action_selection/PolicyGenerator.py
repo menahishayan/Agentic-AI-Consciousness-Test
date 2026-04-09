@@ -299,7 +299,10 @@ class PolicyGenerator:
                 )
                 return None
 
-            selected = self._parse_llm_response(response.content, policies)
+            selected = self._parse_llm_response(
+                response.content, policies,
+                fe_scores=context.get("free_energy_scores"),
+            )
 
             if self._llm_log_cb is not None:
                 try:
@@ -401,8 +404,7 @@ class PolicyGenerator:
         motor_eff = float(context.get("motor_efficiency", 1.0))
         stuck_steps = int(context.get("stuck_steps", 0))
         stuck_line = (
-            f"STUCK: move_forward blocked for {stuck_steps} consecutive steps. "
-            f"Turning is required.\n"
+            "STUCK: Agent not moving. Choose turn_left or turn_right.\n"
             if motor_eff < 0.3 and stuck_steps >= 5 else ""
         )
 
@@ -591,7 +593,7 @@ Valid policy_ids: {valid_ids}
 
 ══ STEP 6 — ALLOSTATIC RESOLUTION ══
   Select the action with the highest EFE score that is consistent with the perceptual evidence above.
-  If food is visible in raycasts, move_forward has first-order pragmatic value.{affect_note}{f"{chr(10)}  ⚠ STUCK: move_forward blocked for {context.get('stuck_steps', 0)} steps. You MUST turn." if motor_eff < 0.3 and context.get('stuck_steps', 0) >= 5 else ""}
+  If food is visible in raycasts, move_forward has first-order pragmatic value.{affect_note}{f"{chr(10)}  ⚠ STUCK: Agent not moving. Choose turn_left or turn_right." if motor_eff < 0.3 and context.get('stuck_steps', 0) >= 5 else ""}
 
 REASON: """
 
@@ -603,11 +605,14 @@ REASON: """
         self,
         response: str,
         policies: List[Dict],
+        fe_scores: Optional[Dict[str, float]] = None,
     ) -> Optional[str]:
         """Extract policy_id from LLM response text.
 
         Primary: look for the explicit ACTION: line.
-        Fallback: scan full response for any valid policy_id substring.
+        Fallback 1: scan full response for any valid policy_id substring.
+        Fallback 2: argmax(EFE scores) — never discard a computed answer on a
+                    malformed LLM response.
         """
         policy_ids = {p["policy_id"] for p in policies}
 
@@ -619,11 +624,15 @@ REASON: """
                 if first_word in policy_ids:
                     return first_word
 
-        # Fallback: first policy_id substring in response
+        # Fallback 1: first policy_id substring in response
         lower = response.lower()
         for pid in policy_ids:
             if pid in lower:
                 return pid
+
+        # Fallback 2: EFE argmax — response was malformed, but EFE already has the answer
+        if fe_scores:
+            return max(fe_scores, key=lambda k: fe_scores[k])
 
         return None
 
