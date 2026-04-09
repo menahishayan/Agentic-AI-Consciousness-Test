@@ -27,6 +27,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from core.coordination.messages import AgentMessage
 from core.coordination.workspace import GlobalWorkspace
+from core.models.ablation import AblationMode
 from core.models.signals import (
     ActionProposal,
     ArousalValence,
@@ -115,6 +116,12 @@ class PolicyGenerator:
         llm_cfg = config.get("llm", {})
         self._llm_timeout_s: float = float(llm_cfg.get("timeout_s", 4.0))
 
+        # Ablation mode — controls which signals appear in the prompt
+        ablation_cfg = config.get("ablation", {})
+        self._ablation_mode: AblationMode = AblationMode(
+            ablation_cfg.get("mode", AblationMode.FULL)
+        )
+
         # PE streak counter — depth modulator, not a call/no-call switch
         self._pe_streak: int = 0
 
@@ -168,6 +175,17 @@ class PolicyGenerator:
         self._update_pe_streak(context)
 
         fe_scores: Dict[str, float] = context.get("free_energy_scores", {})
+
+        # EFE-only condition: deterministic argmax, skip LLM entirely
+        if self._ablation_mode == AblationMode.EFE_ONLY:
+            selected = max(fe_scores, key=lambda k: fe_scores[k]) if fe_scores else "idle"
+            workspace.publish(AgentMessage(
+                sender="PolicyGenerator",
+                kind="policy_proposal",
+                payload={"selected": selected, "depth": "efe_only", "trigger": "ablation_efe_only", "step": step},
+                step=step,
+            ))
+            return selected
 
         depth, reason = self._depth(context)
 
@@ -225,7 +243,9 @@ class PolicyGenerator:
         arousal = float(context.get("arousal", 0.0))
 
         # 1. High arousal: uncertain = deeper inference (Seth 2021)
-        if arousal > self._arousal_diversity_threshold:
+        # Suppressed for no_arousal condition — arousal signal is absent.
+        if (self._ablation_mode != AblationMode.NO_AROUSAL
+                and arousal > self._arousal_diversity_threshold):
             return "full", "high_arousal"
 
         drive_batch: Optional[DriveSignalBatch] = context.get("drive_batch")
@@ -342,8 +362,19 @@ class PolicyGenerator:
         fe_scores: Dict[str, float] = context.get("free_energy_scores", {})
         av: Optional[ArousalValence] = context.get("arousal_valence")
 
-        # Compact drive summary — just urgency values, sorted descending
-        if drive_batch and drive_batch.signals:
+        mode = self._ablation_mode
+
+        # Drive section: computed urgency vs. raw homeostatic values
+        if mode in (AblationMode.LLM_ONLY, AblationMode.NO_INTEROCEPTIVE):
+            # Show raw physiological values — no computed urgency signal
+            current_state = context.get("current_state")
+            if current_state and current_state.homeostasis:
+                sat = current_state.homeostasis.saturation or 0.0
+                health = current_state.homeostasis.health or 0.0
+                drives_compact = f"  (raw) sat={sat:.2f} health={health:.2f}"
+            else:
+                drives_compact = "  (raw) unavailable"
+        elif drive_batch and drive_batch.signals:
             top = sorted(drive_batch.signals, key=lambda s: s.urgency, reverse=True)[:3]
             drives_compact = "  " + "  ".join(
                 f"{s.channel_id}={s.urgency:.2f}" for s in top
@@ -351,8 +382,13 @@ class PolicyGenerator:
         else:
             drives_compact = "  (none)"
 
-        arousal = av.arousal if av else 0.0
-        valence = av.valence if av else 0.0
+        # Arousal/valence: absent for llm_only and no_arousal conditions
+        if mode in (AblationMode.LLM_ONLY, AblationMode.NO_AROUSAL):
+            arousal = 0.0
+            valence = 0.0
+        else:
+            arousal = av.arousal if av else 0.0
+            valence = av.valence if av else 0.0
 
         # Directional raycast summary — shows all food directions simultaneously.
         raycast_hits = context.get("raycast_hits") or []
@@ -402,14 +438,28 @@ class PolicyGenerator:
             raycast_line = "no data"
 
         # EFE scores — sorted descending so the top action is obvious
-        fe_sorted = sorted(fe_scores.items(), key=lambda x: x[1], reverse=True)
-        fe_line = "  " + "  ".join(f"{pid}={score:.3f}" for pid, score in fe_sorted)
+        # Omitted for llm_only (LLM sees only raw state + raycasts)
+        if mode != AblationMode.LLM_ONLY:
+            fe_sorted = sorted(fe_scores.items(), key=lambda x: x[1], reverse=True)
+            fe_line = "  " + "  ".join(f"{pid}={score:.3f}" for pid, score in fe_sorted)
+            efe_block = f"EFE (higher=prefer): {fe_line}\n\n"
+        else:
+            efe_block = ""
+
+        # Arousal/valence line — omitted for llm_only and no_arousal
+        if mode in (AblationMode.LLM_ONLY, AblationMode.NO_AROUSAL):
+            av_line = ""
+        else:
+            av_line = f"  arousal={arousal:.2f}  valence={valence:.2f}\n"
+
+        # Drive header label differs by mode
+        drive_header = "HOMEOSTASIS" if mode in (AblationMode.LLM_ONLY, AblationMode.NO_INTEROCEPTIVE) else "DRIVES (urgency)"
 
         valid_ids = ", ".join(p["policy_id"] for p in policies)
 
         motor_eff = float(context.get("motor_efficiency", 1.0))
         stuck_steps = int(context.get("stuck_steps", 0))
-        if motor_eff < 0.3 and stuck_steps >= 5:
+        if motor_eff < 0.3 and stuck_steps >= 5 and mode != AblationMode.LLM_ONLY:
             turn_scores = {k: v for k, v in fe_scores.items() if k in ("turn_left", "turn_right")}
             preferred_turn = max(turn_scores, key=turn_scores.get) if turn_scores else "turn_right"
             stuck_line = f"STUCK: Agent not moving. EFE favours {preferred_turn} — choose it.\n"
@@ -419,11 +469,11 @@ class PolicyGenerator:
         return (
             f"Step {step}. Choose the best action.\n"
             f"Valid: {valid_ids}\n\n"
-            f"DRIVES (urgency): {drives_compact}\n"
-            f"  arousal={arousal:.2f}  valence={valence:.2f}\n"
+            f"{drive_header}: {drives_compact}\n"
+            f"{av_line}"
             f"RAYCAST: {raycast_line}\n"
             f"{stuck_line}"
-            f"EFE (higher=prefer): {fe_line}\n\n"
+            f"{efe_block}"
             f"Reply on one line: action_name: your reason\n"
         )
 
@@ -447,23 +497,42 @@ class PolicyGenerator:
 
         Output: REASON: <one sentence>\nACTION: <policy_id>
         """
+        mode = self._ablation_mode
         drive_batch: Optional[DriveSignalBatch] = context.get("drive_batch")
         pe_batch: Optional[PredictionErrorBatch] = context.get("pe_batch")
         av: Optional[ArousalValence] = context.get("arousal_valence")
         fe_scores: Dict[str, float] = context.get("free_energy_scores", {})
 
         # --- Step 1: interoceptive drives ---
-        arousal = av.arousal if av else 0.0
-        valence = av.valence if av else 0.0
-        if drive_batch:
+        # For no_arousal and llm_only: arousal/valence are absent from the prompt
+        if mode in (AblationMode.LLM_ONLY, AblationMode.NO_AROUSAL):
+            arousal = 0.0
+            valence = 0.0
+        else:
+            arousal = av.arousal if av else 0.0
+            valence = av.valence if av else 0.0
+
+        # For llm_only and no_interoceptive: replace computed urgency with raw values
+        if mode in (AblationMode.LLM_ONLY, AblationMode.NO_INTEROCEPTIVE):
+            current_state = context.get("current_state")
+            if current_state and current_state.homeostasis:
+                sat = current_state.homeostasis.saturation or 0.0
+                health = current_state.homeostasis.health or 0.0
+                drive_lines = f"  (raw) sat={sat:.2f}  health={health:.2f}"
+            else:
+                drive_lines = "  (raw) unavailable"
+            intero_header = "HOMEOSTASIS (raw values — no urgency computed)"
+        elif drive_batch:
             signals = sorted(drive_batch.signals, key=lambda s: s.urgency, reverse=True)
             drive_lines = "\n".join(
                 f"  {s.channel_id:<14} value={s.current_value:.2f}  urgency={s.urgency:.2f}"
                 f"  ticks_to_crit={s.ticks_to_critical if s.ticks_to_critical is not None else '∞'}"
                 for s in signals
             )
+            intero_header = "INTEROCEPTIVE STATE"
         else:
             drive_lines = "  (no drive data)"
+            intero_header = "INTEROCEPTIVE STATE"
 
         dominant_channel = drive_batch.dominant_channel if drive_batch else None
         _rc = context.get("raycast_hits")
@@ -528,26 +597,44 @@ class PolicyGenerator:
             raycast_text = "  (no raycast data this step)"
 
         # --- Step 3: EFE per action ---
-        fe_lines = []
-        for p in policies:
-            pid = p["policy_id"]
-            fe = fe_scores.get(pid, 0.0)
-            tags = ", ".join(p.get("drive_tags", [])) or "—"
-            fe_lines.append(f"  {pid:<16} EFE={fe:.3f}  drives=[{tags}]")
-        fe_text = "\n".join(fe_lines) if fe_lines else "  (no scores)"
+        # Omitted for llm_only (LLM has no access to computed free energy scores)
+        if mode != AblationMode.LLM_ONLY:
+            fe_lines = []
+            for p in policies:
+                pid = p["policy_id"]
+                fe = fe_scores.get(pid, 0.0)
+                tags = ", ".join(p.get("drive_tags", [])) or "—"
+                fe_lines.append(f"  {pid:<16} EFE={fe:.3f}  drives=[{tags}]")
+            fe_text = "\n".join(fe_lines) if fe_lines else "  (no scores)"
+            efe_section = f"""
+══ STEP 5 — EXPECTED FREE ENERGY PER ACTION ══
+{fe_text}
+  (Higher EFE = action better reduces drive deficit + prediction error)
+"""
+        else:
+            efe_section = ""
 
-        # --- Affect note ---
-        if arousal > self._arousal_diversity_threshold and valence < -0.1:
-            affect_note = (
-                f"\n  ⚠ arousal={arousal:.2f} HIGH + valence={valence:.2f} NEGATIVE"
-                "\n    Current strategy predicts high free energy — diversify away from the last action."
-            )
-        elif arousal > self._arousal_diversity_threshold:
-            affect_note = (
-                f"\n  Note: arousal={arousal:.2f} elevated — consider a novel action to reduce uncertainty."
-            )
+        # --- Affect note (suppressed for no_arousal and llm_only) ---
+        if mode not in (AblationMode.LLM_ONLY, AblationMode.NO_AROUSAL):
+            if arousal > self._arousal_diversity_threshold and valence < -0.1:
+                affect_note = (
+                    f"\n  ⚠ arousal={arousal:.2f} HIGH + valence={valence:.2f} NEGATIVE"
+                    "\n    Current strategy predicts high free energy — diversify away from the last action."
+                )
+            elif arousal > self._arousal_diversity_threshold:
+                affect_note = (
+                    f"\n  Note: arousal={arousal:.2f} elevated — consider a novel action to reduce uncertainty."
+                )
+            else:
+                affect_note = ""
         else:
             affect_note = ""
+
+        # --- Arousal/valence/affect line for Step 1 ---
+        if mode in (AblationMode.LLM_ONLY, AblationMode.NO_AROUSAL):
+            av_line = ""
+        else:
+            av_line = f"  Arousal: {arousal:.2f}  |  Valence: {valence:.2f}  |  Affect: {affect_state}\n"
 
         # --- Step 4: episodic memory ---
         episodic_text = "  (no prior episodes yet)"
@@ -577,6 +664,18 @@ class PolicyGenerator:
         else:
             stuck_note = ""
 
+        # Resolution instruction differs by mode
+        if mode == AblationMode.LLM_ONLY:
+            resolution = (
+                "  Select the action that best addresses the physiological state shown above.\n"
+                "  If food is visible in raycasts, move_forward to approach it."
+            )
+        else:
+            resolution = (
+                "  Select the action with the highest EFE score that is consistent with the perceptual evidence above.\n"
+                "  If food is visible in raycasts, move_forward has first-order pragmatic value."
+            )
+
         valid_ids = ", ".join(p["policy_id"] for p in policies)
         return f"""You are the deliberative system for a survival agent (step {step}).
 You have NO declared task. You act only to reduce allostatic drive deficits and minimise surprise.
@@ -586,10 +685,9 @@ ACTION: <policy_id>
 
 Valid policy_ids: {valid_ids}
 
-══ STEP 1 — INTEROCEPTIVE STATE ══
+══ STEP 1 — {intero_header} ══
 {drive_lines}
-  Arousal: {arousal:.2f}  |  Valence: {valence:.2f}  |  Affect: {affect_state}
-
+{av_line}
 ══ STEP 2 — EXTEROCEPTIVE / MOTOR STATE ══
   Heading:        {heading_deg:.0f}°
   Motor:          efficiency={motor_eff:.2f}  stuck_steps={context.get("stuck_steps", 0)}
@@ -601,14 +699,9 @@ Valid policy_ids: {valid_ids}
 
 ══ STEP 4 — EPISODIC MEMORY (similar past situations — context only) ══
 {episodic_text}
-
-══ STEP 5 — EXPECTED FREE ENERGY PER ACTION ══
-{fe_text}
-  (Higher EFE = action better reduces drive deficit + prediction error)
-
+{efe_section}
 ══ STEP 6 — ALLOSTATIC RESOLUTION ══
-  Select the action with the highest EFE score that is consistent with the perceptual evidence above.
-  If food is visible in raycasts, move_forward has first-order pragmatic value.{affect_note}{stuck_note}
+  {resolution}{affect_note}{stuck_note}
 
 REASON: """
 

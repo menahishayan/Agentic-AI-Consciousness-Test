@@ -39,6 +39,8 @@ from core.layers.predictive.PredictionErrorCalculator import PredictionErrorCalc
 from core.layers.predictive.WorldModelGenerator import WorldModelGenerator
 from core.llm.base import AbstractLLMClient
 from core.memory.manager import MemoryManager
+from core.models.ablation import AblationMode
+from core.models.signals import ArousalValence, DriveSignal, DriveSignalBatch
 from core.models.state import AgentState
 from core.observability.logger import RunLogger
 
@@ -139,6 +141,21 @@ class AgentLoop:
         # from its outcome (which isn't available yet at PEC call time).
         self._last_arousal: float = 0.0
 
+        # Ablation study configuration
+        ablation_cfg = config.get("ablation", {})
+        self._ablation_mode: AblationMode = AblationMode(
+            ablation_cfg.get("mode", AblationMode.FULL)
+        )
+        # Drive injection state for Probe 3 (Satiation Reorientation Latency)
+        self._injection_active: bool = False
+        self._injection_channel: str = ablation_cfg.get("drive_injection_channel", "saturation")
+        self._injection_value: float = float(ablation_cfg.get("drive_injection_value", 0.9))
+        self._injection_trigger_step: Optional[int] = (
+            int(ablation_cfg["drive_injection_step"])
+            if ablation_cfg.get("drive_injection_step") is not None
+            else None
+        )
+
     def _dbg(self, msg: str) -> None:
         """Append a debug line to this run's debug.log (line-buffered)."""
         with open(self._debug_log_path, "a", buffering=1) as _f:
@@ -216,6 +233,32 @@ class AgentLoop:
 
         t_step_start = time.monotonic()
 
+        # --- Drive injection (Probe 3 — Satiation Reorientation Latency) ---
+        # Activates at the configured step and persists: keeps the injected channel
+        # at or above the injection value for as long as the adapter's natural
+        # depletion hasn't caught up (simulates the agent eating a large meal).
+        if self._injection_trigger_step is not None and step == self._injection_trigger_step:
+            self._injection_active = True
+            self._logger.event("drive_injection", {
+                "channel": self._injection_channel,
+                "value": self._injection_value,
+                "step": step,
+            }, step=step)
+
+        if self._injection_active and state.homeostasis:
+            chan = self._injection_channel
+            if chan == "saturation":
+                current = state.homeostasis.saturation or 0.0
+                if current < self._injection_value:
+                    state.homeostasis.saturation = self._injection_value
+                    # Update composite energy too
+                    health = state.homeostasis.health or 0.0
+                    state.homeostasis.energy = self._injection_value * 0.7 + health * 0.3
+            elif chan == "health":
+                current = state.homeostasis.health or 0.0
+                if current < self._injection_value:
+                    state.homeostasis.health = self._injection_value
+
         self._workspace.clear()
 
         # --- Layer 1: Interoceptive ---
@@ -227,6 +270,23 @@ class AgentLoop:
             vitals, self._workspace, step,
             memory_depletion_rates=depletion_rates,
         )
+
+        # Ablation: no_interoceptive — drop AllostaticController output.
+        # Replace with a zero-urgency batch so FreeEnergyMinimizer and PolicyGenerator
+        # receive no pragmatic signal; raw homeostatic values still reach the LLM prompt.
+        if self._ablation_mode == AblationMode.NO_INTEROCEPTIVE:
+            zero_signals = [
+                DriveSignal(
+                    channel_id=s.channel_id,
+                    current_value=s.current_value,
+                    setpoint=s.setpoint,
+                    urgency=0.0,
+                    ticks_to_critical=None,
+                    suggested_action_tags=s.suggested_action_tags,
+                )
+                for s in drive_batch.signals
+            ]
+            drive_batch = DriveSignalBatch(signals=zero_signals)
 
         # --- Layer 2: Predictive ---
         predicted = self._world_model.predict(state, self._last_policy_id)
@@ -251,6 +311,13 @@ class AgentLoop:
             step=step,
             raycast_hits=state.perception.raycast_hits,
         )
+
+        # Ablation: no_arousal — zero the arousal/valence signal.
+        # FreeEnergyMinimizer will use arousal=0 (no LC-NE epistemic gain scaling);
+        # PolicyGenerator will not show arousal/valence in the prompt and will not
+        # promote depth to "full" due to the high-arousal trigger.
+        if self._ablation_mode == AblationMode.NO_AROUSAL:
+            av = ArousalValence(arousal=0.0, valence=0.0, learning_rate_mod=1.0)
 
         if DEBUG:
             _motor_pe_dbg = 0.0
@@ -316,6 +383,12 @@ class AgentLoop:
             area_familiarity=familiarity,
             context=context,
         )
+
+        # Ablation: no_efe — zero all EFE scores so LLM picks from uniform distribution.
+        # Tests whether EFE is doing real work vs. the LLM picking correctly anyway.
+        if self._ablation_mode == AblationMode.NO_EFE:
+            fe_scores = {pid: 0.0 for pid in fe_scores}
+
         context["free_energy_scores"] = fe_scores
 
         # --- Layer 3: Policy selection ---
@@ -473,6 +546,7 @@ class AgentLoop:
                 "area_id": area_id,
                 "outcome_score": outcome_score,
                 "affect_state": affect_state,
+                "ablation_mode": self._ablation_mode.value,
             },
         )
 

@@ -10,7 +10,7 @@
     "simulation": {
       "arena_size": 30.0,
       "step_size": 1.0,
-      "turn_angle_deg": 33.3,
+      "turn_angle_deg": 10,
       "interaction_radius": 1.0,
       "hazard_margin": 2.0,
       "n_food": 8,
@@ -33,7 +33,7 @@
   "llm": {
     "enabled": true,
     "provider": "ollama",
-    "model": "gemma3:12b",
+    "model": "gemma3:4b",
     "base_url": "http://localhost:11434/v1",
     "temperature": 0.1,
     "max_tokens": 500,
@@ -104,5 +104,11 @@
     "log_prompts": true,
     "log_state": true,
     "log_memory": true
+  },
+  "ablation": {
+    "mode": "full",
+    "drive_injection_step": null,
+    "drive_injection_channel": "saturation",
+    "drive_injection_value": 0.9
   }
 }
