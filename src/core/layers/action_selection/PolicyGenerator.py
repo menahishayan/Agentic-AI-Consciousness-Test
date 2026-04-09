@@ -280,10 +280,13 @@ class PolicyGenerator:
                 prompt = self._build_fast_prompt(policies, context, step)
                 max_tokens = 20  # only "ACTION: <id>" needed
 
+            # Full CoT: temperature=0.1 allows mild sampling diversity under deliberation.
+            # Fast prompt: temperature=0.0 — exploit the confident prior.
+            temperature = 0.1 if depth == "full" else 0.0
             request = LLMRequest(
                 messages=[LLMMessage(role="user", content=prompt)],
                 max_tokens=max_tokens,
-                temperature=0.0,
+                temperature=temperature,
             )
 
             t0 = time.monotonic()
@@ -403,10 +406,12 @@ class PolicyGenerator:
 
         motor_eff = float(context.get("motor_efficiency", 1.0))
         stuck_steps = int(context.get("stuck_steps", 0))
-        stuck_line = (
-            "STUCK: Agent not moving. Choose turn_left or turn_right.\n"
-            if motor_eff < 0.3 and stuck_steps >= 5 else ""
-        )
+        if motor_eff < 0.3 and stuck_steps >= 5:
+            turn_scores = {k: v for k, v in fe_scores.items() if k in ("turn_left", "turn_right")}
+            preferred_turn = max(turn_scores, key=turn_scores.get) if turn_scores else "turn_right"
+            stuck_line = f"STUCK: Agent not moving. EFE favours {preferred_turn} — choose it.\n"
+        else:
+            stuck_line = ""
 
         return (
             f"Step {step}. Output exactly one line: ACTION: <policy_id>\n"
@@ -562,6 +567,13 @@ class PolicyGenerator:
                 except Exception:
                     pass
 
+        if motor_eff < 0.3 and context.get("stuck_steps", 0) >= 5:
+            turn_scores = {k: v for k, v in fe_scores.items() if k in ("turn_left", "turn_right")}
+            preferred_turn = max(turn_scores, key=turn_scores.get) if turn_scores else "turn_right"
+            stuck_note = f"\n  ⚠ STUCK {context.get('stuck_steps', 0)} steps — EFE selects {preferred_turn}."
+        else:
+            stuck_note = ""
+
         valid_ids = ", ".join(p["policy_id"] for p in policies)
         return f"""You are the deliberative system for a survival agent (step {step}).
 You have NO declared task. You act only to reduce allostatic drive deficits and minimise surprise.
@@ -593,7 +605,7 @@ Valid policy_ids: {valid_ids}
 
 ══ STEP 6 — ALLOSTATIC RESOLUTION ══
   Select the action with the highest EFE score that is consistent with the perceptual evidence above.
-  If food is visible in raycasts, move_forward has first-order pragmatic value.{affect_note}{f"{chr(10)}  ⚠ STUCK: Agent not moving. Choose turn_left or turn_right." if motor_eff < 0.3 and context.get('stuck_steps', 0) >= 5 else ""}
+  If food is visible in raycasts, move_forward has first-order pragmatic value.{affect_note}{stuck_note}
 
 REASON: """
 

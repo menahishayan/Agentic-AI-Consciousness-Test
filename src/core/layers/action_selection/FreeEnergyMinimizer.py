@@ -161,6 +161,18 @@ class FreeEnergyMinimizer:
         valence = float(context.get("valence", 0.0)) if context else 0.0
         valence_precision = max(0.7, min(1.3, 1.0 - 0.3 * valence))
 
+        # LC-NE gain: arousal scales epistemic weight (Aston-Jones & Cohen 2005).
+        # High arousal = tonic LC → shift exploitation→exploration.
+        # lc_ne_gain=0.4: arousal=1.0 → ×1.4 on epistemic weight.
+        arousal = float(context.get("arousal", 0.0)) if context else 0.0
+        lc_ne_gain = 0.4
+        w_epistemic_eff = self._w_epistemic * (1.0 + arousal * lc_ne_gain)
+
+        # Recency penalty: motor habituation.
+        # Uses last 4 recent_actions; fires if a policy_id appears ≥2 times.
+        recent_actions: list = context.get("recent_actions", []) if context else []
+        _recent_window = recent_actions[-4:] if len(recent_actions) >= 4 else recent_actions
+
         # Motor failure penalty: if the last action failed (efficiency < 0.3),
         # scale its EFE to discourage repeating a blocked action.
         motor_eff = float(context.get("motor_efficiency", 1.0)) if context else 1.0
@@ -205,7 +217,11 @@ class FreeEnergyMinimizer:
                 self._stuck_turn_streak = 0
             self._stuck_turn_angle = current_food_angle
         else:
-            self._stuck_turn_streak = 0
+            # Only reset if the non-turn action actually moved (motor_eff > 0.3).
+            # A failed move_forward (motor_eff < 0.3) doesn't clear the turn streak —
+            # the agent is still stuck, just tried a different action.
+            if motor_eff > 0.3:
+                self._stuck_turn_streak = 0
             self._stuck_turn_angle = current_food_angle
         _turn_bonus_scale = 0.5 if self._stuck_turn_streak >= 5 else 1.0
 
@@ -259,9 +275,15 @@ class FreeEnergyMinimizer:
 
             combined = (
                 pragmatic * self._w_pragmatic * valence_precision
-                + epistemic * self._w_epistemic
+                + epistemic * w_epistemic_eff
                 - motor_cost * self._w_motor_cost
             )
+
+            # Recency penalty: suppress recently-repeated actions.
+            # Threshold=2: fires after the action appears twice in the last 4 steps.
+            # 0.25 penalty is large enough to flip a marginal EFE winner.
+            if _recent_window.count(pid) >= 2:
+                combined -= 0.25
 
             # Food-proximity bonus via window-based per-action method.
             # Close food (dist < 0.10): alignment irrelevant — just move.
