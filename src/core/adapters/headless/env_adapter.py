@@ -13,10 +13,10 @@ Ray geometry:
   7 synthetic raycasts at the same angles used by the Animal AI
   RayPerceptionSensorComponent3D (raysPerSide=3, centre-first ordering):
     [0.0°, +23.3°, -23.3°, +46.6°, -46.6°, +70.0°, -70.0°]
-  Each ray reports the first object hit (food or wall) within max_ray_range.
+  Each ray reports the first object hit within max_ray_range.
   Distance is normalised to [0, 1] (0 = at agent, 1 = max range / no hit).
   hit_tag uses the same canonical strings as observation_mapper.py:
-    "GoodGoal", "wall", or None.
+    "GoodGoal", "BadGoal", "wall", or None.
 
 Motor efficiency:
   For move_forward / move_backward: actual displacement / step_size.
@@ -111,6 +111,14 @@ class FoodItem:
         self.consumed = False
 
 
+class BadGoalItem:
+    """Persistent hazard — never consumed, applies damage each step agent is in range."""
+    def __init__(self, x: float, z: float, damage: float = 0.3):
+        self.x = x
+        self.z = z
+        self.damage = damage
+
+
 class HeadlessSimAdapter(AbstractEnvironmentAdapter):
     """
     Pure Python simulation of an Animal AI-like food-finding arena.
@@ -132,6 +140,8 @@ class HeadlessSimAdapter(AbstractEnvironmentAdapter):
         self._interaction_radius: float = float(sim.get("interaction_radius", 2.0))
         self._hazard_margin: float = float(sim.get("hazard_margin", 2.0))
         self._n_food: int = int(sim.get("n_food", 5))
+        self._n_badgoal: int = int(sim.get("n_badgoal", 0))
+        self._badgoal_damage: float = float(sim.get("badgoal_damage", 0.3))
         self._seed: Optional[int] = sim.get("seed")
 
         # Max ray range for synthetic raycasts — use arena diagonal to cover
@@ -155,8 +165,9 @@ class HeadlessSimAdapter(AbstractEnvironmentAdapter):
         self._heading: float = 0.0   # radians, 0 = +z direction
         self._step_count: int = 0
 
-        # Food items
+        # Food and hazard items
         self._food: List[FoodItem] = []
+        self._badgoals: List[BadGoalItem] = []
 
         # Terrain novelty tracking: set of visited grid cells
         self._visited: set = set()
@@ -183,6 +194,7 @@ class HeadlessSimAdapter(AbstractEnvironmentAdapter):
         self._homeostatic.reset()
         self._visited.clear()
         self._food = self._spawn_food()
+        self._badgoals = self._spawn_bad_goals()
         self._motor_efficiency = 1.0
         self._stuck_steps = 0
         self._last_consumed_positions = []
@@ -259,9 +271,14 @@ class HeadlessSimAdapter(AbstractEnvironmentAdapter):
 
     def estimate_threat_proximity(self, state: AgentState) -> float:
         dist_to_wall = min(self._x, self._z, self._arena_size - self._x, self._arena_size - self._z)
-        if dist_to_wall < self._hazard_margin:
-            return float(1.0 - dist_to_wall / self._hazard_margin)
-        return 0.0
+        wall_threat = float(1.0 - dist_to_wall / self._hazard_margin) if dist_to_wall < self._hazard_margin else 0.0
+        if self._badgoals:
+            bg_radius = self._interaction_radius * 3.0
+            min_bg_dist = min(self._dist(b.x, b.z) for b in self._badgoals)
+            bg_threat = float(1.0 - min_bg_dist / bg_radius) if min_bg_dist < bg_radius else 0.0
+        else:
+            bg_threat = 0.0
+        return max(wall_threat, bg_threat)
 
     def build_area_id(self, state: AgentState) -> str:
         gx = int(self._x / 5.0)
@@ -279,8 +296,10 @@ class HeadlessSimAdapter(AbstractEnvironmentAdapter):
         return 0.1
 
     def get_goal_positions(self) -> List[Dict]:
-        """Return all food (GoodGoal) positions for the current episode."""
-        return [{"type": "GoodGoal", "x": f.x, "z": f.z} for f in self._food]
+        """Return all goal positions (GoodGoal and BadGoal) for the current episode."""
+        result = [{"type": "GoodGoal", "x": f.x, "z": f.z} for f in self._food]
+        result += [{"type": "BadGoal", "x": b.x, "z": b.z} for b in self._badgoals]
+        return result
 
     # ------------------------------------------------------------------
     # Internal simulation
@@ -318,6 +337,12 @@ class HeadlessSimAdapter(AbstractEnvironmentAdapter):
                 food.consumed = True
                 reward += food.value
                 self._last_consumed_positions.append({"x": food.x, "z": food.z})
+
+        # Bad goal penalty: persistent hazard objects — apply damage each step in range.
+        # Not consumed; agent must actively avoid them.
+        for bg in self._badgoals:
+            if self._dist(bg.x, bg.z) <= self._interaction_radius:
+                reward -= bg.damage
 
         # Hazard zone
         dist_to_wall = min(
@@ -379,6 +404,19 @@ class HeadlessSimAdapter(AbstractEnvironmentAdapter):
                     if best_food_t is None or along < best_food_t:
                         best_food_t = along
 
+            # --- Bad goal detection ---
+            best_bad_t: Optional[float] = None
+            for bg in self._badgoals:
+                bgx = bg.x - self._x
+                bgz = bg.z - self._z
+                along = bgx * dx + bgz * dz
+                if along <= 0.0:
+                    continue
+                perp = abs(bgx * dz - bgz * dx)
+                if perp < self._ray_food_width:
+                    if best_bad_t is None or along < best_bad_t:
+                        best_bad_t = along
+
             # --- Wall detection ---
             # Ray: (self._x + t*dx, self._z + t*dz)
             # Planes: x=0, x=arena_size, z=0, z=arena_size
@@ -395,10 +433,17 @@ class HeadlessSimAdapter(AbstractEnvironmentAdapter):
                 if 0.0 < t < wall_t:
                     wall_t = t
 
-            # --- Determine hit ---
-            if best_food_t is not None and best_food_t < wall_t:
+            # --- Determine hit (food > bad goal > wall) ---
+            closest_t = min(
+                t for t in (best_food_t, best_bad_t, wall_t)
+                if t is not None
+            ) if any(t is not None for t in (best_food_t, best_bad_t)) else wall_t
+            if best_food_t is not None and best_food_t <= closest_t:
                 hit_tag: Optional[str] = "GoodGoal"
                 raw_dist = best_food_t
+            elif best_bad_t is not None and best_bad_t <= closest_t:
+                hit_tag = "BadGoal"
+                raw_dist = best_bad_t
             elif wall_t < self._max_ray_range:
                 hit_tag = "wall"
                 raw_dist = wall_t
@@ -425,6 +470,30 @@ class HeadlessSimAdapter(AbstractEnvironmentAdapter):
             fx = self._rng.uniform(margin, self._arena_size - margin)
             fz = self._rng.uniform(margin, self._arena_size - margin)
             items.append(FoodItem(fx, fz, value=1.0))
+        return items
+
+    def _spawn_bad_goals(self) -> List[BadGoalItem]:
+        """Spawn BadGoal items at episode start. They persist for the full episode.
+
+        Placement constraints:
+          - Inside arena (clear of hazard margin)
+          - At least interaction_radius * 4 from agent start (arena centre)
+            so the agent is never spawned on a bad goal
+        """
+        if self._n_badgoal <= 0:
+            return []
+        margin = self._hazard_margin + 1.0
+        center_x = self._arena_size / 2.0
+        center_z = self._arena_size / 2.0
+        min_from_center = self._interaction_radius * 4.0
+        items = []
+        for _ in range(self._n_badgoal):
+            for _ in range(100):
+                bx = self._rng.uniform(margin, self._arena_size - margin)
+                bz = self._rng.uniform(margin, self._arena_size - margin)
+                if math.sqrt((bx - center_x) ** 2 + (bz - center_z) ** 2) >= min_from_center:
+                    break
+            items.append(BadGoalItem(bx, bz, self._badgoal_damage))
         return items
 
     def _build_state(self, reward: float) -> AgentState:

@@ -14,7 +14,7 @@
       "turn_angle_deg": 10,
       "interaction_radius": 1.0,
       "hazard_margin": 2.0,
-      "n_food": 8,
+      "n_food": 6,
       "seed": null
     },
     "arena_config": "animalai_configs/basic_food.yaml",
