@@ -425,6 +425,22 @@ class AgentLoop:
         if len(self._recent_actions) > 10:
             self._recent_actions.pop(0)
 
+        # Fix 1: log every positive reward from Animal AI.
+        # Fires even when the contact happens mid-turn (physics frames between decisions).
+        _raw_reward = float(next_state.raw_metadata.get("raw_reward", 0.0))
+        if _raw_reward > 0.0:
+            _prev_rc = prev_state.perception.raycast_hits or []
+            _food_rc = [r for r in _prev_rc if r.get("hit_tag") in ("GoodGoal", "GoodGoalMulti")]
+            self._logger.event("food_collected", {
+                "raw_reward": _raw_reward,
+                "action": selected_id,
+                "food_ray_dist_before": _food_rc[0].get("distance") if _food_rc else None,
+                "saturation_before": round(float(prev_state.homeostasis.saturation or 0.0), 4),
+                "saturation_after": round(float(next_state.homeostasis.saturation or 0.0), 4),
+                "health_before": round(float(prev_state.homeostasis.health or 0.0), 4),
+                "health_after": round(float(next_state.homeostasis.health or 0.0), 4),
+            }, step=step)
+
         # --- Layer 2: World model learning ---
         self._world_model.update(
             prev_state=prev_state,
@@ -438,6 +454,11 @@ class AgentLoop:
         self._memory.record_state(next_state, action=selected_id)
         self._memory.update_state_outcome(next_state)
         self._memory.record_prediction_error(next_state, pe_batch, action=selected_id)
+        self._logger.memory_op("pe_recorded", {
+            "pe_mean": round(pe_batch.mean_magnitude, 4),
+            "area_id": next_state.perception.area_id or "unknown",
+            "action": selected_id,
+        }, step=step)
 
         # Outcome score: drive-relief based.
         #
@@ -529,6 +550,11 @@ class AgentLoop:
             drive_signals={s.channel_id: s.urgency for s in drive_batch.signals},
             notes=situation_note,
         )
+        self._logger.memory_op("trace_stored", {
+            "policy_id": selected_id,
+            "outcome_score": round(outcome_score, 4),
+            "notes": situation_note,
+        }, step=step)
         self._memory.record_episode_outcome(
             selected_id,
             score=outcome_score,

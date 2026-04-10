@@ -282,8 +282,23 @@ class FreeEnergyMinimizer:
             # Recency penalty: suppress recently-repeated actions.
             # Threshold=2: fires after the action appears twice in the last 4 steps.
             # 0.25 penalty is large enough to flip a marginal EFE winner.
+            #
+            # Exemption: purposeful food approach — all three must hold simultaneously:
+            #   1. action is move_forward
+            #   2. agent is physically making progress (motor_eff > 0.3)
+            #   3. food is directly ahead (food_ray within ±20° forward window)
+            # A wall-running agent fails (3): food_ray is None or outside the window.
+            # Forward-backward oscillation without food ahead also fails (3).
+            # The motor failure penalty (below) already handles the wall-stuck case.
             if _recent_window.count(pid) >= 2:
-                combined -= 0.25
+                food_approach = (
+                    pid == "move_forward"
+                    and motor_eff > 0.3
+                    and food_ray is not None
+                    and abs(float(food_ray.get("angle_deg", 90))) < 20
+                )
+                if not food_approach:
+                    combined -= 0.25
 
             # Food-proximity bonus via window-based per-action method.
             # Close food (dist < 0.10): alignment irrelevant — just move.
