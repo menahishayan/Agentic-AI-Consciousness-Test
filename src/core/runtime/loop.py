@@ -639,7 +639,6 @@ class AgentLoop:
             step=step,
             health=next_state.homeostasis.health or 0.0,
             saturation=next_state.homeostasis.saturation or 0.0,
-            energy=next_state.homeostasis.energy or 0.0,
             arousal=av.arousal,
             valence=av.valence,
             pe_mean=pe_batch.mean_magnitude,
@@ -652,6 +651,9 @@ class AgentLoop:
                 "outcome_score": outcome_score,
                 "affect_state": affect_state,
                 "ablation_mode": self._ablation_mode.value,
+                "interoceptive_confidence": round(
+                    float(context.get("interoceptive_confidence", 0.5)), 4
+                ),
             },
         )
 
