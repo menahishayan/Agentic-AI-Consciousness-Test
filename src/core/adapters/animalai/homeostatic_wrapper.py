@@ -49,7 +49,7 @@ class HomeostaticWrapper:
         self.death_threshold: float = float(hc.get("death_threshold", 0.0))
 
         # Internal state
-        self._health: float = 0.5
+        self._health: float = 0.75
         self._saturation: float = 0.5
 
     # ------------------------------------------------------------------
