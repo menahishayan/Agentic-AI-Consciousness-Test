@@ -2,20 +2,27 @@
 PolicyGenerator — Layer 3, Action Selection & Agency
 
 Synchronous tiered-depth model:
-  Every step — LLM is called synchronously.
+  Every step — LLM is called synchronously (or bypassed, see below).
   Depth is modulated by arousal and drive state:
-    "fast"  → 2-section prompt (~100 tokens), ACTION only, < 1s on gemma3:4b
-    "full"  → full CoT prompt with episodic memory, REASON + ACTION
+    "efe_argmax" → bypass LLM entirely; return argmax(EFE scores) directly.
+                   High tonic LC-NE suppresses prefrontal deliberation;
+                   deliberating over a high-error generative model adds
+                   latency without improving the decision (stressed-animal fast-act).
+    "fast"       → 2-section prompt (~100 tokens), ACTION only, < 1s on gemma3:4b
+    "full"       → full CoT prompt with episodic memory, REASON + ACTION
 
-Depth = "full" when any of:
-  1. arousal > arousal_diversity_threshold  (high uncertainty = deeper inference)
+"efe_argmax" when:
+  1. arousal > arousal_diversity_threshold  (high LC-NE → bypass deliberation)
+
+"full" when (and arousal is below threshold):
   2. drive conflict  (2+ channels above conflict_threshold)
   3. sustained PE streak  (world model is wrong and stuck)
   4. skill gap  (high urgency, no policy covers the dominant drive)
 
-Fallback: if LLM times out (> 1.5 s) or fails, use argmax(EFE scores).
-This maps cleanly onto Seth: high arousal = high precision on surprise signal
-= deeper inference. Low arousal = confident prior = shallow reflex.
+Fallback: if LLM times out or fails, use argmax(EFE scores).
+Seth (2021): arousal modulates interoceptive prediction precision — but high
+arousal suppresses, not deepens, deliberative inference. Regulatory slack
+(low-to-medium arousal + competing drives) is the condition that warrants CoT.
 
 No game-specific logic. No adapter imports.
 """
@@ -189,6 +196,21 @@ class PolicyGenerator:
 
         depth, reason = self._depth(context)
 
+        # High-arousal fast path: bypass LLM, go straight to EFE argmax.
+        # High tonic LC-NE suppresses prefrontal deliberation — invoking the LLM
+        # here adds latency without improving the decision. This also makes the
+        # EFE_ONLY ablation a meaningful comparison: both conditions now use the
+        # same argmax path under high arousal.
+        if depth == "efe_argmax":
+            selected = max(fe_scores, key=lambda k: fe_scores[k]) if fe_scores else "idle"
+            workspace.publish(AgentMessage(
+                sender="PolicyGenerator",
+                kind="policy_proposal",
+                payload={"selected": selected, "depth": "efe_argmax", "trigger": reason, "step": step},
+                step=step,
+            ))
+            return selected
+
         result = self._call_llm_sync(policies, goals, context, step, depth=depth, trigger_reason=reason)
         selected = result[0] if result is not None else None
 
@@ -229,24 +251,28 @@ class PolicyGenerator:
         """
         Determine inference depth for this step.
 
-        Returns (depth, reason) where depth is "fast" or "full".
+        Returns (depth, reason) where depth is "efe_argmax", "fast", or "full".
 
-        Conditions that promote to full CoT:
-          1. High arousal  — precision on surprise exceeds prior confidence
+        "efe_argmax" — bypass LLM:
+          1. High arousal — tonic LC-NE suppresses prefrontal deliberation;
+                            act fast from the EFE prior, don't deliberate over
+                            a high-error generative model.
+
+        "full" CoT (only when arousal is below threshold):
           2. Drive conflict — competing drives need active arbitration
-          3. PE streak     — world model is systematically wrong
-          4. Skill gap     — high urgency drive has no matching policy
+          3. PE streak      — world model is systematically wrong
+          4. Skill gap      — high urgency drive has no matching policy
         """
         if self._llm is None:
             return "fast", "no_llm"
 
         arousal = float(context.get("arousal", 0.0))
 
-        # 1. High arousal: uncertain = deeper inference (Seth 2021)
-        # Suppressed for no_arousal condition — arousal signal is absent.
+        # 1. High arousal → EFE argmax, bypass LLM entirely.
+        # Suppressed for no_arousal ablation — arousal signal is zeroed out.
         if (self._ablation_mode != AblationMode.NO_AROUSAL
                 and arousal > self._arousal_diversity_threshold):
-            return "full", "high_arousal"
+            return "efe_argmax", "high_arousal"
 
         drive_batch: Optional[DriveSignalBatch] = context.get("drive_batch")
 
