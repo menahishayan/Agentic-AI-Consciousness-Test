@@ -66,16 +66,21 @@ class ArousalValenceSystem:
         # Health/saturation deliberately excluded — drive state enters only
         # via urgency_boost to keep arousal and valence orthogonal.
         self._w_threat: float = float(av.get("w_threat", 0.30))
-        self._w_pred_err: float = float(av.get("w_pred_err", 0.35))
+        # Perceptual PE is a weak arousal signal — most surprise is routed through
+        # LC-NE (motor frustration) and urgency_boost (interoceptive load) instead.
+        self._w_pred_err: float = float(av.get("w_pred_err", 0.10))
         # Threat rate-of-change: rapid onset → fast arousal spike.
         # Corr (2004): reinforcement sensitivity theory — rapid danger onset.
         self._w_threat_roc: float = float(av.get("w_threat_roc", 0.20))
         # Positive surprise: food found (resource_level jump) = arousing event.
         # Mirrors the negative-surprise PE path but for appetitive outcomes.
         self._w_food_pe: float = float(av.get("w_food_pe", 0.40))
-        # LC-NE pathway gain: sustained motor PE boosts arousal.
+        # LC-NE pathway gain: motor PE is the primary surprise channel.
         # Aston-Jones & Cohen (2005): adaptive gain theory of LC-NE.
         self._lc_ne_gain: float = float(av.get("lc_ne_gain", 0.4))
+        # Urgency boost weight: interoceptive load (drive pressure) grounds arousal
+        # in bodily state. Extracted from the hardcoded 0.15 so it's tunable.
+        self._urgency_weight: float = float(av.get("urgency_weight", 0.35))
 
         # ── Valence (RPE) parameters ─────────────────────────────────────
         # Expected passive loss per step — used to centre the RPE around 0.
@@ -83,8 +88,15 @@ class ArousalValenceSystem:
         self._health_depletion_rate: float = float(homeo.get("health_depletion_rate", 0.002))
         self._sat_depletion_rate: float = float(homeo.get("saturation_depletion_rate", 0.002))
         # Scale factor converts small per-step deltas to [-1,1] range.
-        # At default 3.0: food collection (health+0.3) → health_rpe ≈ 0.9.
-        self._rpe_scale: float = float(av.get("rpe_scale", 3.0))
+        # At 5.0: food collection (health+0.15, sat+0.20) → combined rpe ≈ 0.58,
+        # clearly dominating the negative baseline for several steps.
+        self._rpe_scale: float = float(av.get("rpe_scale", 5.0))
+        # Positive RPE decay: after food collection the positive spike persists
+        # for several steps rather than vanishing in one tick.
+        # decay=0.65 → half-life ≈ 2 steps, gone below noise by step 5.
+        self._rpe_decay: float = float(av.get("rpe_decay", 0.65))
+        # Persisted positive RPE buffer — decays each step, reset to 0 at init.
+        self._pos_rpe_buffer: float = 0.0
         # Anticipatory valence: food visible → moderate positive (incentive salience).
         # Berridge & Kringelbach (2015): wanting (incentive salience) is hedonic.
         self._anticipation_weight: float = float(av.get("anticipation_weight", 0.4))
@@ -108,15 +120,23 @@ class ArousalValenceSystem:
         # ── Anxiety: high PE without locatable source ────────────────────
         # Davis & Whalen (2001): amygdala CeA → anxious state without explicit
         # conditioned stimulus. Distinct from fear: no proximal threat detected.
-        self._anxiety_pe_threshold: float = float(av.get("anxiety_pe_threshold", 0.25))
+        # Threshold raised to 0.40 so ambient PE noise doesn't fire anxiety
+        # every step the agent isn't looking at food.
+        self._anxiety_pe_threshold: float = float(av.get("anxiety_pe_threshold", 0.40))
         self._anxiety_threat_ceiling: float = float(av.get("anxiety_threat_ceiling", 0.15))
         self._anxiety_weight: float = float(av.get("anxiety_weight", 0.20))
 
-        # ── Fatigue: energy depletion × motor struggle ───────────────────
+        # ── Fatigue: saturation depletion × motor struggle ──────────────
         # Boksem & Tops (2008): mental fatigue reduces arousal and impairs
         # valence. Unlike frustration (arousal spike), fatigue suppresses
         # arousal and adds negative valence — a dual drag on both axes.
-        self._fatigue_energy_threshold: float = float(av.get("fatigue_energy_threshold", 0.30))
+        # Grounded in saturation (metabolic substrate) rather than the
+        # composite energy variable, which was a linear function of both
+        # saturation and health and carried no independent signal.
+        # Config key accepts both names for backwards compatibility.
+        self._fatigue_saturation_threshold: float = float(
+            av.get("fatigue_saturation_threshold", av.get("fatigue_energy_threshold", 0.30))
+        )
         self._fatigue_motor_threshold: float = float(av.get("fatigue_motor_threshold", 0.20))
         self._fatigue_valence_weight: float = float(av.get("fatigue_valence_weight", 0.25))
         self._fatigue_arousal_suppression: float = float(av.get("fatigue_arousal_suppression", 0.20))
@@ -127,7 +147,8 @@ class ArousalValenceSystem:
         # is a tonic baseline, not a phasic spike.
         self._stress_ema_alpha: float = float(av.get("stress_ema_alpha", 0.05))
         self._stress_arousal_weight: float = float(av.get("stress_arousal_weight", 0.15))
-        self._stress_valence_weight: float = float(av.get("stress_valence_weight", 0.20))
+        # Reduced from 0.20 — chronic EMA drag was a structural source of negative baseline.
+        self._stress_valence_weight: float = float(av.get("stress_valence_weight", 0.10))
         self._stress_ema: float = 0.0
 
         # ── Persisted state ──────────────────────────────────────────────
@@ -172,10 +193,18 @@ class ArousalValenceSystem:
         current_resource = float(vitals.get("resource_level") or 0.0)
 
         # Tonic stress EMA: update before computing AV so it's current this step.
+        # McEwen (1998): allostatic load builds under sustained PE, but resolves
+        # when prediction errors normalise. When PE drops below a quiescence
+        # threshold, bleed the EMA back toward zero at 2× the normal rate so
+        # valence can mean-revert during genuinely calm states rather than
+        # staying chronically negative from a prior high-PE episode.
         self._stress_ema = (
             self._stress_ema_alpha * pe_mean
             + (1.0 - self._stress_ema_alpha) * self._stress_ema
         )
+        _quiescence_threshold: float = 0.25
+        if pe_mean < _quiescence_threshold:
+            self._stress_ema *= (1.0 - self._stress_ema_alpha * 2)
 
         arousal = self._compute_arousal(
             vitals, drive_batch, pe_batch, motor_pe,
@@ -254,10 +283,10 @@ class ArousalValenceSystem:
         resource_jump = max(0.0, current_resource - self._prev_resource)
         food_pe = resource_jump * self._w_food_pe
 
-        # Indirect homeostatic pressure — clamped so surplus drives don't
-        # produce negative arousal.
+        # Interoceptive load: drive urgency grounds arousal in bodily state.
+        # Clamped so surplus drives don't produce negative arousal.
         max_urgency = drive_batch.max_urgency if drive_batch else 0.0
-        urgency_boost = max(0.0, max_urgency) * 0.15
+        urgency_boost = max(0.0, max_urgency) * self._urgency_weight
 
         base_arousal = threat_comp + threat_roc_comp + pe_comp + food_pe + urgency_boost
 
@@ -268,12 +297,12 @@ class ArousalValenceSystem:
 
         raw = base_arousal + lc_ne_contribution + stress_contribution
 
-        # Fatigue suppression: low energy + sustained motor struggle → dampened
+        # Fatigue suppression: low saturation + sustained motor struggle → dampened
         # arousal. Unlike frustration which spikes arousal, fatigue saps it.
-        energy_urgency = self._energy_urgency(vitals, drive_batch)
-        if (energy_urgency > self._fatigue_energy_threshold
+        sat_urgency = self._saturation_urgency(vitals, drive_batch)
+        if (sat_urgency > self._fatigue_saturation_threshold
                 and motor_pe > self._fatigue_motor_threshold):
-            raw -= self._fatigue_arousal_suppression * min(energy_urgency, 1.0)
+            raw -= self._fatigue_arousal_suppression * min(sat_urgency, 1.0)
 
         return float(min(1.0, max(0.0, raw)))
 
@@ -315,20 +344,21 @@ class ArousalValenceSystem:
         expected_sat_delta = -self._sat_depletion_rate
 
         # Signed RPE: actual - expected. Scaled so food collection → ~1.0.
-        # food collection: delta_health≈+0.3, expected=-0.002 → rpe=(0.302)*3=0.91
-        # passive tick:    delta_health≈-0.002, expected=-0.002 → rpe≈0.0
+        # food collection: delta_health≈+0.15, expected=-0.001 → rpe=(0.151)*5=0.755
+        # passive tick:    delta_health≈-0.001, expected=-0.001 → rpe≈0.0
         health_rpe = (delta_health - expected_health_delta) * self._rpe_scale
         sat_rpe = (delta_sat - expected_sat_delta) * self._rpe_scale
 
+        # Positive RPE buffer: persist the food-collection spike for 3–5 steps so
+        # eating produces a sustained positive signal rather than a single-tick blip.
+        # Negative RPE is always instantaneous — pain should not linger.
+        pos_rpe_raw = max(0.0, health_rpe) * 0.35 + max(0.0, sat_rpe) * 0.30
+        self._pos_rpe_buffer = max(pos_rpe_raw, self._pos_rpe_buffer * self._rpe_decay)
+        neg_rpe = min(0.0, health_rpe) * 0.35 + min(0.0, sat_rpe) * 0.30
+
         # Per-channel urgency for craving and fatigue.
-        sat_urgency = 0.0
-        energy_urgency = self._energy_urgency(vitals, drive_batch)
-        max_urgency = 0.0
-        if drive_batch:
-            for s in drive_batch.signals:
-                if s.channel_id == "saturation":
-                    sat_urgency = max(0.0, s.urgency)
-            max_urgency = drive_batch.max_urgency
+        sat_urgency = self._saturation_urgency(vitals, drive_batch)
+        max_urgency = drive_batch.max_urgency if drive_batch else 0.0
 
         # Urgency-weighted anticipatory craving: food visible + hunger → wanting.
         # Berridge & Robinson (1998): incentive salience scales with deprivation.
@@ -363,32 +393,37 @@ class ArousalValenceSystem:
         # Anxiety: high PE without locatable source → diffuse dread.
         # Distinct from fear (proximal threat) and curiosity (same arousal, no
         # negative valence). Fires only when all three conditions hold:
-        #   - mean PE is elevated (unexplained prediction errors)
+        #   - mean PE exceeds recent running baseline (surprise above norm, not absolute level)
         #   - no proximal threat (otherwise this is fear)
         #   - no food visible (otherwise positive-valence explanation exists)
         anxiety = 0.0
         pe_mean = pe_batch.mean_magnitude if pe_batch else 0.0
-        if (pe_mean > self._anxiety_pe_threshold
+        pe_excess = pe_mean - stress_ema  # surprise relative to recent tonic norm
+        if (pe_excess > self._anxiety_pe_threshold
                 and threat < self._anxiety_threat_ceiling
                 and not food_detected):
-            excess = min((pe_mean - self._anxiety_pe_threshold)
-                         / max(1.0 - self._anxiety_pe_threshold, 1e-6), 1.0)
+            excess = min(pe_excess / max(self._anxiety_pe_threshold, 1e-6), 1.0)
             anxiety = -self._anxiety_weight * excess
 
-        # Fatigue: energy depletion + motor struggle → negative valence penalty.
+        # Fatigue: saturation depletion + motor struggle → negative valence penalty.
         # Complements arousal suppression; together they produce a state of
         # flagging motivation that neither fear nor frustration captures.
         fatigue_valence = 0.0
-        if (energy_urgency > self._fatigue_energy_threshold
+        if (sat_urgency > self._fatigue_saturation_threshold
                 and motor_pe > self._fatigue_motor_threshold):
-            fatigue_valence = -self._fatigue_valence_weight * min(energy_urgency, 1.0)
+            fatigue_valence = -self._fatigue_valence_weight * min(sat_urgency, 1.0)
 
         # Tonic stress: sustained high PE chronically drains valence baseline.
-        stress_penalty = -stress_ema * self._stress_valence_weight
+        # Only applied when anxiety is NOT active — both represent unexplained PE;
+        # charging both would double-count the same signal.
+        if anxiety == 0.0:
+            stress_penalty = -stress_ema * self._stress_valence_weight
+        else:
+            stress_penalty = 0.0
 
         valence_raw = (
-            health_rpe * 0.35
-            + sat_rpe * 0.30
+            self._pos_rpe_buffer
+            + neg_rpe
             + anticipation
             + threat_hit
             + frustration
@@ -399,24 +434,23 @@ class ArousalValenceSystem:
         )
         return float(max(-1.0, min(1.0, valence_raw)))
 
-    def _energy_urgency(
+    def _saturation_urgency(
         self,
         vitals: Dict[str, Optional[float]],
         drive_batch: Optional[DriveSignalBatch],
     ) -> float:
         """
-        Return energy urgency in [0, 1], preferring the drive_batch signal.
-        Falls back to 1 - vitals["energy"] when no explicit energy drive channel
-        exists (energy_urgency = 0 when drive_batch has no 'energy' channel and
-        vitals has no 'energy' key, which is the safe default).
+        Return saturation urgency in [0, 1] as the metabolic fatigue signal.
+        Saturation depletion → adenosine-like pressure → fatigue suppression.
+        Prefers drive_batch; falls back to 1 - vitals["saturation"].
         """
         if drive_batch:
             for s in drive_batch.signals:
-                if s.channel_id == "energy":
+                if s.channel_id == "saturation":
                     return max(0.0, min(1.0, s.urgency))
-        raw_energy = vitals.get("energy")
-        if raw_energy is not None:
-            return max(0.0, 1.0 - float(raw_energy))
+        raw_sat = vitals.get("saturation")
+        if raw_sat is not None:
+            return max(0.0, 1.0 - float(raw_sat))
         return 0.0
 
     def _learning_rate_mod(self, arousal: float) -> float:

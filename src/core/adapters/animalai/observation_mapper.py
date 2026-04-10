@@ -255,6 +255,7 @@ def map_obs(
             "motor_efficiency": info.get("motor_efficiency", 1.0),
             "position_delta_norm": info.get("position_delta_norm", 0.0),
             "stuck_steps": info.get("stuck_steps", 0),
+            "food_collected": info.get("food_collected", []),
         },
     )
 

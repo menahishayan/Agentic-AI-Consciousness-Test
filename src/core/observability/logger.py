@@ -9,6 +9,7 @@ Writes to src/logs/runs/<timestamp>_<run_id>/:
   memory.jsonl   — FAISS operations (gated by LOG_MEMORY)
   metrics.jsonl  — numeric per-step metrics (always on, fixed schema)
   tracebacks.jsonl — structured exceptions
+  goals.jsonl    — goal positions (GoodGoal/BadGoal) at episode start and respawns
 """
 from __future__ import annotations
 
@@ -54,6 +55,7 @@ class RunLogger:
         self._state_f = open(run_dir / "state.jsonl", "a") if log_state else None
         self._llm_f = open(run_dir / "llm.jsonl", "a") if log_prompts else None
         self._memory_f = open(run_dir / "memory.jsonl", "a") if log_memory else None
+        self._goals_f = open(run_dir / "goals.jsonl", "a")
 
         self._write_run_metadata(config)
 
@@ -78,7 +80,6 @@ class RunLogger:
         step: int,
         health: float,
         saturation: float,
-        energy: float,
         arousal: float,
         valence: float,
         pe_mean: float,
@@ -89,7 +90,6 @@ class RunLogger:
             "step": step,
             "health": round(health, 4),
             "saturation": round(saturation, 4),
-            "energy": round(energy, 4),
             "arousal": round(arousal, 4),
             "valence": round(valence, 4),
             "pe_mean": round(pe_mean, 4),
@@ -103,6 +103,10 @@ class RunLogger:
         if self._state_f:
             self._append(self._state_f, {"step": step, "state": state_obj})
 
+    def goal(self, goal_type: str, x: float, z: float, step: int = 0) -> None:
+        """Record a goal position (GoodGoal or BadGoal). Written at episode start and on respawn."""
+        self._append(self._goals_f, {"step": step, "type": goal_type, "x": round(x, 3), "z": round(z, 3)})
+
     def llm(
         self,
         prompt: str,
@@ -115,7 +119,22 @@ class RunLogger:
         selected: Optional[str] = None,
         reason: Optional[str] = None,
         step: int = 0,
+        efe_scores: Optional[Dict[str, Any]] = None,
     ) -> None:
+        """Append one LLM call record to llm.jsonl.
+
+        trigger_reason is the canonical field for inferring inference depth in
+        analysis code — do NOT add a separate "depth" field. The mapping is:
+          "normal"        → fast prompt
+          "drive_conflict"
+          "pe_streak"
+          "skill_gap"     → full CoT prompt
+          "high_arousal"  → EFE argmax (LLM bypassed; this entry is not written)
+          "no_llm"        → EFE argmax (LLM absent; this entry is not written)
+          "<reason>:efe_argmax"  → fast/full fell back to EFE argmax on timeout
+        A "depth" field would duplicate this information and silently go stale
+        whenever the trigger logic changes.
+        """
         if self._llm_f:
             entry: Dict[str, Any] = {
                 "t": time.time(),
@@ -131,6 +150,8 @@ class RunLogger:
             }
             if reason is not None:
                 entry["reason"] = reason
+            if efe_scores:
+                entry["efe_scores"] = efe_scores
             self._append(self._llm_f, entry)
 
     def memory_op(self, op: str, details: Any, step: int = 0) -> None:
@@ -162,6 +183,7 @@ class RunLogger:
             self._state_f,
             self._llm_f,
             self._memory_f,
+            self._goals_f,
         ]:
             if f:
                 try:

@@ -104,6 +104,7 @@ class AgentLoop:
             step: int,
             selected: Optional[str] = None,
             llm_reason: Optional[str] = None,
+            efe_scores: Optional[Dict[str, Any]] = None,
         ) -> None:
             logger.llm(
                 prompt=prompt,
@@ -116,6 +117,7 @@ class AgentLoop:
                 selected=selected,
                 reason=llm_reason,
                 step=step,
+                efe_scores=efe_scores,
             )
 
         self._policy_gen.set_llm_log_callback(_llm_log_cb)
@@ -140,6 +142,22 @@ class AgentLoop:
         # the arousal that was current when the action was taken, not the one computed
         # from its outcome (which isn't available yet at PEC call time).
         self._last_arousal: float = 0.0
+        # Efference copy cache: prediction computed AFTER action selection but BEFORE
+        # execution, using predict(current_state, selected_action). Retrieved at the
+        # NEXT step to compute PE against the actual observation that arrived.
+        # None on step 0 — PEC falls back to the prior EMA baseline.
+        self._last_predicted: Optional[Dict[str, Any]] = None
+
+        # Last-known-food-location buffer.
+        # Populated whenever food exits the raycast fan while saturation urgency
+        # is above threshold; cleared when food re-enters the fan or urgency drops.
+        # Injected into context as "food_memory" so FreeEnergyMinimizer can bias
+        # move_forward / turns without re-implementing the decay logic.
+        pg_cfg = config.get("policy_generator", {})
+        self._food_memory_urgency_threshold: float = float(
+            pg_cfg.get("food_memory_urgency_threshold", 0.3)
+        )
+        self._food_memory: Optional[Dict[str, Any]] = None   # {heading_to_food, steps_since_seen}
 
         # Ablation study configuration
         ablation_cfg = config.get("ablation", {})
@@ -176,6 +194,10 @@ class AgentLoop:
 
         self._current_state = self._adapter.reset()
         self._step = 0
+
+        # Log goal positions at episode start
+        for g in self._adapter.get_goal_positions():
+            self._logger.goal(g["type"], g["x"], g["z"], step=0)
 
         # Reset area familiarity for the starting position so area_novelty = 1.0
         # on step 0. This lets the epistemic value of turns dominate the urgency
@@ -301,7 +323,11 @@ class AgentLoop:
             drive_batch = DriveSignalBatch(signals=zero_signals)
 
         # --- Layer 2: Predictive ---
-        predicted = self._world_model.predict(state, self._last_policy_id)
+        # Use the efference copy prediction cached at the END of the previous step
+        # (predict(S_{t-1}, A_{t-1})) as the expected state for this observation.
+        # On step 0 self._last_predicted is None — PEC falls back to EMA baseline.
+        predicted = self._last_predicted if self._last_predicted is not None \
+            else self._world_model.predict(state, self._last_policy_id)
         area_id = state.perception.area_id or "unknown"
         familiarity = self._memory.get_area_familiarity(area_id)
         pe_batch = self._pe_calc.update(
@@ -379,6 +405,45 @@ class AgentLoop:
         # Current AgentState — used by PolicyGenerator to query episodic memory
         context["current_state"] = state
 
+        # --- Last-known-food-location buffer ---
+        # Maintain a lightweight dead-reckoning signal for the interval between
+        # food disappearing from the raycast fan and the agent reaching it.
+        # The buffer stores the absolute heading toward the last-seen food item
+        # (agent heading + relative ray angle) so that even after the food ray
+        # exits the fan, subsequent steps know which direction to bias.
+        #
+        # Update rules (in priority order):
+        #   1. Food visible + urgency active  → refresh buffer, reset counter
+        #   2. Food visible + urgency below threshold → clear buffer (just ate)
+        #   3. Food not visible + urgency active + buffer set → age counter
+        #   4. Food not visible + urgency below threshold → clear buffer
+        _food_rays = [r for r in context["raycast_hits"]
+                      if r.get("hit_tag") in ("GoodGoal", "GoodGoalMulti")]
+        _sat_urgency = next(
+            (s.urgency for s in drive_batch.signals if s.channel_id == "saturation"),
+            0.0,
+        )
+        _urgency_active = _sat_urgency >= self._food_memory_urgency_threshold
+        if _food_rays and _urgency_active:
+            # Food visible and drive active — refresh the buffer.
+            _best = min(_food_rays, key=lambda r: abs(r.get("angle_deg", 90.0)))
+            _agent_heading = float(state.position.heading or 0.0)
+            _heading_to_food = (_agent_heading + float(_best.get("angle_deg", 0.0))) % 360.0
+            self._food_memory = {
+                "heading_to_food": _heading_to_food,
+                "steps_since_seen": 0,
+            }
+        elif _food_rays and not _urgency_active:
+            # Food visible but drive satisfied — clear (agent just ate or is sated).
+            self._food_memory = None
+        elif not _food_rays and _urgency_active and self._food_memory is not None:
+            # Food lost from view, drive still active — age the buffer.
+            self._food_memory["steps_since_seen"] += 1
+        else:
+            # No food, no drive, or no prior memory — nothing to do.
+            self._food_memory = None
+        context["food_memory"] = self._food_memory   # None when buffer is empty
+
         if DEBUG:
             _rc_ctx = context["raycast_hits"]
             _food_rc = [r for r in _rc_ctx if r.get("hit_tag") in ("GoodGoal", "GoodGoalMulti")]
@@ -415,6 +480,14 @@ class AgentLoop:
         if selected_id is None:
             selected_id = "idle"
 
+        # --- Efference copy: predict before executing ---
+        # Store predict(S_t, A_t) so that at step t+1 we can compare it against
+        # the observation that actually arrives. This is the self-caused / externally-
+        # caused distinction: PE computed from an efference copy prediction flags
+        # deviations from what the agent's own action was expected to produce, not
+        # deviations from an action-agnostic prior.
+        self._last_predicted = self._world_model.predict(state, selected_id)
+
         # --- Execute action ---
         prev_state = state
         next_state, done = self._motor.execute(selected_id)
@@ -424,6 +497,44 @@ class AgentLoop:
         self._recent_actions.append(selected_id)
         if len(self._recent_actions) > 10:
             self._recent_actions.pop(0)
+
+        # Log food collection events with position data for grid map visualization.
+        # AnimalAI: fires on raw_reward > 0; headless: fires from food_collected in raw_metadata.
+        _raw_reward = float(next_state.raw_metadata.get("raw_reward", 0.0))
+        _meta_collected = list(next_state.raw_metadata.get("food_collected") or [])
+        if _raw_reward > 0.0:
+            _prev_rc = prev_state.perception.raycast_hits or []
+            _food_rc = [r for r in _prev_rc if r.get("hit_tag") in ("GoodGoal", "GoodGoalMulti")]
+            _collect_pos = _meta_collected[0] if _meta_collected else None
+            self._logger.event("food_collected", {
+                "raw_reward": _raw_reward,
+                "action": selected_id,
+                "x": _collect_pos["x"] if _collect_pos else None,
+                "z": _collect_pos["z"] if _collect_pos else None,
+                "food_ray_dist_before": _food_rc[0].get("distance") if _food_rc else None,
+                "saturation_before": round(float(prev_state.homeostasis.saturation or 0.0), 4),
+                "saturation_after": round(float(next_state.homeostasis.saturation or 0.0), 4),
+                "health_before": round(float(prev_state.homeostasis.health or 0.0), 4),
+                "health_after": round(float(next_state.homeostasis.health or 0.0), 4),
+            }, step=step)
+        elif _meta_collected:
+            # Headless adapter: food_collected carries exact positions, no raw_reward field
+            _headless_reward = float(next_state.raw_metadata.get("reward", 0.0))
+            for _fc in _meta_collected:
+                self._logger.event("food_collected", {
+                    "raw_reward": _headless_reward,
+                    "action": selected_id,
+                    "x": _fc["x"],
+                    "z": _fc["z"],
+                    "saturation_before": round(float(prev_state.homeostasis.saturation or 0.0), 4),
+                    "saturation_after": round(float(next_state.homeostasis.saturation or 0.0), 4),
+                    "health_before": round(float(prev_state.homeostasis.health or 0.0), 4),
+                    "health_after": round(float(next_state.homeostasis.health or 0.0), 4),
+                }, step=step)
+
+        # Log new goal positions when headless respawns all food
+        for _ng in (next_state.raw_metadata.get("new_goals") or []):
+            self._logger.goal(_ng["type"], _ng["x"], _ng["z"], step=step)
 
         # --- Layer 2: World model learning ---
         self._world_model.update(
@@ -438,6 +549,11 @@ class AgentLoop:
         self._memory.record_state(next_state, action=selected_id)
         self._memory.update_state_outcome(next_state)
         self._memory.record_prediction_error(next_state, pe_batch, action=selected_id)
+        self._logger.memory_op("pe_recorded", {
+            "pe_mean": round(pe_batch.mean_magnitude, 4),
+            "area_id": next_state.perception.area_id or "unknown",
+            "action": selected_id,
+        }, step=step)
 
         # Outcome score: drive-relief based.
         #
@@ -529,6 +645,11 @@ class AgentLoop:
             drive_signals={s.channel_id: s.urgency for s in drive_batch.signals},
             notes=situation_note,
         )
+        self._logger.memory_op("trace_stored", {
+            "policy_id": selected_id,
+            "outcome_score": round(outcome_score, 4),
+            "notes": situation_note,
+        }, step=step)
         self._memory.record_episode_outcome(
             selected_id,
             score=outcome_score,
@@ -546,7 +667,6 @@ class AgentLoop:
             step=step,
             health=next_state.homeostasis.health or 0.0,
             saturation=next_state.homeostasis.saturation or 0.0,
-            energy=next_state.homeostasis.energy or 0.0,
             arousal=av.arousal,
             valence=av.valence,
             pe_mean=pe_batch.mean_magnitude,
@@ -559,6 +679,9 @@ class AgentLoop:
                 "outcome_score": outcome_score,
                 "affect_state": affect_state,
                 "ablation_mode": self._ablation_mode.value,
+                "interoceptive_confidence": round(
+                    float(context.get("interoceptive_confidence", 0.5)), 4
+                ),
             },
         )
 

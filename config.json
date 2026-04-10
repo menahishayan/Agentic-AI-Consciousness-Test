@@ -1,9 +1,9 @@
 {
-  "adapter_folder": "animalai",
+  "adapter_folder": "headless",
   "adapter_config": {
     "homeostatic": {
-      "saturation_depletion_rate": 0.005,
-      "health_depletion_rate": 0.002,
+      "saturation_depletion_rate": 0.001,
+      "health_depletion_rate": 0.001,
       "food_saturation_restore": 0.2,
       "food_health_restore": 0.15,
       "death_threshold": 0.0
@@ -14,7 +14,8 @@
       "turn_angle_deg": 10,
       "interaction_radius": 1.0,
       "hazard_margin": 2.0,
-      "n_food": 8,
+      "n_food": 6,
+      "n_badgoal": 2,
       "seed": null
     },
     "arena_config": "animalai_configs/basic_food.yaml",
@@ -80,11 +81,15 @@
   },
   "arousal_valence": {
     "w_threat": 0.30,
-    "w_pred_err": 0.35,
+    "w_pred_err": 0.10,
+    "urgency_weight": 0.35,
     "w_threat_roc": 0.20,
     "w_food_pe": 0.40,
     "lc_ne_gain": 0.40,
-    "rpe_scale": 3.0,
+    "rpe_scale": 5.0,
+    "rpe_decay": 0.65,
+    "anxiety_pe_threshold": 0.40,
+    "stress_valence_weight": 0.10,
     "anticipation_weight": 0.4,
     "threat_hit_threshold": 0.3,
     "threat_hit_weight": 0.5

@@ -17,6 +17,7 @@ No game-specific logic. No adapter imports.
 from __future__ import annotations
 
 import logging
+import math
 from typing import Any, Dict, List, Optional
 
 from core.coordination.messages import AgentMessage
@@ -41,6 +42,34 @@ class MetacognitiveMonitor:
         self._high_uncertainty_threshold = 0.7
         self._critical_health_threshold = 0.15
         self._prev_goals: List[Goal] = []
+        # Interoceptive confidence parameters for Brier score calibration (D2).
+        # P(sat > threshold at t+N) = sigmoid(ticks_to_critical / N)
+        # N is the prediction horizon; threshold is the survival setpoint.
+        mc = config.get("metacognitive", {})
+        self._sat_survival_threshold: float = float(mc.get("sat_survival_threshold", 0.25))
+
+        # Calibrate horizon to the actual depletion timescale so the sigmoid
+        # spans [0.5, ~0.88] across the full viable saturation range rather
+        # than saturating in the first few dozen steps.
+        #
+        # ticks_from_setpoint_to_critical ≈ (setpoint - threshold) / depletion_rate
+        # horizon = ticks / 2 → sigmoid(ticks/horizon)=sigmoid(2)≈0.88 at full sat
+        #
+        # Reads from adapter_config.homeostatic so it tracks the actual sim rate.
+        # Falls back to mc["confidence_horizon"] if explicitly overridden, then 200.
+        if "confidence_horizon" in mc:
+            self._confidence_horizon: int = int(mc["confidence_horizon"])
+        else:
+            hc = config.get("adapter_config", {}).get("homeostatic", {})
+            sat_depletion_rate: float = float(hc.get("saturation_depletion_rate", 0.001))
+            sat_setpoint: float = float(mc.get("sat_setpoint", 0.7))
+            if sat_depletion_rate > 0.0:
+                self._confidence_horizon = max(
+                    10,
+                    int((sat_setpoint - self._sat_survival_threshold) / sat_depletion_rate / 2),
+                )
+            else:
+                self._confidence_horizon = 200
 
     def update(
         self,
@@ -65,6 +94,16 @@ class MetacognitiveMonitor:
         # Compute integrated uncertainty
         uncertainty = self._estimate_uncertainty(drive_batch, pe_batch, av)
 
+        # Interoceptive confidence: P(sat > threshold at t+N).
+        # Uses the AllostaticController's ticks_to_critical for the saturation
+        # channel as a forward projection. sigmoid(ticks / N) maps:
+        #   ticks = 0  (already critical)  → 0.50
+        #   ticks = N  (critical in N steps) → 0.73
+        #   ticks = 2N                       → 0.88
+        #   ticks = None (no depletion)      → 1.00
+        # Logged as interoceptive_confidence in metrics.jsonl for D2 Brier scoring.
+        interoceptive_confidence = self._compute_interoceptive_confidence(drive_batch)
+
         # Detect critical states
         is_critical = self._check_critical(drive_batch, vitals)
 
@@ -74,6 +113,7 @@ class MetacognitiveMonitor:
 
         assessment = {
             "uncertainty": uncertainty,
+            "interoceptive_confidence": interoceptive_confidence,
             "is_critical": is_critical,
             "goal_changed": goal_changed,
             "max_drive_urgency": drive_batch.max_urgency if drive_batch else 0.0,
@@ -101,10 +141,48 @@ class MetacognitiveMonitor:
             "arousal_valence": av,
             "vitals": vitals or {},
             "uncertainty": uncertainty,
+            "interoceptive_confidence": interoceptive_confidence,
             "is_critical": is_critical,
             "step": step,
         }
         return context
+
+    def _compute_interoceptive_confidence(
+        self,
+        drive_batch: Optional[DriveSignalBatch],
+    ) -> float:
+        """
+        Return P(sat > threshold at t+N) as a probability in [0, 1].
+
+        Derived from the AllostaticController's ticks_to_critical estimate for
+        the saturation channel via sigmoid(ticks / N):
+          - ticks_to_critical = None → no depletion forecast → confidence = 1.0
+          - ticks_to_critical = 0    → already at/below threshold → 0.50
+          - ticks_to_critical = N    → will hit threshold in exactly N steps → ~0.73
+          - ticks_to_critical >> N   → well above threshold → approaches 1.0
+
+        Emitted to metrics.jsonl as interoceptive_confidence for post-hoc Brier
+        score calibration (D2): compare expressed confidence against the binary
+        outcome (did saturation remain above sat_survival_threshold at t+N?).
+        """
+        if drive_batch is None:
+            return 0.5
+        for signal in drive_batch.signals:
+            if signal.channel_id == "saturation":
+                ticks = signal.ticks_to_critical
+                if ticks is None:
+                    # No depletion forecast (rate ≤ 0 — stable or recovering).
+                    # Rather than locking at 1.0, scale with current saturation
+                    # margin so confidence varies continuously even in healthy states.
+                    # sat=1.0 → 0.95, sat=threshold → 0.5
+                    margin = (
+                        (signal.current_value - self._sat_survival_threshold)
+                        / max(1.0 - self._sat_survival_threshold, 1e-6)
+                    )
+                    return float(min(0.95, max(0.5, margin)))
+                return float(1.0 / (1.0 + math.exp(-float(ticks) / self._confidence_horizon)))
+        # saturation channel absent (e.g. no_interoceptive ablation)
+        return 0.5
 
     def _estimate_uncertainty(
         self,

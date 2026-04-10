@@ -653,7 +653,7 @@ function buildChartGrid() {
 
     <!-- Row 2 -->
     <div class="chart-card">
-      <div class="chart-title">Drive Urgency</div>
+      <div class="chart-title">HPA-Axis Drive</div>
       <div class="chart-wrap"><canvas id="ch-urgency"></canvas></div>
     </div>
     <div class="chart-card">
@@ -666,6 +666,7 @@ function buildChartGrid() {
       <div class="chart-title">Outcome Score</div>
       <div class="chart-wrap"><canvas id="ch-outcome"></canvas></div>
     </div>
+    <!-- Row 4 -->
     <div class="chart-card">
       <div class="chart-title">Step Timing (ms)<span id="timing-avg-label" style="margin-left:10px;font-weight:400;color:var(--muted);"></span></div>
       <div class="chart-wrap"><canvas id="ch-timing"></canvas></div>
@@ -715,10 +716,9 @@ function initCharts() {
   state.charts.homeostasis = makeLineChart('ch-homeostasis', [
     ds('Health', '#50fa7b'),
     ds('Saturation', '#7c8cf8'),
-    ds('Energy', '#fbbf24'),
   ], { min: 0, max: 1 });
 
-  state.charts.arousal = makeLineChart('ch-arousal', [
+state.charts.arousal = makeLineChart('ch-arousal', [
     ds('Arousal', '#ff79c6'),
     ds('Valence', '#8be9fd'),
   ], { min: -1, max: 1 });
@@ -767,8 +767,26 @@ function initCharts() {
     });
   }
 
-  // Position scatter
-  state.charts.position = makeScatterChart('ch-position', 'Path', '#7c8cf8');
+  // Position scatter — multi-dataset: path, good goals, bad goals, food collected
+  const posCanvas = document.getElementById('ch-position');
+  if (posCanvas) {
+    const posOpts = JSON.parse(JSON.stringify(CHART_DEFAULTS));
+    posOpts.scales.x.title = { display: true, text: 'X', color: '#4b5563', font: { size: 10 } };
+    posOpts.scales.y.title = { display: true, text: 'Z', color: '#4b5563', font: { size: 10 } };
+    posOpts.plugins.legend.display = true;
+    posOpts.plugins.legend.labels = { boxWidth: 8, font: { size: 10 }, color: '#9ca3af' };
+    state.charts.position = new Chart(posCanvas, {
+      type: 'scatter',
+      data: {
+        datasets: [
+          { label: 'Path',      data: [], backgroundColor: '#7c8cf8', pointRadius: 3 },
+          { label: 'GoodGoal', data: [], backgroundColor: 'rgba(34,197,94,0.25)', borderColor: '#22c55e', borderWidth: 2, pointRadius: 9, pointStyle: 'circle', order: 0 },
+          { label: 'BadGoal',  data: [], backgroundColor: 'rgba(239,68,68,0.25)',  borderColor: '#ef4444', borderWidth: 2, pointRadius: 9, pointStyle: 'circle', order: 0 },
+        ],
+      },
+      options: posOpts,
+    });
+  }
 
   // Arousal-Valence phase portrait (Russell circumplex)
   const avCanvas = document.getElementById('ch-av-quad');
@@ -870,8 +888,8 @@ function ingestMetric(row) {
     chart.data.datasets.forEach((ds, i) => ds.data.push(vals[i] ?? null));
   }
 
-  push(state.charts.homeostasis, row.health, row.saturation, row.energy);
-  push(state.charts.arousal, row.arousal, row.valence);
+  push(state.charts.homeostasis, row.health, row.saturation);
+push(state.charts.arousal, row.arousal, row.valence);
   push(state.charts.urgency, row.drive_urgency);
   push(state.charts.pe, row.pe_mean);
   push(state.charts.outcome, row.outcome_score);
@@ -937,6 +955,15 @@ function ingestPosition(row) {
   const d = state.charts.position.data.datasets[0];
   if (!Array.isArray(d.backgroundColor)) d.backgroundColor = [];
   d.backgroundColor.push(color);
+  scheduleUpdate();
+}
+
+function ingestGoal(row) {
+  if (!state.charts.position) return;
+  if (row.x == null || row.z == null) return;
+  // dataset index 1 = GoodGoal, 2 = BadGoal
+  const dsIdx = row.type === 'BadGoal' ? 2 : 1;
+  state.charts.position.data.datasets[dsIdx].data.push({ x: row.x, y: row.z });
   scheduleUpdate();
 }
 
@@ -1117,6 +1144,7 @@ function loadBulkData(data) {
     if (row.event !== 'step') ingestEvent(row);
   }
   for (const row of data.positions || []) ingestPosition(row);
+  for (const row of data.goals || []) ingestGoal(row);
   for (const row of data.llm_calls || []) ingestLlmCall(row, false);
   if (data.run_complete) renderEpisodeStats(data.run_complete);
   if (data.run_cancelled) ingestRunCancelled(data.run_cancelled);
