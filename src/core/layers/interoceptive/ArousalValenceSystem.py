@@ -66,16 +66,21 @@ class ArousalValenceSystem:
         # Health/saturation deliberately excluded — drive state enters only
         # via urgency_boost to keep arousal and valence orthogonal.
         self._w_threat: float = float(av.get("w_threat", 0.30))
-        self._w_pred_err: float = float(av.get("w_pred_err", 0.35))
+        # Perceptual PE is a weak arousal signal — most surprise is routed through
+        # LC-NE (motor frustration) and urgency_boost (interoceptive load) instead.
+        self._w_pred_err: float = float(av.get("w_pred_err", 0.10))
         # Threat rate-of-change: rapid onset → fast arousal spike.
         # Corr (2004): reinforcement sensitivity theory — rapid danger onset.
         self._w_threat_roc: float = float(av.get("w_threat_roc", 0.20))
         # Positive surprise: food found (resource_level jump) = arousing event.
         # Mirrors the negative-surprise PE path but for appetitive outcomes.
         self._w_food_pe: float = float(av.get("w_food_pe", 0.40))
-        # LC-NE pathway gain: sustained motor PE boosts arousal.
+        # LC-NE pathway gain: motor PE is the primary surprise channel.
         # Aston-Jones & Cohen (2005): adaptive gain theory of LC-NE.
         self._lc_ne_gain: float = float(av.get("lc_ne_gain", 0.4))
+        # Urgency boost weight: interoceptive load (drive pressure) grounds arousal
+        # in bodily state. Extracted from the hardcoded 0.15 so it's tunable.
+        self._urgency_weight: float = float(av.get("urgency_weight", 0.35))
 
         # ── Valence (RPE) parameters ─────────────────────────────────────
         # Expected passive loss per step — used to centre the RPE around 0.
@@ -83,8 +88,15 @@ class ArousalValenceSystem:
         self._health_depletion_rate: float = float(homeo.get("health_depletion_rate", 0.002))
         self._sat_depletion_rate: float = float(homeo.get("saturation_depletion_rate", 0.002))
         # Scale factor converts small per-step deltas to [-1,1] range.
-        # At default 3.0: food collection (health+0.3) → health_rpe ≈ 0.9.
-        self._rpe_scale: float = float(av.get("rpe_scale", 3.0))
+        # At 5.0: food collection (health+0.15, sat+0.20) → combined rpe ≈ 0.58,
+        # clearly dominating the negative baseline for several steps.
+        self._rpe_scale: float = float(av.get("rpe_scale", 5.0))
+        # Positive RPE decay: after food collection the positive spike persists
+        # for several steps rather than vanishing in one tick.
+        # decay=0.65 → half-life ≈ 2 steps, gone below noise by step 5.
+        self._rpe_decay: float = float(av.get("rpe_decay", 0.65))
+        # Persisted positive RPE buffer — decays each step, reset to 0 at init.
+        self._pos_rpe_buffer: float = 0.0
         # Anticipatory valence: food visible → moderate positive (incentive salience).
         # Berridge & Kringelbach (2015): wanting (incentive salience) is hedonic.
         self._anticipation_weight: float = float(av.get("anticipation_weight", 0.4))
@@ -108,7 +120,9 @@ class ArousalValenceSystem:
         # ── Anxiety: high PE without locatable source ────────────────────
         # Davis & Whalen (2001): amygdala CeA → anxious state without explicit
         # conditioned stimulus. Distinct from fear: no proximal threat detected.
-        self._anxiety_pe_threshold: float = float(av.get("anxiety_pe_threshold", 0.25))
+        # Threshold raised to 0.40 so ambient PE noise doesn't fire anxiety
+        # every step the agent isn't looking at food.
+        self._anxiety_pe_threshold: float = float(av.get("anxiety_pe_threshold", 0.40))
         self._anxiety_threat_ceiling: float = float(av.get("anxiety_threat_ceiling", 0.15))
         self._anxiety_weight: float = float(av.get("anxiety_weight", 0.20))
 
@@ -133,7 +147,8 @@ class ArousalValenceSystem:
         # is a tonic baseline, not a phasic spike.
         self._stress_ema_alpha: float = float(av.get("stress_ema_alpha", 0.05))
         self._stress_arousal_weight: float = float(av.get("stress_arousal_weight", 0.15))
-        self._stress_valence_weight: float = float(av.get("stress_valence_weight", 0.20))
+        # Reduced from 0.20 — chronic EMA drag was a structural source of negative baseline.
+        self._stress_valence_weight: float = float(av.get("stress_valence_weight", 0.10))
         self._stress_ema: float = 0.0
 
         # ── Persisted state ──────────────────────────────────────────────
@@ -268,10 +283,10 @@ class ArousalValenceSystem:
         resource_jump = max(0.0, current_resource - self._prev_resource)
         food_pe = resource_jump * self._w_food_pe
 
-        # Indirect homeostatic pressure — clamped so surplus drives don't
-        # produce negative arousal.
+        # Interoceptive load: drive urgency grounds arousal in bodily state.
+        # Clamped so surplus drives don't produce negative arousal.
         max_urgency = drive_batch.max_urgency if drive_batch else 0.0
-        urgency_boost = max(0.0, max_urgency) * 0.15
+        urgency_boost = max(0.0, max_urgency) * self._urgency_weight
 
         base_arousal = threat_comp + threat_roc_comp + pe_comp + food_pe + urgency_boost
 
@@ -329,10 +344,17 @@ class ArousalValenceSystem:
         expected_sat_delta = -self._sat_depletion_rate
 
         # Signed RPE: actual - expected. Scaled so food collection → ~1.0.
-        # food collection: delta_health≈+0.3, expected=-0.002 → rpe=(0.302)*3=0.91
-        # passive tick:    delta_health≈-0.002, expected=-0.002 → rpe≈0.0
+        # food collection: delta_health≈+0.15, expected=-0.001 → rpe=(0.151)*5=0.755
+        # passive tick:    delta_health≈-0.001, expected=-0.001 → rpe≈0.0
         health_rpe = (delta_health - expected_health_delta) * self._rpe_scale
         sat_rpe = (delta_sat - expected_sat_delta) * self._rpe_scale
+
+        # Positive RPE buffer: persist the food-collection spike for 3–5 steps so
+        # eating produces a sustained positive signal rather than a single-tick blip.
+        # Negative RPE is always instantaneous — pain should not linger.
+        pos_rpe_raw = max(0.0, health_rpe) * 0.35 + max(0.0, sat_rpe) * 0.30
+        self._pos_rpe_buffer = max(pos_rpe_raw, self._pos_rpe_buffer * self._rpe_decay)
+        neg_rpe = min(0.0, health_rpe) * 0.35 + min(0.0, sat_rpe) * 0.30
 
         # Per-channel urgency for craving and fatigue.
         sat_urgency = self._saturation_urgency(vitals, drive_batch)
@@ -400,8 +422,8 @@ class ArousalValenceSystem:
             stress_penalty = 0.0
 
         valence_raw = (
-            health_rpe * 0.35
-            + sat_rpe * 0.30
+            self._pos_rpe_buffer
+            + neg_rpe
             + anticipation
             + threat_hit
             + frustration
