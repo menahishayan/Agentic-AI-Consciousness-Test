@@ -153,9 +153,9 @@ def main() -> None:
         description="Run ablation study across 6 conditions",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument("--episodes", type=int, default=10,
+    parser.add_argument("--episodes", type=int, default=5,
                         help="Episodes per condition")
-    parser.add_argument("--max-steps", type=int, default=500,
+    parser.add_argument("--max-steps", type=int, default=300,
                         help="Max steps per episode")
     parser.add_argument("--out", type=str, default="results/ablation",
                         help="Output directory for results JSON")
@@ -232,10 +232,16 @@ def main() -> None:
                      probes.get("uqcr_q4_q1", float("nan")),
                      )
 
-    # Save full results
+    # Append to existing results (load → merge → write)
     results_path = out_dir / "ablation_results.json"
+    if results_path.exists():
+        try:
+            prior = json.loads(results_path.read_text())
+            all_results = prior + all_results
+        except (json.JSONDecodeError, ValueError) as exc:
+            log.warning("Could not load existing results (%s) — starting fresh.", exc)
     results_path.write_text(json.dumps(all_results, indent=2, default=str))
-    log.info("Full results saved to %s", results_path)
+    log.info("Results saved to %s (%d total rows)", results_path, len(all_results))
 
     # Print summary table
     _print_summary(all_results, args.conditions)

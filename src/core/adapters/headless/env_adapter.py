@@ -144,6 +144,10 @@ class HeadlessSimAdapter(AbstractEnvironmentAdapter):
 
         self._rng = random.Random(self._seed)
         self._homeostatic = HomeostaticWrapper(config)
+        # Health restoration per food item consumed — headless only (Unity normally
+        # owns health; sync_health() is the seam we use to drive depletion here).
+        hc = config.get("homeostatic", {})
+        self._food_health_restore: float = float(hc.get("food_health_restore", 0.15))
 
         # Agent state
         self._x: float = 0.0
@@ -207,6 +211,17 @@ class HeadlessSimAdapter(AbstractEnvironmentAdapter):
             # The wall is still there; resetting would mask the block.
 
         self._homeostatic.step(reward, env_done=False)
+
+        # Health depletion — headless only. Unity is not available so we drive
+        # health via sync_health(), which applies health_depletion_rate each call:
+        #   new_health = proxy - health_depletion_rate
+        # Passing current health achieves passive depletion per step.
+        # Food reward adds a restoration bonus on top before the depletion is applied.
+        health_proxy = self._homeostatic.health
+        if reward > 0.0:
+            health_proxy = min(1.0, health_proxy + min(reward, 1.0) * self._food_health_restore)
+        self._homeostatic.sync_health(health_proxy)
+
         state = self._build_state(reward=reward)
         done = not self._homeostatic.is_alive
         return state, done
