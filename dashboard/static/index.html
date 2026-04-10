@@ -791,7 +791,6 @@ function initCharts() {
           { label: 'Path',      data: [], backgroundColor: '#7c8cf8', pointRadius: 3 },
           { label: 'GoodGoal', data: [], backgroundColor: 'rgba(34,197,94,0.25)', borderColor: '#22c55e', borderWidth: 2, pointRadius: 9, pointStyle: 'circle', order: 0 },
           { label: 'BadGoal',  data: [], backgroundColor: 'rgba(239,68,68,0.25)',  borderColor: '#ef4444', borderWidth: 2, pointRadius: 9, pointStyle: 'circle', order: 0 },
-          { label: 'Collected', data: [], backgroundColor: '#fbbf24', pointRadius: 6, pointStyle: 'star', order: 0 },
         ],
       },
       options: posOpts,
@@ -978,14 +977,6 @@ function ingestGoal(row) {
   scheduleUpdate();
 }
 
-function ingestFoodCollected(payload) {
-  if (!state.charts.position) return;
-  if (payload.x == null || payload.z == null) return;
-  // dataset index 3 = Collected (gold star)
-  state.charts.position.data.datasets[3].data.push({ x: payload.x, y: payload.z });
-  scheduleUpdate();
-}
-
 function ingestEvent(row) {
   const log = document.getElementById('events-log');
   if (!log) return;
@@ -1160,8 +1151,7 @@ function escHtml(s) {
 function loadBulkData(data) {
   for (const row of data.metrics || []) ingestMetric(row);
   for (const row of data.events || []) {
-    if (row.event === 'food_collected') ingestFoodCollected(row.payload || {});
-    else if (row.event !== 'step') ingestEvent(row);
+    if (row.event !== 'step') ingestEvent(row);
   }
   for (const row of data.positions || []) ingestPosition(row);
   for (const row of data.goals || []) ingestGoal(row);
@@ -1251,8 +1241,7 @@ function openRunStream(runId) {
 
   src.addEventListener('agent_event', e => {
     const row = JSON.parse(e.data);
-    if (row.event === 'food_collected') ingestFoodCollected(row.payload || {});
-    else if (row.event !== 'step') ingestEvent(row);
+    if (row.event !== 'step') ingestEvent(row);
   });
 
   src.addEventListener('position', e => {
