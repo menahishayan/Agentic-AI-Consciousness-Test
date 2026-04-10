@@ -666,11 +666,6 @@ function buildChartGrid() {
       <div class="chart-title">Outcome Score</div>
       <div class="chart-wrap"><canvas id="ch-outcome"></canvas></div>
     </div>
-    <div class="chart-card">
-      <div class="chart-title">Interoceptive Confidence P(sat &gt; threshold at t+N)</div>
-      <div class="chart-wrap"><canvas id="ch-confidence"></canvas></div>
-    </div>
-
     <!-- Row 4 -->
     <div class="chart-card">
       <div class="chart-title">Step Timing (ms)<span id="timing-avg-label" style="margin-left:10px;font-weight:400;color:var(--muted);"></span></div>
@@ -723,11 +718,7 @@ function initCharts() {
     ds('Saturation', '#7c8cf8'),
   ], { min: 0, max: 1 });
 
-  state.charts.confidence = makeLineChart('ch-confidence', [
-    ds('Interoceptive Confidence', '#fbbf24'),
-  ], { min: 0, max: 1 });
-
-  state.charts.arousal = makeLineChart('ch-arousal', [
+state.charts.arousal = makeLineChart('ch-arousal', [
     ds('Arousal', '#ff79c6'),
     ds('Valence', '#8be9fd'),
   ], { min: -1, max: 1 });
@@ -898,8 +889,7 @@ function ingestMetric(row) {
   }
 
   push(state.charts.homeostasis, row.health, row.saturation);
-  push(state.charts.confidence, row.interoceptive_confidence);
-  push(state.charts.arousal, row.arousal, row.valence);
+push(state.charts.arousal, row.arousal, row.valence);
   push(state.charts.urgency, row.drive_urgency);
   push(state.charts.pe, row.pe_mean);
   push(state.charts.outcome, row.outcome_score);
