@@ -141,6 +141,17 @@ class AgentLoop:
         # from its outcome (which isn't available yet at PEC call time).
         self._last_arousal: float = 0.0
 
+        # Last-known-food-location buffer.
+        # Populated whenever food exits the raycast fan while saturation urgency
+        # is above threshold; cleared when food re-enters the fan or urgency drops.
+        # Injected into context as "food_memory" so FreeEnergyMinimizer can bias
+        # move_forward / turns without re-implementing the decay logic.
+        pg_cfg = config.get("policy_generator", {})
+        self._food_memory_urgency_threshold: float = float(
+            pg_cfg.get("food_memory_urgency_threshold", 0.3)
+        )
+        self._food_memory: Optional[Dict[str, Any]] = None   # {heading_to_food, steps_since_seen}
+
         # Ablation study configuration
         ablation_cfg = config.get("ablation", {})
         self._ablation_mode: AblationMode = AblationMode(
@@ -378,6 +389,45 @@ class AgentLoop:
         context["raycast_hits"] = state.perception.raycast_hits or []
         # Current AgentState — used by PolicyGenerator to query episodic memory
         context["current_state"] = state
+
+        # --- Last-known-food-location buffer ---
+        # Maintain a lightweight dead-reckoning signal for the interval between
+        # food disappearing from the raycast fan and the agent reaching it.
+        # The buffer stores the absolute heading toward the last-seen food item
+        # (agent heading + relative ray angle) so that even after the food ray
+        # exits the fan, subsequent steps know which direction to bias.
+        #
+        # Update rules (in priority order):
+        #   1. Food visible + urgency active  → refresh buffer, reset counter
+        #   2. Food visible + urgency below threshold → clear buffer (just ate)
+        #   3. Food not visible + urgency active + buffer set → age counter
+        #   4. Food not visible + urgency below threshold → clear buffer
+        _food_rays = [r for r in context["raycast_hits"]
+                      if r.get("hit_tag") in ("GoodGoal", "GoodGoalMulti")]
+        _sat_urgency = next(
+            (s.urgency for s in drive_batch.signals if s.channel_id == "saturation"),
+            0.0,
+        )
+        _urgency_active = _sat_urgency >= self._food_memory_urgency_threshold
+        if _food_rays and _urgency_active:
+            # Food visible and drive active — refresh the buffer.
+            _best = min(_food_rays, key=lambda r: abs(r.get("angle_deg", 90.0)))
+            _agent_heading = float(state.position.heading or 0.0)
+            _heading_to_food = (_agent_heading + float(_best.get("angle_deg", 0.0))) % 360.0
+            self._food_memory = {
+                "heading_to_food": _heading_to_food,
+                "steps_since_seen": 0,
+            }
+        elif _food_rays and not _urgency_active:
+            # Food visible but drive satisfied — clear (agent just ate or is sated).
+            self._food_memory = None
+        elif not _food_rays and _urgency_active and self._food_memory is not None:
+            # Food lost from view, drive still active — age the buffer.
+            self._food_memory["steps_since_seen"] += 1
+        else:
+            # No food, no drive, or no prior memory — nothing to do.
+            self._food_memory = None
+        context["food_memory"] = self._food_memory   # None when buffer is empty
 
         if DEBUG:
             _rc_ctx = context["raycast_hits"]

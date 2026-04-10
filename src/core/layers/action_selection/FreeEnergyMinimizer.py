@@ -365,25 +365,49 @@ class FreeEnergyMinimizer:
                         pragmatic_scale=sat_urgency,
                     )
 
-            # Last-known-food bonus (Fix 5): when food is not currently visible but
-            # was recently seen, apply a reduced proximity bonus to move_forward and
-            # the appropriate turn action toward the remembered angle.
-            # Gated by sat_urgency > threshold — the remembered location is only
-            # relevant when the drive is still active. If the agent just ate and
-            # urgency dropped below the threshold, the buffer is ignored until
-            # hunger returns. This is the beast machine distinction: the interoceptive
-            # state initiates and terminates food-seeking, not the external goal.
+            # Last-known-food bonus (Fixes 5 & 6): when food is not currently visible
+            # but was recently seen, bias move_forward and the appropriate turn.
+            # Gated by sat_urgency >= threshold — drive-conditioned goal persistence.
+            #
+            # Two sources, in priority order:
+            #   1. context["food_memory"] — injected by AgentLoop (Fix 6).
+            #      Carries absolute heading_to_food and steps_since_seen.
+            #      Derives the required turn direction from the difference between
+            #      the agent's current heading and the remembered food heading.
+            #      Preferred because it survives heading changes between the moment
+            #      food disappeared and the current step.
+            #   2. self._last_food_angle — internal relative-angle buffer (Fix 5).
+            #      Fallback when context key is absent (e.g. EFE_ONLY ablation or
+            #      unit tests that don't provide the full context dict).
             if (not food_candidates
-                    and self._last_food_angle is not None
                     and sat_urgency >= self._food_memory_urgency_threshold):
-                mem_proximity = 1.0 - self._last_food_dist
-                mem_bonus = mem_proximity * self._food_proximity_bonus * 0.4 * sat_urgency
-                if pid == "move_forward" and abs(self._last_food_angle) < 20:
-                    combined += mem_bonus
-                elif pid == "turn_left" and self._last_food_angle < -10:
-                    combined += mem_bonus * 0.7
-                elif pid == "turn_right" and self._last_food_angle > 10:
-                    combined += mem_bonus * 0.7
+                loop_mem = context.get("food_memory") if context else None
+                if loop_mem is not None:
+                    # Absolute-heading path: compute relative turn angle from current heading.
+                    current_heading = float(
+                        context.get("heading", 0.0) if context else 0.0
+                    )
+                    heading_to_food = float(loop_mem["heading_to_food"])
+                    # Signed angular error in (-180, +180]: positive = food is to the right
+                    rel_angle = (heading_to_food - current_heading + 180.0) % 360.0 - 180.0
+                    mem_proximity = 1.0 - self._last_food_dist  # best available distance estimate
+                    mem_bonus = mem_proximity * self._food_proximity_bonus * 0.4 * sat_urgency
+                    if pid == "move_forward" and abs(rel_angle) < 20:
+                        combined += mem_bonus
+                    elif pid == "turn_left" and rel_angle < -10:
+                        combined += mem_bonus * 0.7
+                    elif pid == "turn_right" and rel_angle > 10:
+                        combined += mem_bonus * 0.7
+                elif self._last_food_angle is not None:
+                    # Relative-angle fallback (no loop context available).
+                    mem_proximity = 1.0 - self._last_food_dist
+                    mem_bonus = mem_proximity * self._food_proximity_bonus * 0.4 * sat_urgency
+                    if pid == "move_forward" and abs(self._last_food_angle) < 20:
+                        combined += mem_bonus
+                    elif pid == "turn_left" and self._last_food_angle < -10:
+                        combined += mem_bonus * 0.7
+                    elif pid == "turn_right" and self._last_food_angle > 10:
+                        combined += mem_bonus * 0.7
 
             # Motor failure penalty: soften EFE of the last action if it was blocked
             # for at least 2 consecutive steps (streak guard stops spurious first-obs firing).
