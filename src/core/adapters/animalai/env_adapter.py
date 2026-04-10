@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -99,6 +100,9 @@ class AnimalAIAdapter(AbstractEnvironmentAdapter):
         if config.get("resolve_filename", True):
             arena_path = str(Path(arena_path).resolve())
         self._arena_config_path = arena_path
+
+        # Parse goal positions from the arena YAML once at init
+        self._goal_positions: List[Dict[str, Any]] = self._parse_arena_goals()
 
         self._worker_id = int(config.get("worker_id", 1))
         self._base_port = int(config.get("base_port", 5005))
@@ -286,6 +290,13 @@ class AnimalAIAdapter(AbstractEnvironmentAdapter):
         # Used by PredictionErrorCalculator for the motor PE (efference copy channel).
         info["position_delta_norm"] = position_delta_norm
 
+        # Tag food collection: when raw_reward > 0 food was collected.
+        # Use the agent's world position as a proxy (the agent is standing on the item).
+        if raw_reward > 0:
+            info["food_collected"] = [{"x": curr_wx, "z": curr_wz}]
+        else:
+            info["food_collected"] = []
+
         motor_stuck = self._stuck_adapter_count >= self._stuck_adapter_threshold
         info["motor_stuck"] = motor_stuck
         info["stuck_steps"] = self._stuck_adapter_count
@@ -371,6 +382,41 @@ class AnimalAIAdapter(AbstractEnvironmentAdapter):
                 log.warning("Error closing Animal AI env: %s", exc)
             finally:
                 self._env = None
+
+    def get_goal_positions(self) -> List[Dict[str, Any]]:
+        """Return GoodGoal and BadGoal positions parsed from the arena YAML config."""
+        return list(self._goal_positions)
+
+    def _parse_arena_goals(self) -> List[Dict[str, Any]]:
+        """Extract GoodGoal/BadGoal positions from the AnimalAI arena YAML via regex."""
+        try:
+            with open(self._arena_config_path) as f:
+                text = f.read()
+        except Exception as exc:
+            log.warning("Could not read arena config %s: %s", self._arena_config_path, exc)
+            return []
+
+        goals: List[Dict[str, Any]] = []
+        _goal_names = {"GoodGoal", "GoodGoalSmall", "GoodGoalMulti", "BadGoal"}
+
+        # Split on !Item boundaries to get per-item blocks
+        blocks = re.split(r'\n[ \t]*-[ \t]*!Item\b', text)
+        for block in blocks[1:]:
+            name_match = re.search(r'name:\s*(\w+)', block)
+            if not name_match:
+                continue
+            name = name_match.group(1)
+            if name not in _goal_names:
+                continue
+            goal_type = "BadGoal" if name == "BadGoal" else "GoodGoal"
+            # Extract all !Vector3 position entries in this item block
+            # Stop at the next item-level key (sizes:, rotations:, etc.) — positions come first
+            pos_section = re.search(r'positions:(.*?)(?:\n[ \t]+\w+:|$)', block, re.DOTALL)
+            search_text = pos_section.group(1) if pos_section else block
+            for m in re.finditer(r'!Vector3\s*\{[^}]*\bx:\s*([\d.]+)[^}]*\bz:\s*([\d.]+)', search_text):
+                goals.append({"type": goal_type, "x": float(m.group(1)), "z": float(m.group(2))})
+
+        return goals
 
     def get_available_vitals(self) -> List[str]:
         return ["health", "saturation"]

@@ -97,3 +97,9 @@ class AbstractEnvironmentAdapter(ABC):
     @abstractmethod
     def estimate_terrain_novelty(self, state: AgentState) -> float:
         """Return [0,1] how novel this area is (0=very familiar, 1=never seen)."""
+
+    def get_goal_positions(self) -> List[Dict[str, Any]]:
+        """Return goal positions for the current episode as [{"type": "GoodGoal"|"BadGoal", "x": float, "z": float}].
+        Called after reset() so the loop can log them to goals.jsonl.
+        Default returns empty list — override in adapters that have fixed or generated goals."""
+        return []

@@ -9,6 +9,7 @@ Writes to src/logs/runs/<timestamp>_<run_id>/:
   memory.jsonl   — FAISS operations (gated by LOG_MEMORY)
   metrics.jsonl  — numeric per-step metrics (always on, fixed schema)
   tracebacks.jsonl — structured exceptions
+  goals.jsonl    — goal positions (GoodGoal/BadGoal) at episode start and respawns
 """
 from __future__ import annotations
 
@@ -54,6 +55,7 @@ class RunLogger:
         self._state_f = open(run_dir / "state.jsonl", "a") if log_state else None
         self._llm_f = open(run_dir / "llm.jsonl", "a") if log_prompts else None
         self._memory_f = open(run_dir / "memory.jsonl", "a") if log_memory else None
+        self._goals_f = open(run_dir / "goals.jsonl", "a")
 
         self._write_run_metadata(config)
 
@@ -100,6 +102,10 @@ class RunLogger:
     def state(self, state_obj: Any, step: int = 0) -> None:
         if self._state_f:
             self._append(self._state_f, {"step": step, "state": state_obj})
+
+    def goal(self, goal_type: str, x: float, z: float, step: int = 0) -> None:
+        """Record a goal position (GoodGoal or BadGoal). Written at episode start and on respawn."""
+        self._append(self._goals_f, {"step": step, "type": goal_type, "x": round(x, 3), "z": round(z, 3)})
 
     def llm(
         self,
@@ -177,6 +183,7 @@ class RunLogger:
             self._state_f,
             self._llm_f,
             self._memory_f,
+            self._goals_f,
         ]:
             if f:
                 try:

@@ -195,6 +195,10 @@ class AgentLoop:
         self._current_state = self._adapter.reset()
         self._step = 0
 
+        # Log goal positions at episode start
+        for g in self._adapter.get_goal_positions():
+            self._logger.goal(g["type"], g["x"], g["z"], step=0)
+
         # Reset area familiarity for the starting position so area_novelty = 1.0
         # on step 0. This lets the epistemic value of turns dominate the urgency
         # fallback, producing a natural orienting scan at episode start without
@@ -494,21 +498,43 @@ class AgentLoop:
         if len(self._recent_actions) > 10:
             self._recent_actions.pop(0)
 
-        # Fix 1: log every positive reward from Animal AI.
-        # Fires even when the contact happens mid-turn (physics frames between decisions).
+        # Log food collection events with position data for grid map visualization.
+        # AnimalAI: fires on raw_reward > 0; headless: fires from food_collected in raw_metadata.
         _raw_reward = float(next_state.raw_metadata.get("raw_reward", 0.0))
+        _meta_collected = list(next_state.raw_metadata.get("food_collected") or [])
         if _raw_reward > 0.0:
             _prev_rc = prev_state.perception.raycast_hits or []
             _food_rc = [r for r in _prev_rc if r.get("hit_tag") in ("GoodGoal", "GoodGoalMulti")]
+            _collect_pos = _meta_collected[0] if _meta_collected else None
             self._logger.event("food_collected", {
                 "raw_reward": _raw_reward,
                 "action": selected_id,
+                "x": _collect_pos["x"] if _collect_pos else None,
+                "z": _collect_pos["z"] if _collect_pos else None,
                 "food_ray_dist_before": _food_rc[0].get("distance") if _food_rc else None,
                 "saturation_before": round(float(prev_state.homeostasis.saturation or 0.0), 4),
                 "saturation_after": round(float(next_state.homeostasis.saturation or 0.0), 4),
                 "health_before": round(float(prev_state.homeostasis.health or 0.0), 4),
                 "health_after": round(float(next_state.homeostasis.health or 0.0), 4),
             }, step=step)
+        elif _meta_collected:
+            # Headless adapter: food_collected carries exact positions, no raw_reward field
+            _headless_reward = float(next_state.raw_metadata.get("reward", 0.0))
+            for _fc in _meta_collected:
+                self._logger.event("food_collected", {
+                    "raw_reward": _headless_reward,
+                    "action": selected_id,
+                    "x": _fc["x"],
+                    "z": _fc["z"],
+                    "saturation_before": round(float(prev_state.homeostasis.saturation or 0.0), 4),
+                    "saturation_after": round(float(next_state.homeostasis.saturation or 0.0), 4),
+                    "health_before": round(float(prev_state.homeostasis.health or 0.0), 4),
+                    "health_after": round(float(next_state.homeostasis.health or 0.0), 4),
+                }, step=step)
+
+        # Log new goal positions when headless respawns all food
+        for _ng in (next_state.raw_metadata.get("new_goals") or []):
+            self._logger.goal(_ng["type"], _ng["x"], _ng["z"], step=step)
 
         # --- Layer 2: World model learning ---
         self._world_model.update(

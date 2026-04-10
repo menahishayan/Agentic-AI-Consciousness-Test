@@ -166,6 +166,11 @@ class HeadlessSimAdapter(AbstractEnvironmentAdapter):
         self._motor_efficiency: float = 1.0
         self._stuck_steps: int = 0
 
+        # Food collection tracking: positions consumed in the most recent _apply_action call
+        self._last_consumed_positions: List[Dict] = []
+        # New goals from the most recent respawn (cleared each step unless respawn happened)
+        self._new_goals: List[Dict] = []
+
     # ------------------------------------------------------------------
     # AbstractEnvironmentAdapter
     # ------------------------------------------------------------------
@@ -180,6 +185,8 @@ class HeadlessSimAdapter(AbstractEnvironmentAdapter):
         self._food = self._spawn_food()
         self._motor_efficiency = 1.0
         self._stuck_steps = 0
+        self._last_consumed_positions = []
+        self._new_goals = []
         return self._build_state(reward=0.0)
 
     def step(self, action_id: str) -> Tuple[AgentState, bool]:
@@ -271,12 +278,18 @@ class HeadlessSimAdapter(AbstractEnvironmentAdapter):
             return 1.0
         return 0.1
 
+    def get_goal_positions(self) -> List[Dict]:
+        """Return all food (GoodGoal) positions for the current episode."""
+        return [{"type": "GoodGoal", "x": f.x, "z": f.z} for f in self._food]
+
     # ------------------------------------------------------------------
     # Internal simulation
     # ------------------------------------------------------------------
 
     def _apply_action(self, action_id: str) -> float:
         """Apply action, return raw reward."""
+        self._last_consumed_positions = []
+        self._new_goals = []
         if action_id == "move_forward":
             self._x += self._step_size * math.sin(self._heading)
             self._z += self._step_size * math.cos(self._heading)
@@ -304,6 +317,7 @@ class HeadlessSimAdapter(AbstractEnvironmentAdapter):
             if not food.consumed and self._dist(food.x, food.z) <= self._interaction_radius:
                 food.consumed = True
                 reward += food.value
+                self._last_consumed_positions.append({"x": food.x, "z": food.z})
 
         # Hazard zone
         dist_to_wall = min(
@@ -317,6 +331,7 @@ class HeadlessSimAdapter(AbstractEnvironmentAdapter):
         # Respawn food if all consumed
         if all(f.consumed for f in self._food):
             self._food = self._spawn_food()
+            self._new_goals = [{"type": "GoodGoal", "x": f.x, "z": f.z} for f in self._food]
 
         return reward
 
@@ -510,6 +525,8 @@ class HeadlessSimAdapter(AbstractEnvironmentAdapter):
                 "n_food_remaining": sum(1 for f in self._food if not f.consumed),
                 "motor_efficiency": self._motor_efficiency,
                 "stuck_steps": self._stuck_steps,
+                "food_collected": list(self._last_consumed_positions),
+                "new_goals": list(self._new_goals),
             },
         )
 
