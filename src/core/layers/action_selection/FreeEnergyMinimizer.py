@@ -98,18 +98,40 @@ class FreeEnergyMinimizer:
         # — the agent is spinning next to food it can't reach via turning alone.
         self._stuck_turn_angle: Optional[float] = None
         self._stuck_turn_streak: int = 0
+        # Last-known-food buffer — goal persistence without persistent goals.
+        # Stores the angle and distance of the most recently observed food ray.
+        # Cleared after memory_decay_steps consecutive steps without a food sighting
+        # so stale episodes don't bleed across arena resets.
+        self._last_food_angle: Optional[float] = None
+        self._last_food_dist: float = 1.0
+        self._steps_since_food: int = 0
+        self._food_memory_decay_steps: int = int(
+            pg.get("food_memory_decay_steps", 30)
+        )
+        # Drive gate: food memory only influences action when saturation urgency
+        # exceeds this threshold. Below it the drive is satisfied — the beast
+        # is not hungry and food location is irrelevant to the current state.
+        self._food_memory_urgency_threshold: float = float(
+            pg.get("food_memory_urgency_threshold", 0.3)
+        )
 
     def _food_bonus_for_action(
         self,
         food_rays: List[Dict[str, Any]],
         action_id: str,
         turn_bonus_scale: float = 1.0,
+        pragmatic_scale: float = 1.0,
     ) -> float:
         """Return food-proximity bonus for action_id given the current ray fan.
 
         Selects the closest food ray inside the action's angular window and
         returns proximity = 1 - distance (0 = far, 1 = touching).
+
         turn_bonus_scale halves the turn bonus when the stuck-turn detector fires.
+        pragmatic_scale gates the move_forward approach bonus by saturation urgency
+        so that sustained forward approach only fires when the body actually needs
+        food. The epistemic turn bonus is left unscaled — turning toward food to
+        resolve its location has information-theoretic value regardless of hunger.
         """
         window = _ACTION_FOOD_WINDOWS.get(action_id)
         if window is None or not food_rays:
@@ -122,7 +144,7 @@ class FreeEnergyMinimizer:
         proximity = 1.0 - float(best.get("distance", 1.0))
         if action_id in _EPISTEMIC_ACTIONS:
             return proximity * self._food_proximity_bonus * 0.7 * turn_bonus_scale
-        return proximity * self._food_proximity_bonus
+        return proximity * self._food_proximity_bonus * pragmatic_scale
 
     def score(
         self,
@@ -190,10 +212,13 @@ class FreeEnergyMinimizer:
 
         # tag → max urgency across all drive signals
         urgency_by_tag: Dict[str, float] = {}
+        sat_urgency: float = 0.0
         if drive_batch:
             for signal in drive_batch.signals:
                 for tag in signal.suggested_action_tags:
                     urgency_by_tag[tag] = max(urgency_by_tag.get(tag, 0.0), signal.urgency)
+                if signal.channel_id == "saturation":
+                    sat_urgency = signal.urgency
 
         # Find the most-aligned food ray across the full fan — used for directional bonuses.
         # Most-aligned (smallest |angle|) rather than closest (smallest distance) because
@@ -205,6 +230,21 @@ class FreeEnergyMinimizer:
             min(food_candidates, key=lambda r: abs(r.get("angle_deg", 90)))
             if food_candidates else None
         )
+
+        # Last-known-food buffer update (Fix 5).
+        # When food is visible: refresh the buffer and reset the decay counter.
+        # When food is absent: increment the counter and clear the buffer once
+        # the decay window expires, preventing stale locations from persisting
+        # across episode resets or after the agent has left the food area.
+        if food_ray is not None:
+            self._last_food_angle = float(food_ray.get("angle_deg", 0.0))
+            self._last_food_dist = float(food_ray.get("distance", 1.0))
+            self._steps_since_food = 0
+        else:
+            self._steps_since_food += 1
+            if self._steps_since_food > self._food_memory_decay_steps:
+                self._last_food_angle = None
+                self._last_food_dist = 1.0
 
         # Stuck-turn detector: if the food angle hasn't changed for 5+ steps while
         # the agent is turning, the turn bonus is halved to encourage move_forward instead.
@@ -301,21 +341,49 @@ class FreeEnergyMinimizer:
                     combined -= 0.25
 
             # Food-proximity bonus via window-based per-action method.
-            # Close food (dist < 0.10): alignment irrelevant — just move.
-            #   move_forward gets 1.5× bonus; turns suppressed (spinning next to
-            #   adjacent food is counterproductive).
-            # Far food (dist ≥ 0.10): delegate to _food_bonus_for_action which
-            #   checks each action's angular window against all food rays.
+            # Close food (dist < 0.01): alignment irrelevant — just move.
+            #   move_forward gets 1.5× bonus scaled by sat_urgency (pragmatic gate);
+            #   turns suppressed (spinning next to adjacent food is counterproductive).
+            # Far food (dist ≥ 0.01): delegate to _food_bonus_for_action which
+            #   checks each action's angular window against all food rays and applies
+            #   sat_urgency as pragmatic_scale to the move_forward bonus only.
+            #   The epistemic turn bonus inside _food_bonus_for_action is left unscaled.
             if food_candidates:
                 food_dist_min = min(r.get("distance", 1.0) for r in food_candidates)
                 if food_dist_min < 0.01:
                     if pid == "move_forward":
-                        combined += (1.0 - food_dist_min) * self._food_proximity_bonus * 1.5
+                        combined += (
+                            (1.0 - food_dist_min)
+                            * self._food_proximity_bonus
+                            * 1.5
+                            * sat_urgency
+                        )
                     # No turn bonus when food is adjacent.
                 else:
                     combined += self._food_bonus_for_action(
-                        food_candidates, pid, _turn_bonus_scale
+                        food_candidates, pid, _turn_bonus_scale,
+                        pragmatic_scale=sat_urgency,
                     )
+
+            # Last-known-food bonus (Fix 5): when food is not currently visible but
+            # was recently seen, apply a reduced proximity bonus to move_forward and
+            # the appropriate turn action toward the remembered angle.
+            # Gated by sat_urgency > threshold — the remembered location is only
+            # relevant when the drive is still active. If the agent just ate and
+            # urgency dropped below the threshold, the buffer is ignored until
+            # hunger returns. This is the beast machine distinction: the interoceptive
+            # state initiates and terminates food-seeking, not the external goal.
+            if (not food_candidates
+                    and self._last_food_angle is not None
+                    and sat_urgency >= self._food_memory_urgency_threshold):
+                mem_proximity = 1.0 - self._last_food_dist
+                mem_bonus = mem_proximity * self._food_proximity_bonus * 0.4 * sat_urgency
+                if pid == "move_forward" and abs(self._last_food_angle) < 20:
+                    combined += mem_bonus
+                elif pid == "turn_left" and self._last_food_angle < -10:
+                    combined += mem_bonus * 0.7
+                elif pid == "turn_right" and self._last_food_angle > 10:
+                    combined += mem_bonus * 0.7
 
             # Motor failure penalty: soften EFE of the last action if it was blocked
             # for at least 2 consecutive steps (streak guard stops spurious first-obs firing).
