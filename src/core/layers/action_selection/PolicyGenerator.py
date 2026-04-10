@@ -356,6 +356,10 @@ class PolicyGenerator:
 
             if self._llm_log_cb is not None:
                 try:
+                    # trigger_reason is the canonical inference-depth signal in
+                    # llm.jsonl — see RunLogger.llm() for the full mapping.
+                    # depth is intentionally not forwarded: it would duplicate
+                    # trigger_reason and silently go stale if the trigger logic changes.
                     self._llm_log_cb(prompt, response, trigger_reason, step, selected, llm_reason)
                 except Exception as log_exc:
                     log.debug("LLM log callback failed: %s", log_exc)

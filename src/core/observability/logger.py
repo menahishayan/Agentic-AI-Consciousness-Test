@@ -116,6 +116,20 @@ class RunLogger:
         reason: Optional[str] = None,
         step: int = 0,
     ) -> None:
+        """Append one LLM call record to llm.jsonl.
+
+        trigger_reason is the canonical field for inferring inference depth in
+        analysis code — do NOT add a separate "depth" field. The mapping is:
+          "normal"        → fast prompt
+          "drive_conflict"
+          "pe_streak"
+          "skill_gap"     → full CoT prompt
+          "high_arousal"  → EFE argmax (LLM bypassed; this entry is not written)
+          "no_llm"        → EFE argmax (LLM absent; this entry is not written)
+          "<reason>:efe_argmax"  → fast/full fell back to EFE argmax on timeout
+        A "depth" field would duplicate this information and silently go stale
+        whenever the trigger logic changes.
+        """
         if self._llm_f:
             entry: Dict[str, Any] = {
                 "t": time.time(),
