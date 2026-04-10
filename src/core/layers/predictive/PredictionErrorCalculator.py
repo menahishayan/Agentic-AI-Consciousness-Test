@@ -27,7 +27,6 @@ from core.models.state import AgentState
 _CHANNEL_SOURCES = {
     "health":            "proprioceptive",
     "saturation":        "proprioceptive",
-    "energy":            "proprioceptive",
     "oxygen":            "proprioceptive",
     "motor_efficiency":  "proprioceptive",
     "motor":             "proprioceptive",
@@ -193,7 +192,6 @@ class PredictionErrorCalculator:
         return {
             "health":            h.health or 0.0,
             "saturation":        h.saturation or 0.0,
-            "energy":            h.energy or 0.0,
             "oxygen":            h.oxygen or 1.0,
             "motor_efficiency":  motor_efficiency,
             "resource_level":    r.resource_level or 0.5,

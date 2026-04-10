@@ -55,7 +55,7 @@ class WorldModelGenerator:
     """
 
     _CHANNELS = [
-        "health", "saturation", "energy", "oxygen",
+        "health", "saturation", "oxygen",
         "resource_level", "threat_proximity",
         "terrain_novelty", "entity_density",
         "motor_efficiency",
@@ -210,7 +210,6 @@ class WorldModelGenerator:
         return {
             "health":               h.health or 0.0,
             "saturation":           h.saturation or 0.0,
-            "energy":               h.energy or 0.0,
             "oxygen":               h.oxygen or 1.0,
             "resource_level":       r.resource_level or 0.5,
             "threat_proximity":     r.threat_proximity or 0.0,

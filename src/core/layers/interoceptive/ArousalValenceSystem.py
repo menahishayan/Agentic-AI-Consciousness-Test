@@ -112,11 +112,17 @@ class ArousalValenceSystem:
         self._anxiety_threat_ceiling: float = float(av.get("anxiety_threat_ceiling", 0.15))
         self._anxiety_weight: float = float(av.get("anxiety_weight", 0.20))
 
-        # ── Fatigue: energy depletion × motor struggle ───────────────────
+        # ── Fatigue: saturation depletion × motor struggle ──────────────
         # Boksem & Tops (2008): mental fatigue reduces arousal and impairs
         # valence. Unlike frustration (arousal spike), fatigue suppresses
         # arousal and adds negative valence — a dual drag on both axes.
-        self._fatigue_energy_threshold: float = float(av.get("fatigue_energy_threshold", 0.30))
+        # Grounded in saturation (metabolic substrate) rather than the
+        # composite energy variable, which was a linear function of both
+        # saturation and health and carried no independent signal.
+        # Config key accepts both names for backwards compatibility.
+        self._fatigue_saturation_threshold: float = float(
+            av.get("fatigue_saturation_threshold", av.get("fatigue_energy_threshold", 0.30))
+        )
         self._fatigue_motor_threshold: float = float(av.get("fatigue_motor_threshold", 0.20))
         self._fatigue_valence_weight: float = float(av.get("fatigue_valence_weight", 0.25))
         self._fatigue_arousal_suppression: float = float(av.get("fatigue_arousal_suppression", 0.20))
@@ -268,12 +274,12 @@ class ArousalValenceSystem:
 
         raw = base_arousal + lc_ne_contribution + stress_contribution
 
-        # Fatigue suppression: low energy + sustained motor struggle → dampened
+        # Fatigue suppression: low saturation + sustained motor struggle → dampened
         # arousal. Unlike frustration which spikes arousal, fatigue saps it.
-        energy_urgency = self._energy_urgency(vitals, drive_batch)
-        if (energy_urgency > self._fatigue_energy_threshold
+        sat_urgency = self._saturation_urgency(vitals, drive_batch)
+        if (sat_urgency > self._fatigue_saturation_threshold
                 and motor_pe > self._fatigue_motor_threshold):
-            raw -= self._fatigue_arousal_suppression * min(energy_urgency, 1.0)
+            raw -= self._fatigue_arousal_suppression * min(sat_urgency, 1.0)
 
         return float(min(1.0, max(0.0, raw)))
 
@@ -321,14 +327,8 @@ class ArousalValenceSystem:
         sat_rpe = (delta_sat - expected_sat_delta) * self._rpe_scale
 
         # Per-channel urgency for craving and fatigue.
-        sat_urgency = 0.0
-        energy_urgency = self._energy_urgency(vitals, drive_batch)
-        max_urgency = 0.0
-        if drive_batch:
-            for s in drive_batch.signals:
-                if s.channel_id == "saturation":
-                    sat_urgency = max(0.0, s.urgency)
-            max_urgency = drive_batch.max_urgency
+        sat_urgency = self._saturation_urgency(vitals, drive_batch)
+        max_urgency = drive_batch.max_urgency if drive_batch else 0.0
 
         # Urgency-weighted anticipatory craving: food visible + hunger → wanting.
         # Berridge & Robinson (1998): incentive salience scales with deprivation.
@@ -375,13 +375,13 @@ class ArousalValenceSystem:
                          / max(1.0 - self._anxiety_pe_threshold, 1e-6), 1.0)
             anxiety = -self._anxiety_weight * excess
 
-        # Fatigue: energy depletion + motor struggle → negative valence penalty.
+        # Fatigue: saturation depletion + motor struggle → negative valence penalty.
         # Complements arousal suppression; together they produce a state of
         # flagging motivation that neither fear nor frustration captures.
         fatigue_valence = 0.0
-        if (energy_urgency > self._fatigue_energy_threshold
+        if (sat_urgency > self._fatigue_saturation_threshold
                 and motor_pe > self._fatigue_motor_threshold):
-            fatigue_valence = -self._fatigue_valence_weight * min(energy_urgency, 1.0)
+            fatigue_valence = -self._fatigue_valence_weight * min(sat_urgency, 1.0)
 
         # Tonic stress: sustained high PE chronically drains valence baseline.
         stress_penalty = -stress_ema * self._stress_valence_weight
@@ -399,24 +399,23 @@ class ArousalValenceSystem:
         )
         return float(max(-1.0, min(1.0, valence_raw)))
 
-    def _energy_urgency(
+    def _saturation_urgency(
         self,
         vitals: Dict[str, Optional[float]],
         drive_batch: Optional[DriveSignalBatch],
     ) -> float:
         """
-        Return energy urgency in [0, 1], preferring the drive_batch signal.
-        Falls back to 1 - vitals["energy"] when no explicit energy drive channel
-        exists (energy_urgency = 0 when drive_batch has no 'energy' channel and
-        vitals has no 'energy' key, which is the safe default).
+        Return saturation urgency in [0, 1] as the metabolic fatigue signal.
+        Saturation depletion → adenosine-like pressure → fatigue suppression.
+        Prefers drive_batch; falls back to 1 - vitals["saturation"].
         """
         if drive_batch:
             for s in drive_batch.signals:
-                if s.channel_id == "energy":
+                if s.channel_id == "saturation":
                     return max(0.0, min(1.0, s.urgency))
-        raw_energy = vitals.get("energy")
-        if raw_energy is not None:
-            return max(0.0, 1.0 - float(raw_energy))
+        raw_sat = vitals.get("saturation")
+        if raw_sat is not None:
+            return max(0.0, 1.0 - float(raw_sat))
         return 0.0
 
     def _learning_rate_mod(self, arousal: float) -> float:

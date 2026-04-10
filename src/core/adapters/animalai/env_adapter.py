@@ -58,15 +58,7 @@ _DRIVE_CHANNELS = [
         critical_threshold=0.25,
         recovery_cost_ticks=150,
         suggested_action_tags=["exploration", "navigation"],
-        weight=1.0,
-    ),
-    DriveChannel(
-        channel_id="energy",
-        setpoint=0.65,
-        critical_threshold=0.2,
-        recovery_cost_ticks=180,
-        suggested_action_tags=["navigation", "rest"],
-        weight=0.9,
+        weight=1.2,  # raised from 1.0 to absorb the urgency mass previously carried by energy
     ),
     DriveChannel(
         channel_id="safety",
@@ -381,7 +373,7 @@ class AnimalAIAdapter(AbstractEnvironmentAdapter):
                 self._env = None
 
     def get_available_vitals(self) -> List[str]:
-        return ["health", "saturation", "energy"]
+        return ["health", "saturation"]
 
     def get_available_policies(self) -> List[Dict[str, Any]]:
         return get_policy_descriptors()
