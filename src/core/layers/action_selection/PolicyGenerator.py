@@ -171,7 +171,8 @@ class PolicyGenerator:
 
         depth, reason = self._depth(context)
 
-        selected = self._call_llm_sync(policies, goals, context, step, depth=depth, trigger_reason=reason)
+        result = self._call_llm_sync(policies, goals, context, step, depth=depth, trigger_reason=reason)
+        selected = result[0] if result is not None else None
 
         # Timeout / error fallback: pure EFE argmax, not tag matching.
         # The generative model's own score is the best available signal when
@@ -278,12 +279,15 @@ class PolicyGenerator:
                 max_tokens = 200
             else:
                 prompt = self._build_fast_prompt(policies, context, step)
-                max_tokens = 20  # only "ACTION: <id>" needed
+                max_tokens = 30  # "action: why in ≤6 words"
 
+            # Full CoT: temperature=0.1 allows mild sampling diversity under deliberation.
+            # Fast prompt: temperature=0.0 — exploit the confident prior.
+            temperature = 0.1 if depth == "full" else 0.0
             request = LLMRequest(
                 messages=[LLMMessage(role="user", content=prompt)],
                 max_tokens=max_tokens,
-                temperature=0.0,
+                temperature=temperature,
             )
 
             t0 = time.monotonic()
@@ -299,18 +303,20 @@ class PolicyGenerator:
                 )
                 return None
 
-            selected = self._parse_llm_response(
+            selected, llm_reason = self._parse_llm_response(
                 response.content, policies,
                 fe_scores=context.get("free_energy_scores"),
             )
 
             if self._llm_log_cb is not None:
                 try:
-                    self._llm_log_cb(prompt, response, trigger_reason, step, selected)
+                    self._llm_log_cb(prompt, response, trigger_reason, step, selected, llm_reason)
                 except Exception as log_exc:
                     log.debug("LLM log callback failed: %s", log_exc)
 
-            return selected
+            if selected is None:
+                return None
+            return (selected, llm_reason)
 
         except Exception as exc:
             log.warning("LLM call failed: %s", exc)
@@ -403,20 +409,22 @@ class PolicyGenerator:
 
         motor_eff = float(context.get("motor_efficiency", 1.0))
         stuck_steps = int(context.get("stuck_steps", 0))
-        stuck_line = (
-            "STUCK: Agent not moving. Choose turn_left or turn_right.\n"
-            if motor_eff < 0.3 and stuck_steps >= 5 else ""
-        )
+        if motor_eff < 0.3 and stuck_steps >= 5:
+            turn_scores = {k: v for k, v in fe_scores.items() if k in ("turn_left", "turn_right")}
+            preferred_turn = max(turn_scores, key=turn_scores.get) if turn_scores else "turn_right"
+            stuck_line = f"STUCK: Agent not moving. EFE favours {preferred_turn} — choose it.\n"
+        else:
+            stuck_line = ""
 
         return (
-            f"Step {step}. Output exactly one line: ACTION: <policy_id>\n"
+            f"Step {step}. Choose the best action.\n"
             f"Valid: {valid_ids}\n\n"
             f"DRIVES (urgency): {drives_compact}\n"
             f"  arousal={arousal:.2f}  valence={valence:.2f}\n"
             f"RAYCAST: {raycast_line}\n"
             f"{stuck_line}"
             f"EFE (higher=prefer): {fe_line}\n\n"
-            f"ACTION: "
+            f"Reply on one line: action_name: your reason\n"
         )
 
     def _build_prompt(
@@ -562,6 +570,13 @@ class PolicyGenerator:
                 except Exception:
                     pass
 
+        if motor_eff < 0.3 and context.get("stuck_steps", 0) >= 5:
+            turn_scores = {k: v for k, v in fe_scores.items() if k in ("turn_left", "turn_right")}
+            preferred_turn = max(turn_scores, key=turn_scores.get) if turn_scores else "turn_right"
+            stuck_note = f"\n  ⚠ STUCK {context.get('stuck_steps', 0)} steps — EFE selects {preferred_turn}."
+        else:
+            stuck_note = ""
+
         valid_ids = ", ".join(p["policy_id"] for p in policies)
         return f"""You are the deliberative system for a survival agent (step {step}).
 You have NO declared task. You act only to reduce allostatic drive deficits and minimise surprise.
@@ -593,7 +608,7 @@ Valid policy_ids: {valid_ids}
 
 ══ STEP 6 — ALLOSTATIC RESOLUTION ══
   Select the action with the highest EFE score that is consistent with the perceptual evidence above.
-  If food is visible in raycasts, move_forward has first-order pragmatic value.{affect_note}{f"{chr(10)}  ⚠ STUCK: Agent not moving. Choose turn_left or turn_right." if motor_eff < 0.3 and context.get('stuck_steps', 0) >= 5 else ""}
+  If food is visible in raycasts, move_forward has first-order pragmatic value.{affect_note}{stuck_note}
 
 REASON: """
 
@@ -606,35 +621,73 @@ REASON: """
         response: str,
         policies: List[Dict],
         fe_scores: Optional[Dict[str, float]] = None,
-    ) -> Optional[str]:
-        """Extract policy_id from LLM response text.
+    ) -> Tuple[Optional[str], Optional[str]]:
+        """Extract (policy_id, reason) from LLM response text.
 
-        Primary: look for the explicit ACTION: line.
-        Fallback 1: scan full response for any valid policy_id substring.
+        Handles two formats:
+          Fast: [STATE: ...] [SIGNAL: ...] → action: 5-word reason
+          Full: REASON: <sentence>\\nACTION: <policy_id>
+
+        Fallback 1: any valid policy_id substring in response.
         Fallback 2: argmax(EFE scores) — never discard a computed answer on a
                     malformed LLM response.
+        Returns (action_id, reason_string); either may be None.
         """
         policy_ids = {p["policy_id"] for p in policies}
+        reason: Optional[str] = None
 
+        # Primary: "action: reason" format (fast mode)
+        # Pass 1 — policy_id is the first token before ":".
+        # Pass 2 — policy_id appears anywhere in the line (handles "<action>: turn_left - reason").
+        for strict in (True, False):
+            for line in response.splitlines():
+                stripped = line.strip()
+                lower = stripped.lower()
+                if strict:
+                    if ":" not in stripped:
+                        continue
+                    colon_idx = stripped.index(":")
+                    candidate = stripped[:colon_idx].strip().lower()
+                    first_word = candidate.split()[0].rstrip(".,;") if candidate else ""
+                    if first_word in policy_ids:
+                        return first_word, stripped[colon_idx + 1:].strip() or None
+                else:
+                    # Scan for policy_id followed by ":" or " -" and grab trailing text as reason
+                    for pid in sorted(policy_ids, key=len, reverse=True):
+                        idx = lower.find(pid)
+                        if idx == -1:
+                            continue
+                        after = stripped[idx + len(pid):].strip()
+                        if after.startswith(":"):
+                            return pid, after[1:].strip() or None
+                        if after.startswith("-"):
+                            return pid, after[1:].strip() or None
+
+        # Secondary: ACTION: / REASON: format (full CoT)
+        action_id: Optional[str] = None
         for line in response.splitlines():
             stripped = line.strip()
-            if stripped.upper().startswith("ACTION:"):
+            if stripped.upper().startswith("REASON:"):
+                reason = stripped.split(":", 1)[1].strip() if ":" in stripped else None
+            elif stripped.upper().startswith("ACTION:"):
                 candidate = stripped.split(":", 1)[1].strip().lower()
                 first_word = candidate.split()[0].rstrip(".,;") if candidate else ""
                 if first_word in policy_ids:
-                    return first_word
+                    action_id = first_word
+        if action_id is not None:
+            return action_id, reason
 
         # Fallback 1: first policy_id substring in response
         lower = response.lower()
         for pid in policy_ids:
             if pid in lower:
-                return pid
+                return pid, reason
 
-        # Fallback 2: EFE argmax — response was malformed, but EFE already has the answer
+        # Fallback 2: EFE argmax — response was malformed, EFE is still valid
         if fe_scores:
-            return max(fe_scores, key=lambda k: fe_scores[k])
+            return max(fe_scores, key=lambda k: fe_scores[k]), reason
 
-        return None
+        return None, None
 
     # ------------------------------------------------------------------
     # Helpers

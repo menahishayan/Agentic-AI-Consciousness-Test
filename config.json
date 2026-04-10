@@ -33,7 +33,7 @@
   "llm": {
     "enabled": true,
     "provider": "ollama",
-    "model": "gemma3:4b",
+    "model": "gemma3:12b",
     "base_url": "http://localhost:11434/v1",
     "temperature": 0.1,
     "max_tokens": 500,

@@ -95,7 +95,14 @@ class AgentLoop:
         self._policy_gen.set_policy_history_callback(memory.get_ltm_success_rate)
         self._policy_gen.set_episodic_memory_callback(memory.query_similar_traces)
 
-        def _llm_log_cb(prompt: str, resp: Any, reason: str, step: int, selected: Optional[str] = None) -> None:
+        def _llm_log_cb(
+            prompt: str,
+            resp: Any,
+            reason: str,
+            step: int,
+            selected: Optional[str] = None,
+            llm_reason: Optional[str] = None,
+        ) -> None:
             logger.llm(
                 prompt=prompt,
                 response=resp.content,
@@ -105,6 +112,7 @@ class AgentLoop:
                 output_tokens=resp.output_tokens or 0,
                 trigger_reason=reason,
                 selected=selected,
+                reason=llm_reason,
                 step=step,
             )
 

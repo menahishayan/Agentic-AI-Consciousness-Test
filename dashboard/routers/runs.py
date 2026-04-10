@@ -82,6 +82,8 @@ async def get_bulk(run_id: str, request: Request):
             "t": row.get("t"),
             "model": row.get("model"),
             "trigger_reason": row.get("trigger_reason", ""),
+            "selected": row.get("selected"),
+            "reason": row.get("reason"),
             "latency_ms": row.get("latency_ms"),
             "input_tokens": row.get("input_tokens"),
             "output_tokens": row.get("output_tokens"),
@@ -91,9 +93,16 @@ async def get_bulk(run_id: str, request: Request):
         for row in raw_llm
     ]
 
+    # Extract run_complete payload from the episode_complete event if present
+    run_complete = None
+    for row in events:
+        if row.get("event") == "episode_complete":
+            run_complete = row.get("payload", {})
+
     return {
         "metrics": metrics,
         "events": events,
         "positions": positions,
         "llm_calls": llm_calls,
+        "run_complete": run_complete,
     }
