@@ -178,10 +178,18 @@ class ArousalValenceSystem:
         current_resource = float(vitals.get("resource_level") or 0.0)
 
         # Tonic stress EMA: update before computing AV so it's current this step.
+        # McEwen (1998): allostatic load builds under sustained PE, but resolves
+        # when prediction errors normalise. When PE drops below a quiescence
+        # threshold, bleed the EMA back toward zero at 2× the normal rate so
+        # valence can mean-revert during genuinely calm states rather than
+        # staying chronically negative from a prior high-PE episode.
         self._stress_ema = (
             self._stress_ema_alpha * pe_mean
             + (1.0 - self._stress_ema_alpha) * self._stress_ema
         )
+        _quiescence_threshold: float = 0.25
+        if pe_mean < _quiescence_threshold:
+            self._stress_ema *= (1.0 - self._stress_ema_alpha * 2)
 
         arousal = self._compute_arousal(
             vitals, drive_batch, pe_batch, motor_pe,
@@ -363,16 +371,16 @@ class ArousalValenceSystem:
         # Anxiety: high PE without locatable source → diffuse dread.
         # Distinct from fear (proximal threat) and curiosity (same arousal, no
         # negative valence). Fires only when all three conditions hold:
-        #   - mean PE is elevated (unexplained prediction errors)
+        #   - mean PE exceeds recent running baseline (surprise above norm, not absolute level)
         #   - no proximal threat (otherwise this is fear)
         #   - no food visible (otherwise positive-valence explanation exists)
         anxiety = 0.0
         pe_mean = pe_batch.mean_magnitude if pe_batch else 0.0
-        if (pe_mean > self._anxiety_pe_threshold
+        pe_excess = pe_mean - stress_ema  # surprise relative to recent tonic norm
+        if (pe_excess > self._anxiety_pe_threshold
                 and threat < self._anxiety_threat_ceiling
                 and not food_detected):
-            excess = min((pe_mean - self._anxiety_pe_threshold)
-                         / max(1.0 - self._anxiety_pe_threshold, 1e-6), 1.0)
+            excess = min(pe_excess / max(self._anxiety_pe_threshold, 1e-6), 1.0)
             anxiety = -self._anxiety_weight * excess
 
         # Fatigue: saturation depletion + motor struggle → negative valence penalty.
@@ -384,7 +392,12 @@ class ArousalValenceSystem:
             fatigue_valence = -self._fatigue_valence_weight * min(sat_urgency, 1.0)
 
         # Tonic stress: sustained high PE chronically drains valence baseline.
-        stress_penalty = -stress_ema * self._stress_valence_weight
+        # Only applied when anxiety is NOT active — both represent unexplained PE;
+        # charging both would double-count the same signal.
+        if anxiety == 0.0:
+            stress_penalty = -stress_ema * self._stress_valence_weight
+        else:
+            stress_penalty = 0.0
 
         valence_raw = (
             health_rpe * 0.35
