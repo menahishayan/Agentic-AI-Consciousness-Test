@@ -140,6 +140,11 @@ class AgentLoop:
         # the arousal that was current when the action was taken, not the one computed
         # from its outcome (which isn't available yet at PEC call time).
         self._last_arousal: float = 0.0
+        # Efference copy cache: prediction computed AFTER action selection but BEFORE
+        # execution, using predict(current_state, selected_action). Retrieved at the
+        # NEXT step to compute PE against the actual observation that arrived.
+        # None on step 0 — PEC falls back to the prior EMA baseline.
+        self._last_predicted: Optional[Dict[str, Any]] = None
 
         # Last-known-food-location buffer.
         # Populated whenever food exits the raycast fan while saturation urgency
@@ -312,7 +317,11 @@ class AgentLoop:
             drive_batch = DriveSignalBatch(signals=zero_signals)
 
         # --- Layer 2: Predictive ---
-        predicted = self._world_model.predict(state, self._last_policy_id)
+        # Use the efference copy prediction cached at the END of the previous step
+        # (predict(S_{t-1}, A_{t-1})) as the expected state for this observation.
+        # On step 0 self._last_predicted is None — PEC falls back to EMA baseline.
+        predicted = self._last_predicted if self._last_predicted is not None \
+            else self._world_model.predict(state, self._last_policy_id)
         area_id = state.perception.area_id or "unknown"
         familiarity = self._memory.get_area_familiarity(area_id)
         pe_batch = self._pe_calc.update(
@@ -464,6 +473,14 @@ class AgentLoop:
 
         if selected_id is None:
             selected_id = "idle"
+
+        # --- Efference copy: predict before executing ---
+        # Store predict(S_t, A_t) so that at step t+1 we can compare it against
+        # the observation that actually arrives. This is the self-caused / externally-
+        # caused distinction: PE computed from an efference copy prediction flags
+        # deviations from what the agent's own action was expected to produce, not
+        # deviations from an action-agnostic prior.
+        self._last_predicted = self._world_model.predict(state, selected_id)
 
         # --- Execute action ---
         prev_state = state

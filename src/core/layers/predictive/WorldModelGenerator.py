@@ -83,6 +83,17 @@ class WorldModelGenerator:
         """
         Predict next-step channel values given current state and action.
 
+        Intended call pattern (efference copy):
+          Call predict(S_t, A_t) AFTER action selection but BEFORE execution.
+          Cache the result and compare it against the observation S_{t+1} that
+          arrives at the next step. This distinguishes self-caused transitions
+          (low PE when the action produces the predicted outcome) from externally-
+          caused ones (high PE when the environment deviates from the prediction).
+
+          Calling predict(S_t, A_{t-1}) — using the previous step's action on the
+          current state — compares a forward prediction to the present observation,
+          which conflates self-caused and externally-caused errors.
+
         Returns:
             Dict mapping channel_id → predicted float value [0,1]
         """
