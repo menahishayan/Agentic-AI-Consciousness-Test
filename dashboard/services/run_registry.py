@@ -18,6 +18,7 @@ class RunInfo:
     run_dir: Path
     metadata: dict
     is_complete: bool
+    is_cancelled: bool = False
     step_count: int = 0
     first_seen_ts: float = field(default_factory=time.time)
 
@@ -50,11 +51,14 @@ class RunRegistry:
                 continue
             run_id = entry.name
             if run_id not in self._runs:
+                is_complete = self._check_complete(entry)
+                is_cancelled = False if is_complete else self._check_cancelled(entry)
                 info = RunInfo(
                     run_id=run_id,
                     run_dir=entry,
                     metadata=self._load_metadata(entry),
-                    is_complete=self._check_complete(entry),
+                    is_complete=is_complete,
+                    is_cancelled=is_cancelled,
                     step_count=self._count_steps(entry),
                 )
                 self._runs[run_id] = info
@@ -65,9 +69,11 @@ class RunRegistry:
                 if not info.metadata:
                     info.metadata = self._load_metadata(entry)
                 # update step count and completion for active runs
-                if not info.is_complete:
+                if not info.is_complete and not info.is_cancelled:
                     info.step_count = self._count_steps(entry)
                     info.is_complete = self._check_complete(entry)
+                    if not info.is_complete:
+                        info.is_cancelled = self._check_cancelled(entry)
 
         return new_ids
 
@@ -95,6 +101,13 @@ class RunRegistry:
 
     def _check_complete(self, run_dir: Path) -> bool:
         """Check if episode_complete event exists by reading the tail of events.jsonl."""
+        return self._events_tail_contains(run_dir, "episode_complete")
+
+    def _check_cancelled(self, run_dir: Path) -> bool:
+        """Check if episode_cancelled event exists by reading the tail of events.jsonl."""
+        return self._events_tail_contains(run_dir, "episode_cancelled")
+
+    def _events_tail_contains(self, run_dir: Path, keyword: str) -> bool:
         events_path = run_dir / "events.jsonl"
         if not events_path.exists():
             return False
@@ -106,7 +119,7 @@ class RunRegistry:
             with open(events_path, "rb") as f:
                 f.seek(max(0, size - read_size))
                 tail = f.read().decode("utf-8", errors="ignore")
-            return "episode_complete" in tail
+            return keyword in tail
         except OSError:
             return False
 

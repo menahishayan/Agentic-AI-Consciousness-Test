@@ -183,6 +183,7 @@ class RunLogger:
             "adapter": config.get("adapter_folder", "unknown"),
             "llm_provider": config.get("llm", {}).get("provider", "unknown"),
             "llm_model": config.get("llm", {}).get("model", "unknown"),
+            "ablation_mode": config.get("ablation", {}).get("mode", "full"),
             "config": config,
         }
         (self._dir / "run.json").write_text(safe_dumps(meta))
