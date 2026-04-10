@@ -46,8 +46,30 @@ class MetacognitiveMonitor:
         # P(sat > threshold at t+N) = sigmoid(ticks_to_critical / N)
         # N is the prediction horizon; threshold is the survival setpoint.
         mc = config.get("metacognitive", {})
-        self._confidence_horizon: int = int(mc.get("confidence_horizon", 50))
         self._sat_survival_threshold: float = float(mc.get("sat_survival_threshold", 0.25))
+
+        # Calibrate horizon to the actual depletion timescale so the sigmoid
+        # spans [0.5, ~0.88] across the full viable saturation range rather
+        # than saturating in the first few dozen steps.
+        #
+        # ticks_from_setpoint_to_critical ≈ (setpoint - threshold) / depletion_rate
+        # horizon = ticks / 2 → sigmoid(ticks/horizon)=sigmoid(2)≈0.88 at full sat
+        #
+        # Reads from adapter_config.homeostatic so it tracks the actual sim rate.
+        # Falls back to mc["confidence_horizon"] if explicitly overridden, then 200.
+        if "confidence_horizon" in mc:
+            self._confidence_horizon: int = int(mc["confidence_horizon"])
+        else:
+            hc = config.get("adapter_config", {}).get("homeostatic", {})
+            sat_depletion_rate: float = float(hc.get("saturation_depletion_rate", 0.001))
+            sat_setpoint: float = float(mc.get("sat_setpoint", 0.7))
+            if sat_depletion_rate > 0.0:
+                self._confidence_horizon = max(
+                    10,
+                    int((sat_setpoint - self._sat_survival_threshold) / sat_depletion_rate / 2),
+                )
+            else:
+                self._confidence_horizon = 200
 
     def update(
         self,
@@ -149,7 +171,15 @@ class MetacognitiveMonitor:
             if signal.channel_id == "saturation":
                 ticks = signal.ticks_to_critical
                 if ticks is None:
-                    return 1.0
+                    # No depletion forecast (rate ≤ 0 — stable or recovering).
+                    # Rather than locking at 1.0, scale with current saturation
+                    # margin so confidence varies continuously even in healthy states.
+                    # sat=1.0 → 0.95, sat=threshold → 0.5
+                    margin = (
+                        (signal.current_value - self._sat_survival_threshold)
+                        / max(1.0 - self._sat_survival_threshold, 1e-6)
+                    )
+                    return float(min(0.95, max(0.5, margin)))
                 return float(1.0 / (1.0 + math.exp(-float(ticks) / self._confidence_horizon)))
         # saturation channel absent (e.g. no_interoceptive ablation)
         return 0.5

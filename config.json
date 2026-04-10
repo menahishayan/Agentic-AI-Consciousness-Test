@@ -15,6 +15,7 @@
       "interaction_radius": 1.0,
       "hazard_margin": 2.0,
       "n_food": 6,
+      "n_badgoal": 2,
       "seed": null
     },
     "arena_config": "animalai_configs/basic_food.yaml",
