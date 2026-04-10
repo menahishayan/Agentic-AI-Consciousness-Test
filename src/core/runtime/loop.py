@@ -104,6 +104,7 @@ class AgentLoop:
             step: int,
             selected: Optional[str] = None,
             llm_reason: Optional[str] = None,
+            efe_scores: Optional[Dict[str, Any]] = None,
         ) -> None:
             logger.llm(
                 prompt=prompt,
@@ -116,6 +117,7 @@ class AgentLoop:
                 selected=selected,
                 reason=llm_reason,
                 step=step,
+                efe_scores=efe_scores,
             )
 
         self._policy_gen.set_llm_log_callback(_llm_log_cb)

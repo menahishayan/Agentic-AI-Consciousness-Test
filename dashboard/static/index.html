@@ -653,7 +653,7 @@ function buildChartGrid() {
 
     <!-- Row 2 -->
     <div class="chart-card">
-      <div class="chart-title">Drive Urgency</div>
+      <div class="chart-title">HPA-Axis Drive</div>
       <div class="chart-wrap"><canvas id="ch-urgency"></canvas></div>
     </div>
     <div class="chart-card">
@@ -666,6 +666,12 @@ function buildChartGrid() {
       <div class="chart-title">Outcome Score</div>
       <div class="chart-wrap"><canvas id="ch-outcome"></canvas></div>
     </div>
+    <div class="chart-card">
+      <div class="chart-title">Interoceptive Confidence P(sat &gt; threshold at t+N)</div>
+      <div class="chart-wrap"><canvas id="ch-confidence"></canvas></div>
+    </div>
+
+    <!-- Row 4 -->
     <div class="chart-card">
       <div class="chart-title">Step Timing (ms)<span id="timing-avg-label" style="margin-left:10px;font-weight:400;color:var(--muted);"></span></div>
       <div class="chart-wrap"><canvas id="ch-timing"></canvas></div>
@@ -715,6 +721,9 @@ function initCharts() {
   state.charts.homeostasis = makeLineChart('ch-homeostasis', [
     ds('Health', '#50fa7b'),
     ds('Saturation', '#7c8cf8'),
+  ], { min: 0, max: 1 });
+
+  state.charts.confidence = makeLineChart('ch-confidence', [
     ds('Interoceptive Confidence', '#fbbf24'),
   ], { min: 0, max: 1 });
 
@@ -870,7 +879,8 @@ function ingestMetric(row) {
     chart.data.datasets.forEach((ds, i) => ds.data.push(vals[i] ?? null));
   }
 
-  push(state.charts.homeostasis, row.health, row.saturation, row.interoceptive_confidence);
+  push(state.charts.homeostasis, row.health, row.saturation);
+  push(state.charts.confidence, row.interoceptive_confidence);
   push(state.charts.arousal, row.arousal, row.valence);
   push(state.charts.urgency, row.drive_urgency);
   push(state.charts.pe, row.pe_mean);

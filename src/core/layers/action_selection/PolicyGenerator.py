@@ -360,7 +360,10 @@ class PolicyGenerator:
                     # llm.jsonl — see RunLogger.llm() for the full mapping.
                     # depth is intentionally not forwarded: it would duplicate
                     # trigger_reason and silently go stale if the trigger logic changes.
-                    self._llm_log_cb(prompt, response, trigger_reason, step, selected, llm_reason)
+                    self._llm_log_cb(
+                        prompt, response, trigger_reason, step, selected, llm_reason,
+                        efe_scores=context.get("free_energy_scores", {}),
+                    )
                 except Exception as log_exc:
                     log.debug("LLM log callback failed: %s", log_exc)
 

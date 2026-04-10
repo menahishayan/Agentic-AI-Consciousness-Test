@@ -113,6 +113,7 @@ class RunLogger:
         selected: Optional[str] = None,
         reason: Optional[str] = None,
         step: int = 0,
+        efe_scores: Optional[Dict[str, Any]] = None,
     ) -> None:
         """Append one LLM call record to llm.jsonl.
 
@@ -143,6 +144,8 @@ class RunLogger:
             }
             if reason is not None:
                 entry["reason"] = reason
+            if efe_scores:
+                entry["efe_scores"] = efe_scores
             self._append(self._llm_f, entry)
 
     def memory_op(self, op: str, details: Any, step: int = 0) -> None:
