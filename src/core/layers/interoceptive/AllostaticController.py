@@ -153,6 +153,13 @@ class AllostaticController:
         if self._ablation_mode == AblationMode.REACTIVE:
             return 1.0 if current <= channel.critical_threshold + 0.05 else 0.0
 
+        # No-interoceptive baseline (E1 ablation): urgency zeroed for all channels.
+        # The agent receives no drive signals — no pragmatic urgency, no food-proximity
+        # bonus, no saturation-attention coupling.  All urgency-contingent behaviors
+        # (allostatic anticipation, goal persistence, crosstalk) should vanish.
+        if self._ablation_mode == AblationMode.NO_INTEROCEPTIVE:
+            return 0.0
+
         # Component 1: setpoint deviation
         if current >= channel.setpoint:
             setpoint_urgency = 0.0
