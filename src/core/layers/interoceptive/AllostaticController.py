@@ -19,6 +19,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from core.coordination.messages import AgentMessage
 from core.coordination.workspace import GlobalWorkspace
+from core.models.ablation import AblationMode
 from core.models.signals import DriveChannel, DriveSignal, DriveSignalBatch
 
 
@@ -35,6 +36,10 @@ class AllostaticController:
     ) -> None:
         self._channels: Dict[str, DriveChannel] = {ch.channel_id: ch for ch in drive_channels}
         cfg = config.get("allostatic_controller", {})
+        ablation_cfg = config.get("ablation", {})
+        self._ablation_mode: AblationMode = AblationMode(
+            ablation_cfg.get("mode", AblationMode.FULL.value)
+        )
         self._planning_horizon: int = int(cfg.get("planning_horizon", 50))
         self._history_window: int = int(cfg.get("history_window", 20))
         self._urgency_tie_epsilon: float = float(cfg.get("urgency_tie_epsilon", 0.05))
@@ -142,6 +147,12 @@ class AllostaticController:
 
         Returns float in [0, 1].
         """
+        # Reactive baseline (B1 ablation): no predictive component.
+        # Urgency fires only when the drive is already at the edge of critical —
+        # pure reactive regulation, the opposite of allostatic anticipation.
+        if self._ablation_mode == AblationMode.REACTIVE:
+            return 1.0 if current <= channel.critical_threshold + 0.05 else 0.0
+
         # Component 1: setpoint deviation
         if current >= channel.setpoint:
             setpoint_urgency = 0.0
