@@ -41,7 +41,7 @@ from scipy.stats import mannwhitneyu, norm as _sp_norm, pearsonr, spearmanr
 # ── path setup ──────────────────────────────────────────────────────────────
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent / "src"))
 
-from core.adapters.headless.env_adapter import HeadlessSimAdapter
+from core.adapters.headless.env_adapter import FoodItem, HeadlessSimAdapter
 from core.coordination.workspace import GlobalWorkspace
 from core.layers.action_selection.FreeEnergyMinimizer import FreeEnergyMinimizer
 from core.layers.interoceptive.AllostaticController import AllostaticController
@@ -127,6 +127,8 @@ def _run_episode(
     starting_saturation: Optional[float] = None,
     starting_health: Optional[float] = None,
     hold_saturation_steps: int = 0,
+    food_removal_step: Optional[int] = None,
+    food_positions_override: Optional[List[Tuple[float, float]]] = None,
 ) -> List[Dict[str, Any]]:
     """
     Run one episode with deterministic EFE-argmax policy (no LLM).
@@ -158,6 +160,14 @@ def _run_episode(
     hold_saturation_steps — disable saturation depletion for the first N steps
                          then restore the configured rate.  Used by B3 to keep
                          the interoceptive condition constant during measurement.
+
+    food_removal_step     — at this step, all food items are consumed and food
+                         respawn is suppressed for the remainder of the episode.
+                         Used by C3a to test goal-persistence after food loss.
+
+    food_positions_override — if provided, replace the randomly-spawned food
+                         items with food at exactly these (x, z) positions after
+                         reset.  Used by C2/C3 to guarantee food visibility.
     """
     adapter = HeadlessSimAdapter(sim_cfg)
     ac = AllostaticController(adapter.get_drive_channels(), brain_cfg)
@@ -171,6 +181,12 @@ def _run_episode(
         adapter._homeostatic._saturation = float(starting_saturation)
     if starting_health is not None:
         adapter._homeostatic._health = float(starting_health)
+
+    # Override food positions: place food at exact coordinates instead of random spawn.
+    # Rebuild the initial state so that step-0 raycasts reflect the new food positions.
+    if food_positions_override is not None:
+        adapter._food = [FoodItem(float(x), float(z)) for x, z in food_positions_override]
+        state = adapter._build_state(reward=0.0)   # propagate override to first state
 
     # Optionally hold saturation constant for the first N steps
     saved_depletion_rate = adapter._homeostatic.saturation_depletion_rate
@@ -186,6 +202,14 @@ def _run_episode(
                 and step == drive_injection_step
                 and drive_injection_channel == "saturation"):
             adapter._homeostatic._saturation = float(drive_injection_value)
+
+        # Food removal: consume all remaining food and suppress respawn.
+        # Applied BEFORE this step's raycasts so the removal is reflected in
+        # the current step's perception (food disappears this step).
+        if food_removal_step is not None and step == food_removal_step:
+            for f in adapter._food:
+                f.consumed = True
+            adapter._n_food = 0   # _spawn_food() will return [] on any respawn check
 
         # Restore depletion rate after the hold window.
         if hold_saturation_steps > 0 and step == hold_saturation_steps:
@@ -251,6 +275,9 @@ def _run_episode(
             "food_distance":            float(min_food_dist),
             "food_attention_weight":    float(food_attention_weight),
             "food_attention_weight_sat": float(food_attention_weight_sat),
+            "x":                        float(state.position.x or 0.0),
+            "z":                        float(state.position.z or 0.0),
+            "heading":                  float(state.position.heading or 0.0),
         })
 
         state, done = adapter.step(policy_id)

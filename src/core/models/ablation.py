@@ -32,3 +32,4 @@ class AblationMode(str, Enum):
     NO_AROUSAL = "no_arousal"
     EFE_ONLY = "efe_only"
     REACTIVE = "reactive"          # B1: binary urgency — no allostatic prediction
+    NO_EPISTEMIC = "no_epistemic"  # C1: epistemic term zeroed; pure pragmatic argmax
