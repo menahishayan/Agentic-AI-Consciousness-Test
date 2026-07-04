@@ -34,13 +34,17 @@ def _setup_paths(root: str):
 def d1(outdir: str):
     """D1 boxplot + histogram of self-caused vs external PE (Fig 7.x)."""
     from scipy.stats import wilcoxon
+
     from core.layers.predictive.WorldModelGenerator import WorldModelGenerator
-    from tests.functional.test_d_suite import (
-        _run_d1_episode,
-        _N_D1_WARMUP, _N_D1_TEST, _STEPS_D1,
-        _D1_INJECTION_STEP, _D1_INJECTION_VALUE,
-    )
     from tests.functional.test_b_suite import _make_cfg
+    from tests.functional.test_d_suite import (
+        _D1_INJECTION_STEP,
+        _D1_INJECTION_VALUE,
+        _N_D1_TEST,
+        _N_D1_WARMUP,
+        _STEPS_D1,
+        _run_d1_episode,
+    )
 
     # Mirror test_d1_causal_self_attribution exactly.
     sim_cfg, brain_cfg = _make_cfg(
@@ -176,9 +180,15 @@ def _grouped_figure(groups: dict, ylabel: str, title: str, outpath: str,
 def b1(outdir: str):
     """B1 anticipatory foraging rate, full vs reactive (Fig 7.x)."""
     from scipy.stats import mannwhitneyu
+
     from tests.functional.test_b_suite import (
-        _run_n_episodes, _make_cfg, _b1_anticipatory_rate, _N_B1, _STEPS_B1,
+        _N_B1,
+        _STEPS_B1,
+        _b1_anticipatory_rate,
+        _make_cfg,
+        _run_n_episodes,
     )
+
     ov = {"simulation": {"n_food": 4}, "homeostatic": {"saturation_depletion_rate": 0.001}}
     sf, bf = _make_cfg(sim_overrides=ov, ablation_mode="full")
     sr, br = _make_cfg(sim_overrides=ov, ablation_mode="reactive")
@@ -208,9 +218,10 @@ def b1(outdir: str):
     _grouped_figure(
         {"Full": rf, "Reactive": rr},
         "Anticipatory rate (food-seeking steps at sat > 0.35)",
-        f"B1: Allostatic vs. Reactive   (MWU p = {p:.2e}, n={_N_B1} matched)",
+        f"B1: Allostatic vs. Reactive  \n (MWU p = {p:.2e}, n={_N_B1} matched)",
         os.path.join(outdir, "fig_7x_b1_anticipatory.png"),
-        hline=0.50, hline_label="0.50 target",
+        hline=0.50,
+        hline_label="0.50 target",
     )
     print(json.dumps({
         "mean_full": float(rf.mean()), "mean_reactive": float(rr.mean()),
@@ -224,8 +235,9 @@ def b1(outdir: str):
 def coverage(outdir: str):
     """C1 + E2 arena coverage at step 200: full vs no_epistemic vs efe_only."""
     from scipy.stats import mannwhitneyu
-    from tests.functional.test_b_suite import _run_n_episodes, _make_cfg
-    from tests.functional.test_c_suite import _arena_coverage, _N_C1, _STEPS_C1
+
+    from tests.functional.test_b_suite import _make_cfg, _run_n_episodes
+    from tests.functional.test_c_suite import _N_C1, _STEPS_C1, _arena_coverage
 
     def cov200(ep):
         return _arena_coverage([r for r in ep if r["step"] < 200])
@@ -245,11 +257,14 @@ def coverage(outdir: str):
             for i, v in enumerate(arr):
                 fh.write(f"{mode},{i},{v:.6f}\n")
     _grouped_figure(
-        {"Full": out["full"], "No-epistemic": out["no_epistemic"], "EFE-only": out["efe_only"]},
+        {
+            "Full": out["full"],
+            "No-epistemic": out["no_epistemic"],
+            "EFE-only": out["efe_only"],
+        },
         "Arena coverage at step 200 (fraction of cells)",
         "C1 / E2: Epistemic exploration coverage",
         os.path.join(outdir, "fig_7x_c1_e2_coverage.png"),
-        hline=0.25, hline_label="0.25 C1 target",
     )
     _, p_c1 = mannwhitneyu(out["full"], out["no_epistemic"], alternative="greater")
     print(json.dumps({
@@ -278,14 +293,19 @@ def d1_control(outdir: str):
         large drop), NOT self-attribution -> the mechanism claim must be dropped.
     """
     import copy
+
     from scipy.stats import wilcoxon
+
     from core.layers.predictive.WorldModelGenerator import WorldModelGenerator
-    from tests.functional.test_d_suite import (
-        _run_d1_episode,
-        _N_D1_WARMUP, _N_D1_TEST, _STEPS_D1,
-        _D1_INJECTION_STEP, _D1_INJECTION_VALUE,
-    )
     from tests.functional.test_b_suite import _make_cfg
+    from tests.functional.test_d_suite import (
+        _D1_INJECTION_STEP,
+        _D1_INJECTION_VALUE,
+        _N_D1_TEST,
+        _N_D1_WARMUP,
+        _STEPS_D1,
+        _run_d1_episode,
+    )
 
     class NullWorldModel:
         """Predicts no change (current saturation); learns nothing."""
@@ -360,10 +380,16 @@ def d1_control(outdir: str):
 def b3(outdir: str):
     """B3 interoceptive-exteroceptive crosstalk: saturation vs food-attention weight."""
     from scipy.stats import pearsonr
+
     from tests.functional.test_b_suite import (
-        _run_episode, _make_cfg, _partial_pearsonr,
-        _SAT_CONDITIONS, _N_B3_PER_CONDITION, _STEPS_B3,
+        _N_B3_PER_CONDITION,
+        _SAT_CONDITIONS,
+        _STEPS_B3,
+        _make_cfg,
+        _partial_pearsonr,
+        _run_episode,
     )
+
     base_ov = {"simulation": {"n_food": 4, "seed": 42},
                "homeostatic": {"saturation_depletion_rate": 0.0}}
     sim_base, brain = _make_cfg(sim_overrides=base_ov, ablation_mode="full")
@@ -409,11 +435,18 @@ def b3(outdir: str):
 def c3(outdir: str):
     """C3a goal persistence (full vs no-memory) and C3b satiation suppression."""
     from scipy.stats import mannwhitneyu
-    from tests.functional.test_b_suite import _run_episode, _make_cfg
+
+    from tests.functional.test_b_suite import _make_cfg, _run_episode
     from tests.functional.test_c_suite import (
-        _persistence_steps, _FOOD_AHEAD_FAR, _FOOD_AHEAD_NEAR,
-        _FOOD_REMOVAL_STEP_C3A, _SAT_WINDOW,
-        _N_C3A, _STEPS_C3A, _N_C3B, _STEPS_C3B,
+        _FOOD_AHEAD_FAR,
+        _FOOD_AHEAD_NEAR,
+        _FOOD_REMOVAL_STEP_C3A,
+        _N_C3A,
+        _N_C3B,
+        _SAT_WINDOW,
+        _STEPS_C3A,
+        _STEPS_C3B,
+        _persistence_steps,
     )
 
     # ---- C3a: persistence after food removal, full vs no-memory ----
@@ -491,9 +524,13 @@ def c3a_probe(outdir: str):
     enough to flip the argmax to move_forward. Runs the REAL _run_episode (full
     condition) so nothing is reimplemented.
     """
-    from tests.functional.test_b_suite import _run_episode, _make_cfg
-    from tests.functional.test_c_suite import _FOOD_AHEAD_FAR, _FOOD_REMOVAL_STEP_C3A, _STEPS_C3A
     from core.layers.action_selection.FreeEnergyMinimizer import FreeEnergyMinimizer
+    from tests.functional.test_b_suite import _make_cfg, _run_episode
+    from tests.functional.test_c_suite import (
+        _FOOD_AHEAD_FAR,
+        _FOOD_REMOVAL_STEP_C3A,
+        _STEPS_C3A,
+    )
 
     N_EPISODES = 5
     WINDOW = 35  # persistence window used by the test: [removal, removal+35)
