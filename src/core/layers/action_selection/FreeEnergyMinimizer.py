@@ -32,6 +32,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional
 
+from core.models.ablation import AblationMode
 from core.models.signals import DriveSignalBatch, PredictionErrorBatch
 
 # Actions that scan unseen directions — pure epistemic value
@@ -114,6 +115,10 @@ class FreeEnergyMinimizer:
         self._food_memory_urgency_threshold: float = float(
             pg.get("food_memory_urgency_threshold", 0.3)
         )
+        ablation_cfg = config.get("ablation", {})
+        self._ablation_mode: AblationMode = AblationMode(
+            ablation_cfg.get("mode", AblationMode.FULL.value)
+        )
 
     def _food_bonus_for_action(
         self,
@@ -189,6 +194,12 @@ class FreeEnergyMinimizer:
         arousal = float(context.get("arousal", 0.0)) if context else 0.0
         lc_ne_gain = 0.4
         w_epistemic_eff = self._w_epistemic * (1.0 + arousal * lc_ne_gain)
+
+        # C1 ablation: zero the epistemic term entirely — pure pragmatic argmax.
+        # At satiation (urgency≈0) this causes idle to dominate all active actions,
+        # since pragmatic=0 and epistemic=0 leave idle as the only non-zero scorer.
+        if self._ablation_mode == AblationMode.NO_EPISTEMIC:
+            w_epistemic_eff = 0.0
 
         # Recency penalty: motor habituation.
         # Uses last 4 recent_actions; fires if a policy_id appears ≥2 times.

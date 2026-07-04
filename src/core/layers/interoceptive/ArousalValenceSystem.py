@@ -114,15 +114,15 @@ class ArousalValenceSystem:
         # ── Contentment: quiescent regulatory success ────────────────────
         # Seth (2021): low urgency across all drives = interoceptive target met.
         # Quiescence is positively valenced, not merely zero-valenced.
-        self._contentment_floor: float = float(av.get("contentment_floor", 0.20))
+        self._contentment_floor: float = float(av.get("contentment_floor", 0.30))
         self._contentment_baseline: float = float(av.get("contentment_baseline", 0.15))
 
         # ── Anxiety: high PE without locatable source ────────────────────
         # Davis & Whalen (2001): amygdala CeA → anxious state without explicit
         # conditioned stimulus. Distinct from fear: no proximal threat detected.
-        # Threshold raised to 0.40 so ambient PE noise doesn't fire anxiety
+        # Threshold raised to 0.45 so ambient PE noise doesn't fire anxiety
         # every step the agent isn't looking at food.
-        self._anxiety_pe_threshold: float = float(av.get("anxiety_pe_threshold", 0.40))
+        self._anxiety_pe_threshold: float = float(av.get("anxiety_pe_threshold", 0.45))
         self._anxiety_threat_ceiling: float = float(av.get("anxiety_threat_ceiling", 0.15))
         self._anxiety_weight: float = float(av.get("anxiety_weight", 0.20))
 

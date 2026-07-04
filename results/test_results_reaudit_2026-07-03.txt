@@ -1,0 +1,332 @@
+python results/figures_from_tests.py d1        --outdir results/figures  
+python results/figures_from_tests.py b1        --outdir results/figures
+python results/figures_from_tests.py coverage  --outdir results/figures
+{
+  "n_pairs": 50,
+  "median_self": 0.24918466754016097,
+  "median_external": 0.5999982292261876,
+  "ratio_external_over_self": 2.407845695921424,
+  "var_self": 0.0012490463941320696,
+  "var_external": 0.009978225979206574,
+  "wilcoxon_p": 8.881784197001252e-16
+}
+
+Compare to paper §7.6.1: ratio ~2.2, Wilcoxon p<0.01, var(ext)>var(self).
+Wrote: results/figures/d1_pe_paired.csv  and  fig_7x_d1_pe_distribution.png
+{
+  "mean_full": 0.7,
+  "mean_reactive": 0.055046620046620046,
+  "median_full": 1.0,
+  "median_reactive": 0.0,
+  "mannwhitney_p": 9.37237228208254e-05,
+  "n_episodes": 20,
+  "full_rates": [
+    1.0,
+    0.0,
+    1.0,
+    1.0,
+    1.0,
+    0.0,
+    1.0,
+    1.0,
+    1.0,
+    0.0,
+    1.0,
+    0.0,
+    1.0,
+    1.0,
+    1.0,
+    0.0,
+    1.0,
+    1.0,
+    0.0,
+    1.0
+  ],
+  "reactive_rates": [
+    0.0,
+    0.0,
+    0.1667,
+    0.0,
+    0.2,
+    0.0,
+    0.0,
+    0.0,
+    0.3846,
+    0.0,
+    0.2727,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0769,
+    0.0,
+    0.0
+  ]
+}
+
+Use mean_full / mean_reactive to replace the '100% / 0%' figures in §7.5.1.
+{
+  "mean_full": 0.0057777777777777775,
+  "mean_no_epistemic": 0.012,
+  "mean_efe_only": 0.0057777777777777775,
+  "c1_full_vs_no_epistemic_mwu_p": 0.9980634199697773,
+  "e2_full_minus_efe_only": 0.0
+}
+
+C1: note full coverage is expected < 0.25 (pe_batch=None infra fail) but > no_epistemic.
+E2: full ≈ efe_only (diff should be < 0.03) confirms EFE-structural exploration.
+(venv) shayan@Shayans-MacBook-Pro Capstone % python results/figures_from_tests.py d1_control --outdir results/figures
+python results/figures_from_tests.py b1        --outdir results/figures                                      
+{
+  "with_efference_copy": {
+    "n": 50,
+    "median_self": 0.24918466754016097,
+    "median_external": 0.5999982292261876,
+    "ratio": 2.407845695921424,
+    "var_self": 0.0012490463941320696
+  },
+  "no_efference_copy": {
+    "n": 50,
+    "median_self": 0.24900000000000005,
+    "median_external": 0.601,
+    "ratio": 2.413654618473895,
+    "var_self": 0.0010673611111111112
+  },
+  "self_pe_reduced_by_wm_p": 0.014388844218769476
+}
+
+Interpretation:
+  median_self WITH efference copy should be LOWER than WITHOUT it,
+  and self_pe_reduced_by_wm_p < 0.05, for the mechanism claim to hold.
+  If they are equal/higher, drop the efference-copy mechanism from 7.6.1.
+B1 full-condition per-episode diagnostic:
+   seed  steps food_seek antic_rate  note
+   1000   1000         7      1.000  
+   1001   1000         0      0.000  no foraging (rate undefined)
+   1002   1000         6      1.000  
+   1003   1000         4      1.000  
+   1004   1000        11      1.000  
+   1005   1000         0      0.000  no foraging (rate undefined)
+   1006   1000         1      1.000  
+   1007   1000        11      1.000  
+   1008   1000        13      1.000  
+   1009   1000         0      0.000  no foraging (rate undefined)
+   1010   1000         9      1.000  
+   1011   1000         0      0.000  no foraging (rate undefined)
+   1012   1000        10      1.000  
+   1013   1000        10      1.000  
+   1014   1000         7      1.000  
+   1015   1000         0      0.000  no foraging (rate undefined)
+   1016   1000         6      1.000  
+   1017   1000         8      1.000  
+   1018   1000         0      0.000  no foraging (rate undefined)
+   1019   1000         9      1.000  
+{
+  "mean_full": 0.7,
+  "mean_reactive": 0.055046620046620046,
+  "median_full": 1.0,
+  "median_reactive": 0.0,
+  "mannwhitney_p": 9.37237228208254e-05,
+  "n_episodes": 20,
+  "full_rates": [
+    1.0,
+    0.0,
+    1.0,
+    1.0,
+    1.0,
+    0.0,
+    1.0,
+    1.0,
+    1.0,
+    0.0,
+    1.0,
+    0.0,
+    1.0,
+    1.0,
+    1.0,
+    0.0,
+    1.0,
+    1.0,
+    0.0,
+    1.0
+  ],
+  "reactive_rates": [
+    0.0,
+    0.0,
+    0.1667,
+    0.0,
+    0.2,
+    0.0,
+    0.0,
+    0.0,
+    0.3846,
+    0.0,
+    0.2727,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0769,
+    0.0,
+    0.0
+  ]
+}
+
+Use mean_full / mean_reactive to replace the '100% / 0%' figures in §7.5.1.
+
+python results/figures_from_tests.py b3  --outdir results/figures
+python results/figures_from_tests.py c3  --outdir results/figures
+{
+  "pearson_r_sat_weight": -0.6939413060851035,
+  "pearson_p": 7.869355322296826e-10,
+  "partial_r_controlling_food_dist": -0.7216603421231292,
+  "ratio_sat025_over_sat075": 82.16082166163154,
+  "mean_weight_by_condition": {
+    "sat=1.0": 0.004552508027238248,
+    "sat=0.75": 0.004552508027238248,
+    "sat=0.5": 0.15618293227846886,
+    "sat=0.25": 0.37411896096072944
+  }
+}
+
+Paper §7.5 B3: report r (expect < -0.50, p < 0.01), partial r < -0.30, ratio >= 2.
+{
+  "c3a_mean_full": 6.0,
+  "c3a_mean_no_memory": 6.0,
+  "c3a_pct_full_gt10": 0.0,
+  "c3a_pct_nomem_gt10": 0.0,
+  "c3a_mwu_p": 1.0,
+  "c3b_suppression_rate": 1.0,
+  "c3b_suppressed_of_n": "20/20"
+}
+
+Paper: C3a targets full mean > 15 & >55% trials >10 steps (this is the architectural FAIL — report observed mean). C3b PASS if suppression_rate > 0.50.
+
+=== episode seed 5000 (post-removal window) ===
+  step food_vis sat_urg  gate    lfa mf_bonus        winner      mf best_oth decisive
+     5     True   0.518 False    0.0      0.0  move_forward  0.6673    0.425    False
+     6    False    0.52  True    0.0   0.1101     turn_left  0.0701    0.425    False
+     7    False   0.521  True    0.0   0.1104     turn_left  0.0704    0.425    False
+     8    False   0.523  True    0.0   0.1107    turn_right  0.0707    0.425    False
+     9    False   0.524  True    0.0    0.111    turn_right   0.321    0.425    False
+    10    False   0.526  True    0.0   0.1113  move_forward  0.3213   0.2025    False
+    11    False   0.527  True    0.0   0.1116     turn_left  0.3216    0.425    False
+    12    False   0.529  True    0.0   0.1119     turn_left  0.3219    0.425    False
+    13    False    0.53  True    0.0   0.1122    turn_right  0.3222    0.425    False
+    14    False   0.532  True    0.0   0.1125    turn_right  0.3225    0.425    False
+    15    False   0.533  True    0.0   0.1128  move_forward  0.3228   0.2025    False
+    16    False   0.534  True    0.0   0.1132     turn_left  0.3232    0.425    False
+    17    False   0.536  True    0.0   0.1135     turn_left  0.3235    0.425    False
+    18    False   0.537  True    0.0   0.1138    turn_right  0.3238    0.425    False
+    19    False   0.539  True    0.0   0.1141    turn_right  0.3241    0.425    False
+    20    False    0.54  True    0.0   0.1144  move_forward  0.3244   0.2025    False
+    21    False   0.542  True    0.0   0.1147     turn_left  0.3247    0.425    False
+    22    False   0.543  True    0.0    0.115     turn_left   0.325    0.425    False
+    23    False   0.545  True    0.0   0.1153    turn_right  0.3253    0.425    False
+    24    False   0.546  True    0.0   0.1156    turn_right  0.3256    0.425    False
+
+=== episode seed 5001 (post-removal window) ===
+  step food_vis sat_urg  gate    lfa mf_bonus        winner      mf best_oth decisive
+     5     True   0.518 False    0.0      0.0  move_forward  0.6673    0.425    False
+     6    False    0.52  True    0.0   0.1101     turn_left  0.0701    0.425    False
+     7    False   0.521  True    0.0   0.1104     turn_left  0.0704    0.425    False
+     8    False   0.523  True    0.0   0.1107    turn_right  0.0707    0.425    False
+     9    False   0.524  True    0.0    0.111    turn_right   0.321    0.425    False
+    10    False   0.526  True    0.0   0.1113  move_forward  0.3213   0.2025    False
+    11    False   0.527  True    0.0   0.1116     turn_left  0.3216    0.425    False
+    12    False   0.529  True    0.0   0.1119     turn_left  0.3219    0.425    False
+    13    False    0.53  True    0.0   0.1122    turn_right  0.3222    0.425    False
+    14    False   0.532  True    0.0   0.1125    turn_right  0.3225    0.425    False
+    15    False   0.533  True    0.0   0.1128  move_forward  0.3228   0.2025    False
+    16    False   0.534  True    0.0   0.1132     turn_left  0.3232    0.425    False
+    17    False   0.536  True    0.0   0.1135     turn_left  0.3235    0.425    False
+    18    False   0.537  True    0.0   0.1138    turn_right  0.3238    0.425    False
+    19    False   0.539  True    0.0   0.1141    turn_right  0.3241    0.425    False
+    20    False    0.54  True    0.0   0.1144  move_forward  0.3244   0.2025    False
+    21    False   0.542  True    0.0   0.1147     turn_left  0.3247    0.425    False
+    22    False   0.543  True    0.0    0.115     turn_left   0.325    0.425    False
+    23    False   0.545  True    0.0   0.1153    turn_right  0.3253    0.425    False
+    24    False   0.546  True    0.0   0.1156    turn_right  0.3256    0.425    False
+
+=== episode seed 5002 (post-removal window) ===
+  step food_vis sat_urg  gate    lfa mf_bonus        winner      mf best_oth decisive
+     5     True   0.518 False    0.0      0.0  move_forward  0.6673    0.425    False
+     6    False    0.52  True    0.0   0.1101     turn_left  0.0701    0.425    False
+     7    False   0.521  True    0.0   0.1104     turn_left  0.0704    0.425    False
+     8    False   0.523  True    0.0   0.1107    turn_right  0.0707    0.425    False
+     9    False   0.524  True    0.0    0.111    turn_right   0.321    0.425    False
+    10    False   0.526  True    0.0   0.1113  move_forward  0.3213   0.2025    False
+    11    False   0.527  True    0.0   0.1116     turn_left  0.3216    0.425    False
+    12    False   0.529  True    0.0   0.1119     turn_left  0.3219    0.425    False
+    13    False    0.53  True    0.0   0.1122    turn_right  0.3222    0.425    False
+    14    False   0.532  True    0.0   0.1125    turn_right  0.3225    0.425    False
+    15    False   0.533  True    0.0   0.1128  move_forward  0.3228   0.2025    False
+    16    False   0.534  True    0.0   0.1132     turn_left  0.3232    0.425    False
+    17    False   0.536  True    0.0   0.1135     turn_left  0.3235    0.425    False
+    18    False   0.537  True    0.0   0.1138    turn_right  0.3238    0.425    False
+    19    False   0.539  True    0.0   0.1141    turn_right  0.3241    0.425    False
+    20    False    0.54  True    0.0   0.1144  move_forward  0.3244   0.2025    False
+    21    False   0.542  True    0.0   0.1147     turn_left  0.3247    0.425    False
+    22    False   0.543  True    0.0    0.115     turn_left   0.325    0.425    False
+    23    False   0.545  True    0.0   0.1153    turn_right  0.3253    0.425    False
+    24    False   0.546  True    0.0   0.1156    turn_right  0.3256    0.425    False
+
+=== episode seed 5003 (post-removal window) ===
+  step food_vis sat_urg  gate    lfa mf_bonus        winner      mf best_oth decisive
+     5     True   0.518 False    0.0      0.0  move_forward  0.6673    0.425    False
+     6    False    0.52  True    0.0   0.1101     turn_left  0.0701    0.425    False
+     7    False   0.521  True    0.0   0.1104     turn_left  0.0704    0.425    False
+     8    False   0.523  True    0.0   0.1107    turn_right  0.0707    0.425    False
+     9    False   0.524  True    0.0    0.111    turn_right   0.321    0.425    False
+    10    False   0.526  True    0.0   0.1113  move_forward  0.3213   0.2025    False
+    11    False   0.527  True    0.0   0.1116     turn_left  0.3216    0.425    False
+    12    False   0.529  True    0.0   0.1119     turn_left  0.3219    0.425    False
+    13    False    0.53  True    0.0   0.1122    turn_right  0.3222    0.425    False
+    14    False   0.532  True    0.0   0.1125    turn_right  0.3225    0.425    False
+    15    False   0.533  True    0.0   0.1128  move_forward  0.3228   0.2025    False
+    16    False   0.534  True    0.0   0.1132     turn_left  0.3232    0.425    False
+    17    False   0.536  True    0.0   0.1135     turn_left  0.3235    0.425    False
+    18    False   0.537  True    0.0   0.1138    turn_right  0.3238    0.425    False
+    19    False   0.539  True    0.0   0.1141    turn_right  0.3241    0.425    False
+    20    False    0.54  True    0.0   0.1144  move_forward  0.3244   0.2025    False
+    21    False   0.542  True    0.0   0.1147     turn_left  0.3247    0.425    False
+    22    False   0.543  True    0.0    0.115     turn_left   0.325    0.425    False
+    23    False   0.545  True    0.0   0.1153    turn_right  0.3253    0.425    False
+    24    False   0.546  True    0.0   0.1156    turn_right  0.3256    0.425    False
+
+=== episode seed 5004 (post-removal window) ===
+  step food_vis sat_urg  gate    lfa mf_bonus        winner      mf best_oth decisive
+     5     True   0.518 False    0.0      0.0  move_forward  0.6673    0.425    False
+     6    False    0.52  True    0.0   0.1101     turn_left  0.0701    0.425    False
+     7    False   0.521  True    0.0   0.1104     turn_left  0.0704    0.425    False
+     8    False   0.523  True    0.0   0.1107    turn_right  0.0707    0.425    False
+     9    False   0.524  True    0.0    0.111    turn_right   0.321    0.425    False
+    10    False   0.526  True    0.0   0.1113  move_forward  0.3213   0.2025    False
+    11    False   0.527  True    0.0   0.1116     turn_left  0.3216    0.425    False
+    12    False   0.529  True    0.0   0.1119     turn_left  0.3219    0.425    False
+    13    False    0.53  True    0.0   0.1122    turn_right  0.3222    0.425    False
+    14    False   0.532  True    0.0   0.1125    turn_right  0.3225    0.425    False
+    15    False   0.533  True    0.0   0.1128  move_forward  0.3228   0.2025    False
+    16    False   0.534  True    0.0   0.1132     turn_left  0.3232    0.425    False
+    17    False   0.536  True    0.0   0.1135     turn_left  0.3235    0.425    False
+    18    False   0.537  True    0.0   0.1138    turn_right  0.3238    0.425    False
+    19    False   0.539  True    0.0   0.1141    turn_right  0.3241    0.425    False
+    20    False    0.54  True    0.0   0.1144  move_forward  0.3244   0.2025    False
+    21    False   0.542  True    0.0   0.1147     turn_left  0.3247    0.425    False
+    22    False   0.543  True    0.0    0.115     turn_left   0.325    0.425    False
+    23    False   0.545  True    0.0   0.1153    turn_right  0.3253    0.425    False
+    24    False   0.546  True    0.0   0.1156    turn_right  0.3256    0.425    False
+
+=== summary across 5 episodes (post-removal window) ===
+{
+  "window_steps": 175,
+  "gate_open_steps": 170,
+  "bonus_populated_steps": 150,
+  "bonus_decisive_steps": 0
+}
+
+VERDICT: BONUS FIRES BUT IS NEVER DECISIVE: move_forward received the memory bonus but it never changed the winning action. This is 'insufficient scaling' — the bonus is real but too small to overcome the epistemic baseline.
